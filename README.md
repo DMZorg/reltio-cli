@@ -1,2 +1,7 @@
 # reltio-cli
-an experimental rust CLI for Reltio
+
+An experimental Rust CLI for Reltio.
+
+## Planning
+
+- [Product requirements document](docs/PRD.md)
