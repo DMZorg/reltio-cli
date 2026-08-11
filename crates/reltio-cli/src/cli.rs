@@ -161,24 +161,63 @@ pub struct ProfileAddArgs {
 #[derive(Debug, Args)]
 pub struct ProfileUpdateArgs {
     pub name: String,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "clear_environment")]
     pub environment: Option<String>,
+    /// Remove the stored environment value.
     #[arg(long)]
+    pub clear_environment: bool,
+    #[arg(long, conflicts_with = "clear_base_url")]
     pub base_url: Option<String>,
+    /// Remove the stored custom environment origin.
     #[arg(long)]
+    pub clear_base_url: bool,
+    #[arg(long, conflicts_with = "clear_tenant")]
     pub tenant: Option<String>,
+    /// Remove the stored tenant.
+    #[arg(long)]
+    pub clear_tenant: bool,
     #[arg(long, value_parser = clap::value_parser!(bool))]
     pub production: Option<bool>,
     #[arg(long, value_parser = parse_profile_auth_method)]
     pub auth_method: Option<AuthMethod>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "clear_client_id")]
     pub client_id: Option<String>,
+    /// Remove the stored client ID.
     #[arg(long)]
+    pub clear_client_id: bool,
+    #[arg(long, conflicts_with = "clear_secret_file")]
     pub secret_file: Option<PathBuf>,
-    #[arg(long = "service-url", value_name = "SERVICE=URL")]
-    pub service_urls: Vec<String>,
-    /// Remove all configured authentication metadata from this profile.
+    /// Remove the stored secret-file reference.
     #[arg(long)]
+    pub clear_secret_file: bool,
+    #[arg(
+        long = "service-url",
+        value_name = "SERVICE=URL",
+        conflicts_with = "clear_service_urls"
+    )]
+    pub service_urls: Vec<String>,
+    /// Remove one service-specific URL. Repeat as needed.
+    #[arg(
+        long = "remove-service-url",
+        value_name = "SERVICE",
+        value_parser = parse_service,
+        conflicts_with = "clear_service_urls"
+    )]
+    pub remove_service_urls: Vec<Service>,
+    /// Remove every service-specific URL.
+    #[arg(long)]
+    pub clear_service_urls: bool,
+    /// Remove all configured authentication metadata from this profile.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "auth_method",
+            "client_id",
+            "clear_client_id",
+            "secret_file",
+            "clear_secret_file"
+        ]
+    )]
     pub clear_auth: bool,
 }
 
@@ -241,10 +280,16 @@ pub struct EntityCommand {
 pub enum EntitySubcommand {
     /// Get one entity by ID or canonical `entities/<id>` URI (consistent read).
     Get(EntityGetArgs),
+    /// Get entity wrapper results by a simple crosswalk value (consistent read).
+    ByCrosswalk(EntityByCrosswalkArgs),
     /// Search the entity index with POST-body parameters (eventually consistent).
     Search(EntitySearchArgs),
     /// Stream an exhaustive cursor search as checkpointed JSONL.
     Scan(EntityScanArgs),
+    /// Retrieve a bounded page from the most recent 1,000 entity history events.
+    History(EntityHistoryArgs),
+    /// Retrieve stored direct potential matches without forcing recalculation.
+    Matches(EntityMatchesArgs),
 }
 
 #[derive(Debug, Args)]
@@ -271,6 +316,22 @@ pub struct EntityGetArgs {
     /// Request masked values for viewing-mode entity retrieval.
     #[arg(long)]
     pub send_masked: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EntityByCrosswalkArgs {
+    /// Crosswalk value. Special-character values require the deferred POST variant.
+    #[arg(long)]
+    pub value: String,
+    /// Crosswalk source type, such as CRM or configuration/sources/CRM.
+    #[arg(long = "type")]
+    pub source_type: String,
+    /// Optional sourceTable component of the crosswalk identity.
+    #[arg(long)]
+    pub source_table: Option<String>,
+    /// Reviewed GET-by-crosswalk response option. Repeat as needed.
+    #[arg(long = "option")]
+    pub options: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -315,6 +376,45 @@ pub struct EntityScanArgs {
     pub options: Vec<String>,
     #[arg(long, value_parser = ["active", "all", "not_active"])]
     pub activeness: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct EntityHistoryArgs {
+    /// Entity ID or canonical entities/<id> URI.
+    pub entity: String,
+    #[arg(long = "max-items", alias = "max", default_value_t = 50)]
+    pub max_items: u32,
+    #[arg(long, default_value_t = 0)]
+    pub offset: u32,
+    /// Send an explicit order because Reltio's published defaults conflict.
+    #[arg(long, default_value = "desc", value_parser = ["asc", "desc"])]
+    pub order: String,
+    /// Filter history events. Cannot be combined with --show-all.
+    #[arg(long, conflicts_with = "show_all")]
+    pub filter: Option<String>,
+    /// Include events without real attribute changes; Reltio recommends this when no changes filter is used.
+    #[arg(long)]
+    pub show_all: bool,
+    /// Explicitly include only major events (true) or all event types (false).
+    #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
+    pub show_major_events_only: Option<bool>,
+    /// Improve performance by omitting some reference-attribute deltas.
+    #[arg(long)]
+    pub skip_reference_attributes_processing: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EntityMatchesArgs {
+    /// Entity ID or canonical entities/<id> URI.
+    pub entity: String,
+    /// Maximum direct matches to request. Reltio documents 200 as the API default, not a limit.
+    #[arg(long = "max-items", alias = "max", default_value_t = 50)]
+    pub max_items: u32,
+    #[arg(long, default_value_t = 0)]
+    pub offset: u32,
+    /// Restrict results to one reviewed built-in match-group type.
+    #[arg(long, value_parser = ["automatic", "relevance_based", "suspect"])]
+    pub match_type: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -368,6 +468,12 @@ pub enum ApiPracticesSubcommand {
     Check {
         #[arg(long)]
         strict: bool,
+        /// Also require every v0.1.0 PRD operation, capability, endpoint binding, scenario, and contract.
+        #[arg(long)]
+        release_ready: bool,
+        /// Stable release version expected by the invoking tag or release workflow.
+        #[arg(long, requires = "release_ready", value_name = "VERSION")]
+        expected_release: Option<String>,
     },
 }
 

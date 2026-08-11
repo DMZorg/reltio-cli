@@ -6,6 +6,7 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 pub mod auth;
+pub mod cancellation;
 pub mod config;
 pub mod entities;
 pub mod error;
@@ -13,6 +14,7 @@ pub mod fs;
 pub mod http;
 pub mod redaction;
 pub mod registry;
+mod release_contract;
 pub mod service;
 mod streaming_redaction;
 

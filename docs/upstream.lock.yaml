@@ -15,8 +15,18 @@ release_notes:
   page_count: 2
   page_url_set_sha256: 7fd333bd5690ba60d4f67c85dc76f7de88b61618fd5efd38bb5575ce0a5f0f3f
   page_state_sha256: 5e41291996bd615708d9d38ecbb20639ad72a64cf73ad546e9c54b63f7602637
+openapi:
+  - name: data-operation
+    url: https://developer.reltio.com/swagger/Data%20Operation
+    retrieved_at: 2026-08-11T13:59:32Z
+    last_modified: "Fri, 07 Aug 2026 00:00:08 GMT"
+    etag: 'W/"24001f-19fd985208c"'
+    content_type: text/yaml; charset=UTF-8
+    sha256: b40a9b7d5f38de9ac116c58ea298b40d968e01745fd8f9e0f425c22ffa0252a7
+    info_version: "2020.2"
+    operation_ids: [getEntityByCrosswalk, getChangesByTenant, getPotentialMatchesByTenant]
 review:
-  reviewed_at: 2026-08-10
+  reviewed_at: 2026-08-11
   language: en
   release_notes_through: 2026.1.8.0
   notes: >-
@@ -24,6 +34,11 @@ review:
     2026.1 release notes, and current deprecation notices for the operations
     registered in endpoints.yaml. Rechecked the complete Get Entity parameter
     contract and the Preview introduction status of reverseTranscodeLookups.
+    Added exact narrowed reviews for GET entity by crosswalk, Entity History,
+    and stored direct potential-match retrieval, including their response shapes,
+    consistency/freshness caveats, parameter conflicts, and pagination bounds.
+    The reviewed live Data Operation OpenAPI payload is locked above with its
+    reproducible URL, response metadata, operation IDs, and content digest.
     Rechecked current authentication token lifetime, same-token original-validity,
     caching, request-limit, retry, response-shape, and opaque JWT guidance for
     the auth hardening change.

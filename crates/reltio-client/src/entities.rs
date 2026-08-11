@@ -14,6 +14,13 @@ use crate::service::{Service, ServiceResolver, normalize_entity_uri};
 pub const SEARCH_RESULT_BOUNDARY: u32 = 10_000;
 pub const SEARCH_BOUNDARY_WARNING: &str = "the 10,000-result offset boundary was reached; more matching entities may exist, so use entity scan for exhaustive retrieval";
 pub const QUERY_FILTER_CHARACTER_LIMIT: usize = 256;
+pub const HISTORY_RESULT_BOUNDARY: u32 = 1_000;
+pub const HISTORY_BOUNDARY_WARNING: &str = "the 1,000-event entity-history boundary was reached; Reltio does not support pagination beyond the most recent 1,000 events";
+pub const HISTORY_CANONICAL_VALUES_WARNING: &str = "entity history contains stored canonical values and does not retranscode them for Accept-Language; values can differ from a current entity read";
+pub const POTENTIAL_MATCHES_FRESHNESS_WARNING: &str = "stored potential matches may be empty or out of date when matching is ON_REQUEST, disabled by strategy NONE, or handled without SuspectMatchHandler persistence; this read does not force recalculation";
+pub const CROSSWALK_ID_FALLBACK_WARNING: &str = "Reltio returned an entity without the requested crosswalk tuple; the documented ID-fallback behavior may have selected the entity by its Reltio ID";
+const ENTITY_CROSSWALK_OPTIONS: &[&str] = &["sendHidden", "ovOnly", "nonOvOnly"];
+pub const ENTITY_MATCH_TYPES: &[&str] = &["automatic", "relevance_based", "suspect"];
 const ENTITY_GET_OPTIONS: &[&str] = &[
     "sendHidden",
     "ovOnly",
@@ -50,6 +57,56 @@ pub struct EntityGetOptions {
     pub explicit_survivorship_group: Option<String>,
     pub reverse_transcode_lookups: Option<String>,
     pub send_masked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EntityByCrosswalkRequest {
+    pub value: String,
+    pub source_type: String,
+    pub source_table: Option<String>,
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EntityHistoryRequest {
+    pub max: u32,
+    pub offset: u32,
+    pub order: String,
+    pub filter: Option<String>,
+    pub show_all: bool,
+    pub show_major_events_only: Option<bool>,
+    pub skip_reference_attributes_processing: bool,
+}
+
+impl Default for EntityHistoryRequest {
+    fn default() -> Self {
+        Self {
+            max: 50,
+            offset: 0,
+            order: "desc".to_owned(),
+            filter: None,
+            show_all: false,
+            show_major_events_only: None,
+            skip_reference_attributes_processing: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EntityMatchesRequest {
+    pub max: u32,
+    pub offset: u32,
+    pub match_type: Option<String>,
+}
+
+impl Default for EntityMatchesRequest {
+    fn default() -> Self {
+        Self {
+            max: 50,
+            offset: 0,
+            match_type: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +158,34 @@ impl Default for EntitySearchRequest {
 #[derive(Debug, Clone)]
 pub struct EntityResult {
     pub entity: Value,
+    pub response: ApiResponse,
+    pub consistency: Consistency,
+}
+
+#[derive(Debug, Clone)]
+pub struct EntityByCrosswalkResult {
+    pub entries: Vec<Value>,
+    pub id_fallback_detected: bool,
+    pub response: ApiResponse,
+    pub consistency: Consistency,
+}
+
+#[derive(Debug, Clone)]
+pub struct EntityHistoryPage {
+    pub changes: Vec<Value>,
+    pub offset: u32,
+    pub max: u32,
+    pub next_offset: Option<u32>,
+    pub boundary_reached: bool,
+    pub response: ApiResponse,
+    pub consistency: Consistency,
+}
+
+#[derive(Debug, Clone)]
+pub struct EntityMatchesPage {
+    pub matches: Value,
+    pub offset: u32,
+    pub max: u32,
     pub response: ApiResponse,
     pub consistency: Consistency,
 }
@@ -196,6 +281,152 @@ impl EntitiesClient {
         }
         Ok(EntityResult {
             entity,
+            response,
+            consistency: endpoint.consistency,
+        })
+    }
+
+    pub async fn by_crosswalk(
+        &self,
+        lookup: &EntityByCrosswalkRequest,
+    ) -> Result<EntityByCrosswalkResult> {
+        validate_by_crosswalk(lookup)?;
+        let mut url = self.resolver.request_url(
+            Service::Data,
+            &format!("/entities/_byCrosswalk/{}", lookup.value),
+        )?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("type", &lookup.source_type);
+            if let Some(source_table) = lookup.source_table.as_deref() {
+                query.append_pair("sourceTable", source_table);
+            }
+            if !lookup.options.is_empty() {
+                query.append_pair("options", &lookup.options.join(","));
+            }
+        }
+        let endpoint = endpoint("entity.by-crosswalk")?;
+        let mut request = RequestSpec::new(Method::GET, url, "entity.by-crosswalk");
+        request.headers = json_headers(false);
+        request.replay = endpoint.replay;
+        request.practice_ids.clone_from(&endpoint.practice_ids);
+        let response = self.http.execute(&self.auth, request).await?;
+        let entries = parse_array(&response, "entity.by-crosswalk")?;
+        let id_fallback_detected = entries
+            .iter()
+            .any(|entry| successful_entry_lacks_crosswalk(entry, lookup));
+        Ok(EntityByCrosswalkResult {
+            entries,
+            id_fallback_detected,
+            response,
+            consistency: endpoint.consistency,
+        })
+    }
+
+    pub async fn history(
+        &self,
+        entity: &str,
+        history: &EntityHistoryRequest,
+    ) -> Result<EntityHistoryPage> {
+        validate_history(entity, history)?;
+        let canonical = normalize_entity_uri(entity)?;
+        let mut url = self
+            .resolver
+            .request_url(Service::Data, &format!("/{canonical}/_changes"))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("max", &history.max.to_string());
+            query.append_pair("offset", &history.offset.to_string());
+            query.append_pair("order", &history.order);
+            if let Some(filter) = history.filter.as_deref() {
+                query.append_pair("filter", filter);
+            }
+            if history.show_all {
+                query.append_pair("showAll", "true");
+            }
+            if let Some(show_major_events_only) = history.show_major_events_only {
+                query.append_pair(
+                    "showMajorEventsOnly",
+                    if show_major_events_only {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                );
+            }
+            if history.skip_reference_attributes_processing {
+                query.append_pair("options", "skipReferenceAttributesProcessing");
+            }
+        }
+        let endpoint = endpoint("entity.history")?;
+        let mut request = RequestSpec::new(Method::GET, url, "entity.history");
+        request.headers = json_headers(false);
+        request.replay = endpoint.replay;
+        request.practice_ids.clone_from(&endpoint.practice_ids);
+        let response = self.http.execute(&self.auth, request).await?;
+        let changes = parse_array(&response, "entity.history")?;
+        let returned = u32::try_from(changes.len()).unwrap_or(u32::MAX);
+        let candidate = history.offset.saturating_add(returned);
+        let next_offset =
+            (returned == history.max && candidate < HISTORY_RESULT_BOUNDARY).then_some(candidate);
+        let boundary_reached = returned == history.max && candidate >= HISTORY_RESULT_BOUNDARY;
+        Ok(EntityHistoryPage {
+            changes,
+            offset: history.offset,
+            max: history.max,
+            next_offset,
+            boundary_reached,
+            response,
+            consistency: endpoint.consistency,
+        })
+    }
+
+    pub async fn matches(
+        &self,
+        entity: &str,
+        matches: &EntityMatchesRequest,
+    ) -> Result<EntityMatchesPage> {
+        validate_matches(entity, matches)?;
+        let canonical = normalize_entity_uri(entity)?;
+        let mut url = self
+            .resolver
+            .request_url(Service::Data, &format!("/{canonical}/_matches"))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("transitive", "false");
+            query.append_pair("forceMatch", "false");
+            query.append_pair("deep", "1");
+            query.append_pair("max", &matches.max.to_string());
+            query.append_pair("offset", &matches.offset.to_string());
+            if let Some(match_type) = matches.match_type.as_deref() {
+                query.append_pair("type", match_type);
+            }
+        }
+        let endpoint = endpoint("entity.matches")?;
+        let mut request = RequestSpec::new(Method::GET, url, "entity.matches");
+        request.headers = json_headers(false);
+        request.replay = endpoint.replay;
+        request.practice_ids.clone_from(&endpoint.practice_ids);
+        let response = self.http.execute(&self.auth, request).await?;
+        let matches_payload = response.json()?;
+        let groups = matches_payload.as_object().ok_or_else(|| {
+            unexpected_shape(
+                "entity.matches",
+                "a JSON object grouped by match rule",
+                &response,
+            )
+        })?;
+        if groups.values().any(|group| !group.is_array()) {
+            return Err(unexpected_shape(
+                "entity.matches",
+                "arrays of potential matches grouped by match rule",
+                &response,
+            ));
+        }
+        Ok(EntityMatchesPage {
+            matches: matches_payload,
+            offset: matches.offset,
+            max: matches.max,
             response,
             consistency: endpoint.consistency,
         })
@@ -337,6 +568,126 @@ struct Cursor {
     _extra: Map<String, Value>,
 }
 
+pub fn validate_by_crosswalk(lookup: &EntityByCrosswalkRequest) -> Result<()> {
+    if lookup.value.is_empty() {
+        return Err(ReltioError::usage(
+            "crosswalk_value_required",
+            "crosswalk value must not be empty",
+        ));
+    }
+    if !lookup
+        .value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+        || matches!(lookup.value.as_str(), "." | "..")
+    {
+        return Err(ReltioError::usage(
+            "crosswalk_value_requires_post",
+            "this CLI conservatively routes crosswalk values outside the RFC 3986 unreserved subset to Reltio's POST-by-crosswalk variant, which is not yet a reviewed typed command",
+        )
+        .with_hint("Use this typed GET only for unreserved crosswalk values until Reltio defines the GET special-character set precisely."));
+    }
+    validate_required_query_text(&lookup.source_type, "type")?;
+    validate_nonempty_query_text(lookup.source_table.as_deref(), "sourceTable")?;
+    validate_options(&lookup.options)?;
+    if let Some(option) = lookup
+        .options
+        .iter()
+        .find(|option| !ENTITY_CROSSWALK_OPTIONS.contains(&option.as_str()))
+    {
+        return Err(ReltioError::usage(
+            "invalid_crosswalk_option",
+            format!("entity by-crosswalk option {option:?} is not in the reviewed GET contract"),
+        )
+        .with_details(json!({ "allowed": ENTITY_CROSSWALK_OPTIONS })));
+    }
+    if lookup.options.iter().any(|option| option == "ovOnly")
+        && lookup.options.iter().any(|option| option == "nonOvOnly")
+    {
+        return Err(ReltioError::usage(
+            "crosswalk_option_conflict",
+            "ovOnly and nonOvOnly are mutually exclusive",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_history(entity: &str, history: &EntityHistoryRequest) -> Result<()> {
+    normalize_entity_uri(entity)?;
+    if history.max == 0 {
+        return Err(ReltioError::usage(
+            "invalid_page_size",
+            "entity history max must be greater than zero",
+        ));
+    }
+    if u64::from(history.offset) + u64::from(history.max) > u64::from(HISTORY_RESULT_BOUNDARY) {
+        return Err(ReltioError::usage(
+            "entity_history_boundary_exceeded",
+            format!(
+                "offset {} plus max {} exceeds Reltio's {}-event entity-history boundary",
+                history.offset, history.max, HISTORY_RESULT_BOUNDARY
+            ),
+        )
+        .with_hint(
+            "Narrow the history filter or request a window within the most recent 1,000 events.",
+        ));
+    }
+    if !matches!(history.order.as_str(), "asc" | "desc") {
+        return Err(ReltioError::usage(
+            "invalid_history_order",
+            "entity history order must be asc or desc",
+        ));
+    }
+    validate_nonempty_query_text(history.filter.as_deref(), "filter")?;
+    if history.show_all && history.filter.is_some() {
+        return Err(ReltioError::usage(
+            "history_filter_ignored",
+            "entity history filter cannot be combined with showAll=true because Reltio ignores the filter",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_matches(entity: &str, matches: &EntityMatchesRequest) -> Result<()> {
+    normalize_entity_uri(entity)?;
+    if matches.max == 0 {
+        return Err(ReltioError::usage(
+            "invalid_matches_page_size",
+            "entity matches max must be greater than zero",
+        ));
+    }
+    if let Some(match_type) = matches.match_type.as_deref() {
+        if !ENTITY_MATCH_TYPES.contains(&match_type) {
+            return Err(ReltioError::usage(
+                "invalid_match_type",
+                format!("match type {match_type:?} is not in the reviewed typed contract"),
+            )
+            .with_details(json!({ "allowed": ENTITY_MATCH_TYPES })));
+        }
+    }
+    Ok(())
+}
+
+fn successful_entry_lacks_crosswalk(entry: &Value, lookup: &EntityByCrosswalkRequest) -> bool {
+    if entry.get("successful").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(crosswalks) = entry
+        .get("object")
+        .and_then(|object| object.get("crosswalks"))
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    !crosswalks.iter().any(|crosswalk| {
+        crosswalk.get("value").and_then(Value::as_str) == Some(lookup.value.as_str())
+            && crosswalk.get("type").and_then(Value::as_str) == Some(lookup.source_type.as_str())
+            && lookup.source_table.as_deref().is_none_or(|source_table| {
+                crosswalk.get("sourceTable").and_then(Value::as_str) == Some(source_table)
+            })
+    })
+}
+
 pub fn validate_search(search: &EntitySearchRequest) -> Result<()> {
     if search.max == 0 {
         return Err(ReltioError::usage(
@@ -462,6 +813,17 @@ fn validate_nonempty_query_text(value: Option<&str>, field: &str) -> Result<()> 
         return Err(ReltioError::usage(
             "invalid_query_value",
             format!("{field} must not be empty when supplied"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_required_query_text(value: &str, field: &str) -> Result<()> {
+    validate_nonempty_query_text(Some(value), field)?;
+    if value.trim() != value || value.chars().all(char::is_whitespace) {
+        return Err(ReltioError::usage(
+            "invalid_query_value",
+            format!("{field} must not have leading or trailing whitespace"),
         ));
     }
     Ok(())
@@ -730,6 +1092,101 @@ mod tests {
                 .expect_err("search-only option must fail")
                 .code,
             "invalid_entity_option"
+        );
+    }
+
+    #[test]
+    fn crosswalk_lookup_rejects_special_values_and_disjoint_ov_options() {
+        let valid = EntityByCrosswalkRequest {
+            value: "source-id_1.2~3".to_owned(),
+            source_type: "configuration/sources/CRM".to_owned(),
+            source_table: Some("contacts".to_owned()),
+            options: vec!["sendHidden".to_owned(), "ovOnly".to_owned()],
+        };
+        validate_by_crosswalk(&valid).expect("narrowed GET contract is accepted");
+
+        let mut special = valid.clone();
+        special.value = "source|id".to_owned();
+        assert_eq!(
+            validate_by_crosswalk(&special)
+                .expect_err("special values require POST")
+                .code,
+            "crosswalk_value_requires_post"
+        );
+
+        let mut conflict = valid;
+        conflict.options = vec!["ovOnly".to_owned(), "nonOvOnly".to_owned()];
+        assert_eq!(
+            validate_by_crosswalk(&conflict)
+                .expect_err("OV options are mutually exclusive")
+                .code,
+            "crosswalk_option_conflict"
+        );
+    }
+
+    #[test]
+    fn history_bounds_the_retrievable_window_and_rejects_ignored_filters() {
+        let valid = EntityHistoryRequest {
+            offset: 950,
+            max: 50,
+            ..EntityHistoryRequest::default()
+        };
+        validate_history("entities/1", &valid).expect("last retrievable window is accepted");
+
+        let beyond_boundary = EntityHistoryRequest {
+            offset: 951,
+            max: 50,
+            ..EntityHistoryRequest::default()
+        };
+        assert_eq!(
+            validate_history("1", &beyond_boundary)
+                .expect_err("history cannot paginate beyond 1,000")
+                .code,
+            "entity_history_boundary_exceeded"
+        );
+
+        let ignored_filter = EntityHistoryRequest {
+            filter: Some("equals(type,'ENTITY_CHANGED')".to_owned()),
+            show_all: true,
+            ..EntityHistoryRequest::default()
+        };
+        assert_eq!(
+            validate_history("1", &ignored_filter)
+                .expect_err("showAll would ignore the filter")
+                .code,
+            "history_filter_ignored"
+        );
+    }
+
+    #[test]
+    fn matches_enforce_the_positive_direct_contract() {
+        let valid = EntityMatchesRequest {
+            max: 10_000,
+            offset: 10,
+            match_type: Some("suspect".to_owned()),
+        };
+        validate_matches("entities/1", &valid).expect("positive max and reviewed match type");
+
+        let zero = EntityMatchesRequest {
+            max: 0,
+            ..EntityMatchesRequest::default()
+        };
+        assert_eq!(
+            validate_matches("1", &zero)
+                .expect_err("zero match page must fail")
+                .code,
+            "invalid_matches_page_size"
+        );
+
+        let custom_action = EntityMatchesRequest {
+            match_type: Some("custom_action".to_owned()),
+            ..EntityMatchesRequest::default()
+        };
+        assert_eq!(
+            validate_matches("1", &custom_action)
+                .expect_err("custom actions are deferred")
+                .code,
+            "invalid_match_type"
         );
     }
 }

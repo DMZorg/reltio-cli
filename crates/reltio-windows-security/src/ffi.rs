@@ -14,8 +14,9 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES,
+    ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    LocalFree,
 };
 #[cfg(test)]
 use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
@@ -48,6 +49,14 @@ use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL, SECURITY_IDENTIFICATION,
     SECURITY_SQOS_PRESENT, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
 #[cfg(test)]
 use windows_sys::Win32::System::LibraryLoader::GetDllDirectoryW;
 use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
@@ -57,7 +66,10 @@ use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_OBJECT_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, ACCESS_DENIED_CALLBACK_ACE_TYPE,
     ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_DENIED_OBJECT_ACE_TYPE,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcessToken,
+    OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+};
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
 use crate::{Error, ErrorKind, Result};
@@ -89,6 +101,199 @@ pub(crate) struct HandleInformation {
     pub(crate) length: u64,
     pub(crate) number_of_links: u32,
     pub(crate) reparse_point: bool,
+}
+
+pub(crate) struct CredentialProcessJob {
+    handle: OwnedHandle,
+}
+
+impl fmt::Debug for CredentialProcessJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialProcessJob")
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) const fn credential_process_creation_flags() -> u32 {
+    CREATE_SUSPENDED
+}
+
+pub(crate) fn create_credential_process_job() -> Result<CredentialProcessJob> {
+    // SAFETY: Null security attributes and name request a fresh, unnamed,
+    // non-inheritable Job handle owned exclusively by this process.
+    let handle = unsafe { CreateJobObjectW(null(), null()) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(last_error("failed to create credential process Job"));
+    }
+    // SAFETY: CreateJobObjectW returned a fresh handle and this is its sole owner.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let byte_length = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+        .map_err(|_| Error::policy(ErrorKind::ProcessContainment, "invalid Job limit size"))?;
+    // SAFETY: The Job handle and immutable typed limit buffer remain live for
+    // the complete call, and the byte length exactly matches the buffer type.
+    if unsafe {
+        SetInformationJobObject(
+            raw_owned_handle(&handle),
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast::<c_void>(),
+            byte_length,
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "failed to configure credential process Job containment",
+        ));
+    }
+    Ok(CredentialProcessJob { handle })
+}
+
+pub(crate) fn assign_credential_process_and_resume(
+    job: &CredentialProcessJob,
+    child: &tokio::process::Child,
+) -> Result<()> {
+    let process = child.raw_handle().ok_or_else(|| {
+        Error::policy(
+            ErrorKind::ProcessContainment,
+            "credential process exited before Job assignment",
+        )
+    })?;
+    let expected_pid = child.id().ok_or_else(|| {
+        Error::policy(
+            ErrorKind::ProcessContainment,
+            "credential process has no live process identifier",
+        )
+    })?;
+    // SAFETY: Tokio owns and keeps the borrowed process handle live while
+    // `child` is borrowed for this synchronous containment transition.
+    let actual_pid = unsafe { GetProcessId(process) };
+    if actual_pid == 0 {
+        return Err(last_error(
+            "failed to inspect suspended credential process identity",
+        ));
+    }
+    if actual_pid != expected_pid {
+        return Err(Error::policy(
+            ErrorKind::ProcessContainment,
+            "credential process handle and identifier do not match",
+        ));
+    }
+    // SAFETY: Both handles are live. The process was created suspended and has
+    // not executed user code before this assignment attempt.
+    if unsafe { AssignProcessToJobObject(raw_owned_handle(&job.handle), process) } == 0 {
+        return Err(last_error(
+            "failed to assign suspended credential process to its Job",
+        ));
+    }
+
+    let thread_id = sole_process_thread(expected_pid)?;
+    // SAFETY: The access mask is minimal, inheritance is disabled, and the
+    // enumerated thread identifier is revalidated against the process below.
+    let thread = unsafe {
+        OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+            0,
+            thread_id,
+        )
+    };
+    if thread.is_null() || thread == INVALID_HANDLE_VALUE {
+        return Err(last_error(
+            "failed to open suspended credential process thread",
+        ));
+    }
+    // SAFETY: OpenThread returned a fresh owned handle and this is its sole owner.
+    let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+    // SAFETY: The owned thread handle remains live for this identity query.
+    let owner_pid = unsafe { GetProcessIdOfThread(raw_owned_handle(&thread)) };
+    if owner_pid == 0 {
+        return Err(last_error(
+            "failed to verify suspended credential process thread",
+        ));
+    }
+    if owner_pid != expected_pid {
+        return Err(Error::policy(
+            ErrorKind::ProcessContainment,
+            "suspended credential process thread changed ownership",
+        ));
+    }
+    // SAFETY: The revalidated thread belongs to the contained child and was
+    // created with exactly one CREATE_SUSPENDED count by this command.
+    let previous_count = unsafe { ResumeThread(raw_owned_handle(&thread)) };
+    if previous_count == u32::MAX {
+        return Err(last_error(
+            "failed to resume contained credential process thread",
+        ));
+    }
+    if previous_count != 1 {
+        return Err(Error::policy(
+            ErrorKind::ProcessContainment,
+            "credential process thread had an unexpected suspend count",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn terminate_credential_process_job(job: &CredentialProcessJob) -> Result<()> {
+    // SAFETY: The Job handle remains owned and live for the complete call.
+    if unsafe { TerminateJobObject(raw_owned_handle(&job.handle), 1) } == 0 {
+        Err(last_error("failed to terminate credential process Job"))
+    } else {
+        Ok(())
+    }
+}
+
+fn sole_process_thread(process_id: u32) -> Result<u32> {
+    // SAFETY: TH32CS_SNAPTHREAD ignores the process-id argument and returns a
+    // fresh snapshot handle on success.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+        return Err(last_error(
+            "failed to snapshot suspended credential process threads",
+        ));
+    }
+    // SAFETY: CreateToolhelp32Snapshot returned a fresh owned handle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(size_of::<THREADENTRY32>()).map_err(|_| {
+            Error::policy(ErrorKind::ProcessContainment, "invalid thread entry size")
+        })?,
+        ..THREADENTRY32::default()
+    };
+    // SAFETY: The snapshot and initialized writable entry remain live.
+    if unsafe { Thread32First(raw_owned_handle(&snapshot), &mut entry) } == 0 {
+        return Err(last_error(
+            "failed to enumerate suspended credential process threads",
+        ));
+    }
+    let mut found = None;
+    loop {
+        if entry.th32OwnerProcessID == process_id && found.replace(entry.th32ThreadID).is_some() {
+            return Err(Error::policy(
+                ErrorKind::ProcessContainment,
+                "suspended credential process unexpectedly had multiple threads",
+            ));
+        }
+        // SAFETY: The snapshot and writable entry remain valid across iteration.
+        if unsafe { Thread32Next(raw_owned_handle(&snapshot), &mut entry) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(i32::try_from(ERROR_NO_MORE_FILES).unwrap_or(i32::MAX))
+            {
+                return Err(Error::io(
+                    "failed while enumerating suspended credential process threads",
+                    error,
+                ));
+            }
+            break;
+        }
+    }
+    found.ok_or_else(|| {
+        Error::policy(
+            ErrorKind::ProcessContainment,
+            "suspended credential process primary thread was not found",
+        )
+    })
 }
 
 struct OwnedSid {

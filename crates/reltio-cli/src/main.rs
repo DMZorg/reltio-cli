@@ -1,16 +1,20 @@
+mod audit;
 mod cli;
 mod commands;
 mod metadata;
 mod output;
+mod release;
 
 use std::process::ExitCode;
 use std::{env, ffi::OsStr};
 
 use clap::Parser;
 use reltio_client::auth::TokenManager;
+use reltio_client::cancellation::CancellationToken;
 use reltio_client::config::{ConfigPaths, Environment};
-use reltio_client::error::{ReltioError, Result};
+use reltio_client::error::{ErrorCategory, ReltioError, Result};
 use reltio_client::redaction::OutputGuard;
+use serde_json::Value;
 
 use crate::cli::{Cli, OutputFormat};
 use crate::commands::Runtime;
@@ -58,12 +62,18 @@ async fn main() -> ExitCode {
         format,
         compact: cli.compact,
     };
-    match run(cli, environment, render).await {
+    let cancellation = CancellationToken::new();
+    let (result, interrupted) = run_with_sigint(cli, environment, render, cancellation).await;
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let error = error.with_output_guard(environment_guard);
             write_error(&error, render.format);
-            ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1))
+            if interrupted {
+                ExitCode::from(130)
+            } else {
+                ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1))
+            }
         }
     }
 }
@@ -92,8 +102,66 @@ fn process_output_guard(environment: &Environment) -> OutputGuard {
     guard
 }
 
-async fn run(cli: Cli, environment: Environment, render: RenderOptions) -> Result<()> {
-    Runtime::new(&cli, environment, render)?
+async fn run_with_sigint(
+    cli: Cli,
+    environment: Environment,
+    render: RenderOptions,
+    cancellation: CancellationToken,
+) -> (Result<()>, bool) {
+    let signal_cancellation = cancellation.clone();
+    let mut signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+            true
+        } else {
+            false
+        }
+    });
+    let command = run(cli, environment, render, cancellation.clone());
+    tokio::pin!(command);
+
+    tokio::select! {
+        biased;
+        signal_result = &mut signal => {
+            let interrupted = signal_result.unwrap_or(false);
+            let result = command.await;
+            if interrupted && result.is_ok() {
+                (Err(interrupted_command_error()), true)
+            } else {
+                (result, interrupted)
+            }
+        }
+        result = &mut command => {
+            signal.abort();
+            (result, false)
+        },
+    }
+}
+
+fn interrupted_command_error() -> ReltioError {
+    ReltioError::new(
+        "request_canceled",
+        ErrorCategory::Canceled,
+        "the command was canceled",
+    )
+    .with_details(serde_json::json!({
+        "phase": "command_completion",
+        "remote_response_received": Value::Null,
+        "remote_request_completed": Value::Null,
+        "remote_operation_completed": Value::Null,
+        "remote_operation_state": "unknown",
+        "local_state_committed": Value::Null,
+        "safe_to_replay": false
+    }))
+}
+
+async fn run(
+    cli: Cli,
+    environment: Environment,
+    render: RenderOptions,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    Runtime::new(&cli, environment, render, cancellation)?
         .dispatch(cli.command)
         .await
 }

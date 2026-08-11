@@ -30,6 +30,8 @@ jobs:
           reviewed_deprecation_count="$(awk '/^  notice_count:/ { print $2; exit }' docs/upstream.lock.yaml)"
           reviewed_deprecations="$(awk '/^  notice_url_set_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
           reviewed_deprecation_state="$(awk '/^  notice_state_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_openapi_url="$(awk '/^    url: https:\/\/developer\.reltio\.com\/swagger\// { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_openapi_sha="$(awk '/^    sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
           latest="$(curl --fail --silent --show-error \
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "Accept: application/vnd.github+json" \
@@ -40,6 +42,7 @@ jobs:
           release_page="$(curl --fail --location --silent --show-error "${release_url}")"
           curl --fail --location --silent --show-error --output /dev/null "${deprecation_url}"
           sitemap="$(curl --fail --location --silent --show-error "${deprecation_sitemap_url}")"
+          current_openapi_sha="$(curl --fail --location --silent --show-error "${reviewed_openapi_url}" | sha256sum | awk '{ print $1 }')"
           fingerprints="$(RELEASE_FAMILY="${reviewed_release_family}" python3 -c '
           import hashlib
           import os
@@ -106,9 +109,11 @@ jobs:
             echo "Current deprecation notices: \`${current_deprecation_count}\` (URL-set hash \`${current_deprecations}\`)"
             echo "Reviewed deprecation state hash: \`${reviewed_deprecation_state}\`"
             echo "Current deprecation state hash: \`${current_deprecation_state}\`"
+            echo "Reviewed OpenAPI digest: \`${reviewed_openapi_sha}\`"
+            echo "Current OpenAPI digest: \`${current_openapi_sha}\`"
             echo
-            if [[ "${reviewed}" == "${latest}" && "${reviewed_release}" == "${latest_release}" && "${reviewed_release_family}" == "${current_release_family}" && "${reviewed_release_page_count}" == "${current_release_page_count}" && "${reviewed_release_urls}" == "${current_release_urls}" && "${reviewed_release_state}" == "${current_release_state}" && "${reviewed_deprecation_count}" == "${current_deprecation_count}" && "${reviewed_deprecations}" == "${current_deprecations}" && "${reviewed_deprecation_state}" == "${current_deprecation_state}" ]]; then
-              echo 'Status: no corpus, release-position, or deprecation-index drift detected.'
+            if [[ "${reviewed}" == "${latest}" && "${reviewed_release}" == "${latest_release}" && "${reviewed_release_family}" == "${current_release_family}" && "${reviewed_release_page_count}" == "${current_release_page_count}" && "${reviewed_release_urls}" == "${current_release_urls}" && "${reviewed_release_state}" == "${current_release_state}" && "${reviewed_deprecation_count}" == "${current_deprecation_count}" && "${reviewed_deprecations}" == "${current_deprecations}" && "${reviewed_deprecation_state}" == "${current_deprecation_state}" && "${reviewed_openapi_sha}" == "${current_openapi_sha}" ]]; then
+              echo 'Status: no corpus, release-position, deprecation-index, or OpenAPI drift detected.'
             else
               echo 'Status: review required. Runtime policy has not changed automatically.'
               echo

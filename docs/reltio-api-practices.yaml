@@ -1,7 +1,7 @@
 schema_version: 1
 catalog:
   corpus_commit: 1c290ec16beb53b7754c0aa3195e9918d0d41ef6
-  reviewed_at: 2026-08-10
+  reviewed_at: 2026-08-11
   release_notes_through: 2026.1.8.0
 practices:
   - id: AUTH-CENTRALIZED-001
@@ -18,7 +18,7 @@ practices:
       section: Internal API sign in service
       updated_at: 2024-12-09
     reviewed_at: 2026-08-10
-    commands: [auth.login, auth.check, auth.token, entity.get, entity.search, entity.scan, api.request, doctor]
+    commands: [auth.login, auth.check, auth.token, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/service.rs
     test_ids: [auth_url_is_centralized, deprecated_auth_path_absent, deprecated_auth_path_refused]
 
@@ -36,7 +36,7 @@ practices:
       section: Request
       updated_at: 2026-07-31
     reviewed_at: 2026-08-10
-    commands: [auth.login, auth.check, auth.token, entity.get, entity.search, entity.scan, api.request, doctor]
+    commands: [auth.login, auth.check, auth.token, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [auth_client_credentials_request, auth_login_secret_source_conflict, auth_login_secret_read_order, auth_login_prior_credential_guard, auth_provider_preparse_guard, auth_credential_process_preparse_guard]
 
@@ -57,7 +57,7 @@ practices:
       section: Token API request limit
       updated_at: 2026-07-31
     reviewed_at: 2026-08-10
-    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.search, entity.scan, api.request, doctor]
+    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [auth_singleflight_cache, auth_cross_process_singleflight, auth_expired_cache_refresh, auth_provider_expiry_guard, auth_candidate_expiry_guard, auth_same_token_reissue_guard, auth_login_cache_transaction, auth_login_cache_reader_isolation, auth_login_profile_rollback, auth_login_malformed_displaced_cache, auth_login_commit_conflict, auth_login_output_preflight, auth_login_warning_preflight, auth_login_output_state, auth_login_broken_pipe_state, auth_logout_partial_commit, auth_global_cache_output_guard, auth_orphan_cache_output_guard]
 
@@ -75,7 +75,7 @@ practices:
       section: Understanding Multi Token Support
       updated_at: 2026-07-31
     reviewed_at: 2026-08-10
-    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.search, entity.scan, api.request, doctor]
+    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [auth_explicit_reissue_lifetime, auth_same_token_reissue_guard]
 
@@ -95,7 +95,7 @@ practices:
       section: What action do you need to take?
       updated_at: 2024-12-09
     reviewed_at: 2026-08-10
-    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.search, entity.scan, api.request, doctor]
+    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [opaque_token_roundtrip, opaque_token_redaction, auth_token_raw_cumulative_guard, auth_prior_cache_disclosure_guard, auth_raw_broken_pipe_state, auth_output_newline_guard, auth_token_raw_newline_guard, auth_malformed_cache_guard, auth_malformed_cache_duplicate_guard, auth_global_cache_output_guard, auth_cached_help_output_guard, auth_orphan_cache_output_guard, auth_provider_preparse_guard, auth_credential_process_preparse_guard, auth_refresh_token_validation, auth_refresh_token_no_commit, auth_login_output_preflight, auth_login_warning_preflight]
 
@@ -115,7 +115,7 @@ practices:
       section: API Error Retries
       updated_at: 2026-07-31
     reviewed_at: 2026-08-10
-    commands: [auth.login, auth.check, auth.token, entity.get, entity.search, entity.scan, api.request, doctor]
+    commands: [auth.login, auth.check, auth.token, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [auth_token_non_rate_limit_no_retry, auth_rate_limit_single_retry, auth_rate_limit_oversized_replay, auth_rate_limit_oversized_terminal, auth_no_retry_disables_token_replay]
 
@@ -126,22 +126,25 @@ practices:
     api_family: data
     service: data
     methods: [GET, POST]
-    path_patterns: ["/entities", "/entities/{id}", "/entities/_search", "/entities/_scan"]
+    path_patterns: ["/entities", "/entities/{id}", "/entities/_byCrosswalk/{crosswalkValue}", "/entities/_search", "/entities/_scan", "/entities/{id}/_changes", "/entities/{id}/_matches"]
     operations:
       - { method: GET, path_pattern: "/entities" }
       - { method: GET, path_pattern: "/entities/{id}" }
+      - { method: GET, path_pattern: "/entities/_byCrosswalk/{crosswalkValue}" }
       - { method: GET, path_pattern: "/entities/_search" }
       - { method: POST, path_pattern: "/entities/_search" }
       - { method: POST, path_pattern: "/entities/_scan" }
+      - { method: GET, path_pattern: "/entities/{id}/_changes" }
+      - { method: GET, path_pattern: "/entities/{id}/_matches" }
     summary: Add exactly one Authorization header in Bearer access-token format.
     source:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api
       section: Entities API
       updated_at: 2026-07-31
     reviewed_at: 2026-08-08
-    commands: [auth.check, entity.get, entity.search, entity.scan, api.request, doctor]
+    commands: [auth.check, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/http.rs
-    test_ids: [entity_get_contract, protected_authorization_header]
+    test_ids: [entity_get_contract, entity_crosswalk_contract, entity_history_contract, entity_matches_contract, protected_authorization_header]
 
   - id: HTTP-RETRY-001
     title: Apply status-specific retry ceilings only to replay-safe requests
@@ -149,6 +152,7 @@ practices:
     enforcement: adaptive_policy
     api_family: cross_cutting
     service: any
+    excluded_services: [auth]
     methods: [GET, POST]
     path_patterns: ["*"]
     limits:
@@ -162,7 +166,7 @@ practices:
       section: Best Practice for Retry Mechanism
       updated_at: 2025-04-29
     reviewed_at: 2026-08-08
-    commands: [auth.check, entity.get, entity.search, entity.scan, api.request, doctor]
+    commands: [auth.check, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/http.rs
     test_ids: [retry_matrix, retry_backoff_sequence, retry_oversized_body_replay, retry_oversized_body_terminal, no_retry_500]
 
@@ -172,6 +176,7 @@ practices:
     enforcement: hard_guard
     api_family: cross_cutting
     service: any
+    excluded_services: [auth]
     methods: [POST]
     path_patterns: ["*"]
     limits:
@@ -245,6 +250,45 @@ practices:
     commands: [entity.get, api.request]
     implementation: crates/reltio-cli/src/commands/entity.rs
     test_ids: [entity_get_query_parameters, raw_entity_get_query_parameters, entity_get_preview_warning_outputs]
+
+  - id: ENTITY-CROSSWALK-CONTRACT-001
+    title: Use the narrowed GET entity-by-crosswalk contract
+    classification: behavior
+    enforcement: hard_guard
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/_byCrosswalk/{crosswalkValue}"]
+    limits:
+      options: [sendHidden, ovOnly, nonOvOnly]
+      conservative_cli_get_subset: RFC3986_unreserved
+    summary: Require type, preserve optional sourceTable, allow only the three response options shared by the current reference and OpenAPI, reject conflicting OV options, and conservatively route values outside the unreserved subset to the deferred POST variant because Reltio does not precisely define "special characters". Preserve the response wrapper and warn when a successful object lacks the requested crosswalk tuple because Reltio documents an ID fallback in that case.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/get-entity-by-crosswalk
+      section: Request, Parameters, and Response
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-11
+    commands: [entity.by-crosswalk, api.request]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_crosswalk_contract, entity_crosswalk_validation, entity_crosswalk_id_fallback, raw_entity_crosswalk_preflight]
+
+  - id: ENTITY-CROSSWALK-CONSISTENCY-001
+    title: Classify entity retrieval by crosswalk as consistent
+    classification: behavior
+    enforcement: metadata
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/_byCrosswalk/{crosswalkValue}"]
+    summary: Entity lookup by crosswalk is a consistent direct read and should be used when immediate visibility matters.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis
+      section: Consistent API endpoints
+      updated_at: 2025-01-17
+    reviewed_at: 2026-08-11
+    commands: [entity.by-crosswalk, api.request]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_crosswalk_contract]
 
   - id: ENTITY-SEARCH-POST-001
     title: Prefer POST-body entity search
@@ -378,6 +422,129 @@ practices:
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_search_filter_guard, entity_scan_filter_guard, query_plus_encoding, raw_query_filter_guard]
 
+  - id: ENTITY-HISTORY-CONTRACT-001
+    title: Preserve the reviewed Entity History request and response contract
+    classification: behavior
+    enforcement: hard_guard
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}/_changes"]
+    limits:
+      default_max: 50
+      options: [skipReferenceAttributesProcessing]
+      order: [asc, desc]
+    summary: Have the typed command send an explicit order, and require raw callers to provide one for reviewed coverage, because the reference and OpenAPI defaults conflict; reject filter with showAll because Reltio ignores that filter, expose the one documented performance option deliberately because it can omit reference-attribute deltas, and preserve the ObjectChangeTO array without remodeling.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
+      section: Parameters and Response
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-11
+    commands: [entity.history, api.request]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_history_contract, entity_history_boundary, raw_entity_history_preflight]
+
+  - id: ENTITY-HISTORY-PERFORMANCE-001
+    title: Explain Entity History performance tradeoffs before selection
+    classification: recommendation
+    enforcement: actionable_warning
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}/_changes"]
+    summary: Reltio recommends showAll=true when no changes filter is used and skipReferenceAttributesProcessing for lower latency; keep both caller-selected because showAll changes event inclusion and the skip option can omit reference-attribute deltas.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
+      section: Response-time recommendations
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-11
+    commands: [entity.history, api.request]
+    implementation: crates/reltio-cli/src/commands/api.rs
+    test_ids: [entity_history_guidance, raw_entity_history_preflight]
+
+  - id: ENTITY-HISTORY-CANONICAL-VALUES-001
+    title: Explain stored canonical values in Entity History
+    classification: behavior
+    enforcement: actionable_warning
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}/_changes"]
+    summary: Warn that history displays stored canonical values and does not retranscode them for Accept-Language, so a historical value can differ from a current entity read.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
+      section: Response and canonical values
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-11
+    commands: [entity.history, api.request]
+    implementation: crates/reltio-cli/src/commands/entity.rs
+    test_ids: [entity_history_canonical_values, raw_entity_history_preflight]
+
+  - id: ENTITY-HISTORY-BOUNDARY-001
+    title: Stay within the 1,000-event Entity History boundary
+    classification: limit
+    enforcement: hard_guard
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}/_changes"]
+    limits:
+      offset_plus_max: 1000
+      default_max: 50
+    summary: Refuse offset plus max above 1,000 and warn when a full page reaches the boundary because the current reference says pagination does not work beyond the most recent 1,000 events, despite broader wording in OpenAPI when major-events-only is disabled.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
+      section: Parameters and 1,000-event note
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-11
+    commands: [entity.history, api.request]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_history_contract, entity_history_boundary, raw_entity_history_preflight]
+
+  - id: ENTITY-MATCHES-CONTRACT-001
+    title: Retrieve stored direct potential matches without forced recalculation
+    classification: behavior
+    enforcement: automatic_default
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}/_matches"]
+    limits:
+      cli_default_max: 50
+      upstream_default_max: 200
+      offset_default: 0
+      deep: 1
+      transitive: false
+      forceMatch: false
+      match_types: [automatic, relevance_based, suspect]
+    summary: Keep the typed MVP read-only and replay-safe by explicitly requesting stored direct matches, hard-refuse raw forceMatch=true until recalculation safety is reviewed, require raw callers to set deep=1 for reviewed direct-only coverage, limit type filters to the documented built-ins, preserve the dynamic object of match-group arrays, and do not invent continuation metadata because grouped pagination cardinality is undocumented. Reltio documents 200 as a default, not a maximum.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/potential-matches-api
+      section: Request, Parameters, and Response
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-11
+    commands: [entity.matches, api.request]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_matches_contract, entity_matches_validation, raw_entity_matches_preflight]
+
+  - id: ENTITY-MATCHES-FRESHNESS-001
+    title: Warn that stored potential matches can be absent or out of date
+    classification: behavior
+    enforcement: actionable_warning
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}/_matches"]
+    summary: Warn on every stored potential-match read that ON_REQUEST can return empty or outdated results, strategy NONE disables matching, and custom PUBLISH_POTENTIAL_LINK_PAIR results are absent unless SuspectMatchHandler persists them; forceMatch remains outside the reviewed typed and raw contract.
+    source:
+      url: https://docs.reltio.com/en/reltio/what-does-reltio-do/what-reltio-does-at-a-glance/data-unification-and-mdm-at-a-glance/data-unification-and-mdm-in-detail/reltio-match-and-merge/additional-topics-on-matching
+      section: Tenant-level match strategy
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-11
+    commands: [entity.matches, api.request]
+    implementation: crates/reltio-cli/src/commands/entity.rs
+    test_ids: [entity_matches_contract, raw_entity_matches_preflight]
+
   - id: ENTITY-LOSSLESS-001
     title: Preserve evolving entity response fields losslessly
     classification: release_change
@@ -385,19 +552,21 @@ practices:
     api_family: entity
     service: data
     methods: [GET, POST]
-    path_patterns: ["/entities", "/entities/{id}", "/entities/_search", "/entities/_scan"]
+    path_patterns: ["/entities", "/entities/{id}", "/entities/_byCrosswalk/{crosswalkValue}", "/entities/_search", "/entities/_scan", "/entities/{id}/_matches"]
     operations:
       - { method: GET, path_pattern: "/entities" }
       - { method: GET, path_pattern: "/entities/{id}" }
+      - { method: GET, path_pattern: "/entities/_byCrosswalk/{crosswalkValue}" }
       - { method: GET, path_pattern: "/entities/_search" }
       - { method: POST, path_pattern: "/entities/_search" }
       - { method: POST, path_pattern: "/entities/_scan" }
-    summary: Preserve every field and value returned by Reltio, including newer explainOv survivorship details, rather than remodeling the received payload lossily; explicit upstream field/value limits remain caller-visible.
+      - { method: GET, path_pattern: "/entities/{id}/_matches" }
+    summary: Preserve every field and value within the reviewed response schemas, including wrapper fields, match-group results, and newer explainOv survivorship details, rather than remodeling payloads lossily; reject top-level shapes outside an endpoint's current OpenAPI schema and keep explicit upstream field/value limits caller-visible.
     source:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api
       section: Entity object structure
       updated_at: 2026-07-31
     reviewed_at: 2026-08-08
-    commands: [entity.get, entity.search, entity.scan, auth.check, api.request, doctor]
+    commands: [entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.matches, auth.check, api.request, doctor]
     implementation: crates/reltio-client/src/entities.rs
-    test_ids: [entity_lossless_roundtrip, entity_response_fidelity, entity_response_arbitrary_precision, entity_typed_raw_fidelity]
+    test_ids: [entity_lossless_roundtrip, entity_crosswalk_contract, entity_matches_contract, entity_response_fidelity, entity_response_arbitrary_precision, entity_typed_raw_fidelity]

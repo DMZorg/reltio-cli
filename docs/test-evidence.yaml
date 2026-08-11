@@ -57,6 +57,18 @@ tests:
   - id: auth_credential_process_preparse_guard
     path: crates/reltio-client/src/auth.rs
     function: credential_process_executes_a_private_absolute_file_and_bounds_failures
+  - id: auth_credential_process_descendant_cleanup
+    path: crates/reltio-client/src/auth.rs
+    function: credential_process_executes_a_private_absolute_file_and_bounds_failures
+  - id: auth_windows_credential_process_job_cleanup
+    path: crates/reltio-windows-security/src/lib.rs
+    function: credential_process_job_starts_suspended_and_terminates_descendants
+  - id: auth_config_lock_cancellation
+    path: crates/reltio-client/src/config.rs
+    function: config_lock_wait_observes_cancellation_without_late_commit
+  - id: auth_sigint_login_no_commit
+    path: crates/reltio-cli/tests/cli.rs
+    function: sigint_during_login_exits_130_without_committing_or_disclosing_provider_output
   - id: auth_same_token_reissue_guard
     path: crates/reltio-client/src/auth.rs
     function: concurrent_rejections_stop_when_the_provider_reissues_the_same_token
@@ -135,15 +147,36 @@ tests:
   - id: auth_token_raw_newline_guard
     path: crates/reltio-cli/tests/cli.rs
     function: raw_auth_token_rejects_refresh_token_that_spans_its_appended_newline
-  - id: api_mutation_broken_pipe_state
+  - id: mutation_audit_absence_fails_closed
     path: crates/reltio-cli/tests/cli.rs
-    function: raw_mutation_broken_pipe_preserves_non_replayable_outcome
-  - id: api_structured_output_single_error
+    function: mutation_audit_absence_fails_closed_before_network_io
+  - id: mutation_method_safety_fail_closed
+    path: crates/reltio-cli/src/commands/api.rs
+    function: registered_safety_overrides_http_method_defaults_fail_closed
+  - id: release_prd_inventory
+    path: crates/reltio-cli/src/release.rs
+    function: release_readiness_reports_the_independent_prd_inventory
+  - id: release_endpoint_role_ownership
+    path: crates/reltio-cli/src/release.rs
+    function: endpoint_roles_do_not_count_dependencies_as_typed_ownership
+  - id: release_inventory_substitution_guard
+    path: crates/reltio-client/src/registry.rs
+    function: release_inventory_rejects_substituted_required_operation
+  - id: release_safety_binding_downgrade_guard
+    path: crates/reltio-client/src/registry.rs
+    function: release_inventory_rejects_safety_and_endpoint_downgrades
+  - id: release_unknown_field_guard
+    path: crates/reltio-client/src/registry.rs
+    function: release_requirement_yaml_rejects_unknown_fields
+  - id: release_audit_evidence_separation
+    path: crates/reltio-client/src/registry.rs
+    function: mutation_audit_guard_evidence_cannot_claim_implementation
+  - id: release_version_binding
+    path: crates/reltio-cli/src/commands/api.rs
+    function: release_version_binding_requires_one_stable_exact_version
+  - id: release_cli_gate
     path: crates/reltio-cli/tests/cli.rs
-    function: structured_mutation_broken_pipe_emits_one_error_document
-  - id: api_warning_output_preflight
-    path: crates/reltio-cli/tests/cli.rs
-    function: mutation_warning_sink_failure_precedes_network_request
+    function: release_gate_reports_prd_blockers_and_refuses_stable_readiness
   - id: protected_authorization_header
     path: crates/reltio-client/src/http.rs
     function: protected_headers_are_refused
@@ -264,3 +297,39 @@ tests:
   - id: entity_typed_raw_fidelity
     path: crates/reltio-cli/tests/cli.rs
     function: typed_entity_raw_output_preserves_upstream_bytes
+  - id: entity_crosswalk_contract
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_by_crosswalk_preserves_wrapper_and_consistency_contract
+  - id: entity_crosswalk_validation
+    path: crates/reltio-client/src/entities.rs
+    function: crosswalk_lookup_rejects_special_values_and_disjoint_ov_options
+  - id: entity_crosswalk_id_fallback
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_by_crosswalk_warns_when_documented_id_fallback_is_detected
+  - id: raw_entity_crosswalk_preflight
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_entity_crosswalk_enforces_the_narrowed_contract
+  - id: entity_history_contract
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_history_preserves_changes_and_explicit_order
+  - id: entity_history_boundary
+    path: crates/reltio-client/src/entities.rs
+    function: history_bounds_the_retrievable_window_and_rejects_ignored_filters
+  - id: entity_history_guidance
+    path: crates/reltio-cli/src/metadata.rs
+    function: history_schema_exposes_performance_tradeoffs
+  - id: entity_history_canonical_values
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_history_preserves_changes_and_explicit_order
+  - id: raw_entity_history_preflight
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_entity_history_enforces_conflicts_and_boundary
+  - id: entity_matches_contract
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_matches_preserves_stored_direct_results_and_warns_about_freshness
+  - id: entity_matches_validation
+    path: crates/reltio-client/src/entities.rs
+    function: matches_enforce_the_positive_direct_contract
+  - id: raw_entity_matches_preflight
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_entity_matches_refuses_force_match_and_reviews_only_stored_direct_reads

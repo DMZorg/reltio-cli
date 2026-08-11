@@ -5,15 +5,16 @@ mod doctor;
 mod entity;
 mod profile;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reltio_client::auth::{TokenManager, TokenManagerOptions};
+use reltio_client::cancellation::CancellationToken;
 use reltio_client::config::{
     ConfigFile, ConfigPaths, ConfigStore, Environment, ResolutionOverrides, ResolvedTarget,
     resolve_target,
 };
 use reltio_client::entities::EntitiesClient;
-use reltio_client::error::{ReltioError, Result};
+use reltio_client::error::{ErrorCategory, ReltioError, Result};
 use reltio_client::http::{HttpClient, HttpOptions};
 use reltio_client::redaction::OutputGuard;
 use reltio_client::service::ServiceResolver;
@@ -41,6 +42,7 @@ pub struct Globals {
 #[derive(Debug)]
 pub struct Runtime {
     pub globals: Globals,
+    pub cancellation: CancellationToken,
     pub environment: Environment,
     pub paths: ConfigPaths,
     pub store: ConfigStore,
@@ -48,7 +50,12 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(cli: &Cli, environment: Environment, render: RenderOptions) -> Result<Self> {
+    pub fn new(
+        cli: &Cli,
+        environment: Environment,
+        render: RenderOptions,
+        cancellation: CancellationToken,
+    ) -> Result<Self> {
         let paths = ConfigPaths::discover(&environment)?;
         let store = ConfigStore::new(paths.config_file.clone());
         Ok(Self {
@@ -71,6 +78,7 @@ impl Runtime {
                 verbose: cli.verbose,
                 max_response_bytes: cli.max_response_bytes,
             },
+            cancellation,
             environment,
             paths,
             store,
@@ -79,13 +87,35 @@ impl Runtime {
     }
 
     pub async fn dispatch(&self, command: Command) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            let output_guard = self.local_output_guard();
+            return Err(ReltioError::new(
+                "request_canceled",
+                ErrorCategory::Canceled,
+                "the command was canceled",
+            )
+            .with_details(serde_json::json!({
+                "attempts": 0,
+                "phase": "before_dispatch",
+                "remote_response_received": false,
+                "remote_request_completed": false,
+                "remote_operation_completed": false,
+                "remote_operation_state": "request_not_sent",
+                "safe_to_replay": true
+            }))
+            .with_output_guard(output_guard));
+        }
         if self.render.format == OutputFormat::Raw
             && !matches!(
                 &command,
                 Command::Api(crate::cli::ApiCommand {
                     command: ApiSubcommand::Request(_)
                 }) | Command::Entity(crate::cli::EntityCommand {
-                    command: EntitySubcommand::Get(_) | EntitySubcommand::Search(_)
+                    command: EntitySubcommand::Get(_)
+                        | EntitySubcommand::ByCrosswalk(_)
+                        | EntitySubcommand::Search(_)
+                        | EntitySubcommand::History(_)
+                        | EntitySubcommand::Matches(_)
                 }) | Command::Auth(crate::cli::AuthCommand {
                     command: AuthSubcommand::Token { .. }
                 })
@@ -179,6 +209,36 @@ impl Runtime {
         Ok(Duration::from_secs(30))
     }
 
+    pub fn deadline_from(&self, started: Instant) -> Result<Instant> {
+        started
+            .checked_add(self.timeout()?)
+            .ok_or_else(|| ReltioError::usage("invalid_timeout", "timeout is too large"))
+    }
+
+    pub fn ensure_not_cancelled(
+        &self,
+        phase: &'static str,
+        local_state_committed: bool,
+    ) -> Result<()> {
+        if !self.cancellation.is_cancelled() {
+            return Ok(());
+        }
+        Err(ReltioError::new(
+            "request_canceled",
+            ErrorCategory::Canceled,
+            "the command was canceled",
+        )
+        .with_details(serde_json::json!({
+            "phase": phase,
+            "remote_response_received": false,
+            "remote_request_completed": false,
+            "remote_operation_completed": false,
+            "remote_operation_state": "request_not_sent",
+            "local_state_committed": local_state_committed,
+            "safe_to_replay": !local_state_committed
+        })))
+    }
+
     pub fn token_manager(
         &self,
         target: &ResolvedTarget,
@@ -204,16 +264,45 @@ impl Runtime {
     }
 
     pub fn http_client(&self) -> Result<HttpClient> {
-        HttpClient::new(HttpOptions {
-            timeout: self.timeout()?,
-            connect_timeout: self
-                .globals
-                .connect_timeout
-                .unwrap_or(Duration::from_secs(10)),
-            no_retry: self.globals.no_retry,
-            max_response_bytes: self.globals.max_response_bytes,
-            retry_delay_cap: None,
-        })
+        self.http_client_with_timeout(self.timeout()?)
+    }
+
+    pub fn http_client_until(&self, deadline: Instant) -> Result<HttpClient> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ReltioError::new(
+                "request_timeout",
+                ErrorCategory::Timeout,
+                "the command exceeded the overall timeout before the request was sent",
+            )
+            .with_details(serde_json::json!({
+                "phase": "before_request",
+                "remote_response_received": false,
+                "remote_request_completed": false,
+                "remote_operation_completed": false,
+                "remote_operation_state": "request_not_sent",
+                "local_state_committed": false,
+                "safe_to_replay": true
+            })));
+        }
+        self.http_client_with_timeout(remaining)
+    }
+
+    fn http_client_with_timeout(&self, timeout: Duration) -> Result<HttpClient> {
+        HttpClient::new_with_cancellation(
+            HttpOptions {
+                timeout,
+                connect_timeout: self
+                    .globals
+                    .connect_timeout
+                    .unwrap_or(Duration::from_secs(10))
+                    .min(timeout),
+                no_retry: self.globals.no_retry,
+                max_response_bytes: self.globals.max_response_bytes,
+                retry_delay_cap: None,
+            },
+            self.cancellation.clone(),
+        )
     }
 
     pub fn entities_client(
@@ -224,6 +313,19 @@ impl Runtime {
         Ok(EntitiesClient::new(
             ServiceResolver::new(target.clone()),
             self.http_client()?,
+            token_manager,
+        ))
+    }
+
+    pub fn entities_client_until(
+        &self,
+        target: &ResolvedTarget,
+        token_manager: TokenManager,
+        deadline: Instant,
+    ) -> Result<EntitiesClient> {
+        Ok(EntitiesClient::new(
+            ServiceResolver::new(target.clone()),
+            self.http_client_until(deadline)?,
             token_manager,
         ))
     }

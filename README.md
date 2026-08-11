@@ -11,8 +11,8 @@
 - Supplied bearer, client-credentials, and strict credential-process authentication.
 - Owner-only token cache with cross-process locking and single-flight acquisition.
 - Opaque multi-kilobyte token support and unconditional secret redaction.
-- Typed consistent entity get, POST-body entity search, and resumable cursor scan.
-- Controlled raw requests with protected headers, no credential-forwarding redirects, dry runs, and unreviewed-mutation gates.
+- Typed consistent entity get and crosswalk lookup, bounded history and stored potential matches, POST-body entity search, and resumable cursor scan.
+- Controlled raw reads with protected headers, no credential-forwarding redirects, mutation dry runs, and a fail-closed audit-contract gate.
 - Stable JSON success/error envelopes, JSONL scan events, YAML, table, and raw output.
 - Source-linked API-practice and endpoint registries validated against real test evidence at build time.
 - Embedded agent skills, command schemas, shell completions, and offline/online diagnostics.
@@ -85,7 +85,7 @@ Finite stdout is JSON by default, even on a TTY. Diagnostics go to stderr. See [
 - A token never selects or proves the intended tenant.
 - HTTP redirects are not followed with authorization.
 - Unknown raw reads are labeled `practice_coverage: unknown` and receive no automatic retries.
-- Unreviewed raw mutations require `--allow-unreviewed-endpoint --yes`; production, overridden, and profile-less targets also require exact `--confirm-tenant`.
+- Mutation dry runs require the normal endpoint and target acknowledgements. Actual raw mutations are refused with `mutation_audit_unavailable` until the versioned audit-result contract has implementation evidence.
 - `--dry-run` resolves and validates an API request without sending it; mutation planning remains its primary use.
 - Raw API bodies are refused on terminal stdout; redirect them deliberately. Active credentials and credential-shaped JSON fields remain redacted without applying diagnostic heuristics to ordinary entity values.
 - No general option disables TLS verification, redaction, target validation, or protected-header policy.
@@ -99,9 +99,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo run -p reltio-cli -- api practices check --strict
+cargo run -p reltio-cli -- api practices check --release-ready
 ```
 
-Every Reltio API operation must update `docs/endpoints.yaml`, `docs/reltio-api-practices.yaml`, `docs/test-evidence.yaml`, command metadata, tests, and user/agent guidance together. Read the [product contract](docs/PRD.md) and [repository agent instructions](AGENTS.md) before implementation work.
+The second check is expected to fail during this incomplete alpha and is one mandatory product-MVP gate before a stable `v0.1.0` release. It does not replace platform tests, signing, provenance, packaging, or pilot approval. Stable tags rerun formatting, Clippy, and all attributed tests, then bind the tag, manifest target, and package version through `--expected-release`. Every Reltio API operation must update `docs/endpoints.yaml`, `docs/reltio-api-practices.yaml`, `docs/test-evidence.yaml`, `docs/release-requirements.yaml`, command metadata, tests, and user/agent guidance together. Read the [product contract](docs/PRD.md) and [repository agent instructions](AGENTS.md) before implementation work.
 
 ## Documentation
 

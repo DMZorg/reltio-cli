@@ -25,6 +25,7 @@ pub enum ErrorKind {
     UnsafeAncestor,
     MultipleLinks,
     AlreadyExists,
+    ProcessContainment,
     Io,
 }
 
@@ -117,6 +118,46 @@ pub struct BoundedFile {
 pub struct PrivateExecutableGuard {
     _file: File,
     _directories: DirectoryGuards,
+}
+
+/// Owns a kill-on-close Job Object for one suspended credential process tree.
+#[derive(Debug)]
+pub struct CredentialProcessJob {
+    inner: ffi::CredentialProcessJob,
+}
+
+impl CredentialProcessJob {
+    /// Configures a command to start suspended and prepares its containment Job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a process-containment error if the Job cannot be created or
+    /// configured before process creation.
+    pub fn prepare(command: &mut tokio::process::Command) -> Result<Self> {
+        let inner = ffi::create_credential_process_job()?;
+        command.creation_flags(ffi::credential_process_creation_flags());
+        command.kill_on_drop(true);
+        Ok(Self { inner })
+    }
+
+    /// Assigns the suspended child to this Job and resumes its sole primary thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed containment error if assignment, thread identity
+    /// validation, or the single resume transition cannot be proven.
+    pub fn assign_and_resume(&self, child: &tokio::process::Child) -> Result<()> {
+        ffi::assign_credential_process_and_resume(&self.inner, child)
+    }
+
+    /// Terminates every process currently associated with this Job.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if Windows refuses Job termination.
+    pub fn terminate(&self) -> Result<()> {
+        ffi::terminate_credential_process_job(&self.inner)
+    }
 }
 
 impl BoundedFile {
@@ -820,6 +861,9 @@ mod tests {
         FILE_SHARE_WRITE, FILE_WRITE_DATA,
     };
 
+    const JOB_TEST_ROLE: &str = "RELTIO_WINDOWS_JOB_TEST_ROLE";
+    const JOB_TEST_DIRECTORY: &str = "RELTIO_WINDOWS_JOB_TEST_DIRECTORY";
+
     #[test]
     fn creation_uses_private_file_and_directory_acls() {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -1142,6 +1186,80 @@ mod tests {
         drop(guard);
         assert!(output.status.success());
         assert!(!output.stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credential_process_job_starts_suspended_and_terminates_descendants() {
+        if let Ok(role) = std::env::var(JOB_TEST_ROLE) {
+            let directory = PathBuf::from(
+                std::env::var_os(JOB_TEST_DIRECTORY).expect("job test directory environment"),
+            );
+            if role == "grandchild" {
+                fs::write(directory.join("grandchild-ready"), b"ready")
+                    .expect("write grandchild readiness");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                fs::write(directory.join("descendant-survived"), b"survived")
+                    .expect("write survivor marker");
+                return;
+            }
+            let executable = std::env::current_exe().expect("current test executable");
+            let mut grandchild = Command::new(executable)
+                .args([
+                    "--exact",
+                    "tests::credential_process_job_starts_suspended_and_terminates_descendants",
+                ])
+                .env(JOB_TEST_ROLE, "grandchild")
+                .env(JOB_TEST_DIRECTORY, &directory)
+                .spawn()
+                .expect("spawn job-test grandchild");
+            fs::write(directory.join("parent-ready"), b"ready").expect("write parent readiness");
+            let _ = grandchild.wait();
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "tests::credential_process_job_starts_suspended_and_terminates_descendants",
+            ])
+            .env(JOB_TEST_ROLE, "parent")
+            .env(JOB_TEST_DIRECTORY, directory.path())
+            .kill_on_drop(true);
+        let job = CredentialProcessJob::prepare(&mut command).expect("prepare Job containment");
+        let mut child = command.spawn().expect("spawn suspended job-test parent");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !directory.path().join("parent-ready").exists(),
+            "the child executed before Job assignment and resume"
+        );
+        job.assign_and_resume(&child)
+            .expect("assign and resume contained child");
+        for _ in 0..200 {
+            if directory.path().join("parent-ready").exists()
+                && directory.path().join("grandchild-ready").exists()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(directory.path().join("parent-ready").exists());
+        assert!(directory.path().join("grandchild-ready").exists());
+
+        job.terminate().expect("terminate contained process tree");
+        tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .expect("contained child exits promptly")
+            .expect("wait for contained child");
+        drop(job);
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        assert!(
+            !directory.path().join("descendant-survived").exists(),
+            "a descendant survived Job termination"
+        );
     }
 
     #[test]

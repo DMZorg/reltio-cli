@@ -593,6 +593,8 @@ mod tests {
             tenant: "ExampleTenant".to_owned(),
             production: false,
             target_overridden: false,
+            routing_overridden: false,
+            tenant_overridden: false,
             base_url: None,
             service_urls: BTreeMap::new(),
             auth: AuthProfile::default(),

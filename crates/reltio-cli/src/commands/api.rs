@@ -6,12 +6,15 @@ use is_terminal::IsTerminal;
 use reltio_client::MAX_POST_BODY_BYTES;
 use reltio_client::auth::TokenManagerOptions;
 use reltio_client::entities::{
-    EntityGetOptions, EntityScanRequest, EntitySearchRequest, SEARCH_BOUNDARY_WARNING,
-    SEARCH_RESULT_BOUNDARY, validate_get, validate_query_filter, validate_scan, validate_search,
+    ENTITY_MATCH_TYPES, EntityByCrosswalkRequest, EntityGetOptions, EntityHistoryRequest,
+    EntityMatchesRequest, EntityScanRequest, EntitySearchRequest, HISTORY_BOUNDARY_WARNING,
+    HISTORY_CANONICAL_VALUES_WARNING, HISTORY_RESULT_BOUNDARY, POTENTIAL_MATCHES_FRESHNESS_WARNING,
+    SEARCH_BOUNDARY_WARNING, SEARCH_RESULT_BOUNDARY, validate_by_crosswalk, validate_get,
+    validate_history, validate_matches, validate_query_filter, validate_scan, validate_search,
 };
 use reltio_client::error::{ErrorCategory, ReltioError, Result, json_parse_details};
 use reltio_client::fs::read_bounded;
-use reltio_client::http::{RequestSpec, validate_user_header};
+use reltio_client::http::{ApiResponse, RequestSpec, validate_user_header};
 use reltio_client::redaction::{redact_bytes, redact_text, redact_url, sensitive_query_key};
 use reltio_client::registry::{PracticeCoverage, Registry, ReplayPolicy, Safety};
 use reltio_client::service::{Service, ServiceResolver, canonical_url_path};
@@ -20,9 +23,13 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::audit;
 use crate::cli::{ApiPracticesSubcommand, ApiRequestArgs, ApiSubcommand, OutputFormat};
 use crate::commands::{Runtime, sha256_hex};
 use crate::output::{Meta, write_raw_guarded, write_success_guarded, write_warning_guarded};
+use crate::release;
+
+const HISTORY_SELECTION_WARNING: &str = "Reltio recommends showAll=true when no history filter is used and offers skipReferenceAttributesProcessing when lower latency is more important than complete reference-attribute deltas";
 
 pub async fn run(runtime: &Runtime, command: ApiSubcommand) -> Result<()> {
     match command {
@@ -33,6 +40,7 @@ pub async fn run(runtime: &Runtime, command: ApiSubcommand) -> Result<()> {
 
 async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     let method = parse_method(&arguments.method)?;
     if arguments.service == Service::Auth {
         return Err(ReltioError::new(
@@ -86,13 +94,19 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
         apply_practice_preflight(&practice.id, &query)?;
     }
     if let Some(endpoint) = endpoint {
-        if !apply_endpoint_preflight(endpoint.id.as_str(), &query, &headers, body.as_deref())? {
+        if !apply_endpoint_preflight(
+            endpoint.id.as_str(),
+            &endpoint_path,
+            &query,
+            &headers,
+            body.as_deref(),
+        )? {
             coverage = PracticeCoverage::Partial;
         }
     }
     let search_window = reviewed_entity_search_window(endpoint, &query, body.as_deref())?;
-    let read_semantic = endpoint.is_some_and(|entry| entry.safety == Safety::Read)
-        || matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+    let history_window = reviewed_entity_history_window(endpoint, &query)?;
+    let read_semantic = request_is_read_semantic(endpoint.map(|entry| entry.safety), &method);
     if arguments.service == Service::Mcp && !read_semantic {
         return Err(ReltioError::new(
             "raw_mcp_mutation_refused",
@@ -119,6 +133,24 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
             unreviewed_mutation,
             arguments.allow_unreviewed_endpoint,
         )?;
+        if !runtime.globals.dry_run && !audit::mutation_audit_available(registry) {
+            return Err(ReltioError::new(
+                "mutation_audit_unavailable",
+                ErrorCategory::Safety,
+                "raw mutations are disabled until mutation_audit_v1 has implementation evidence",
+            )
+            .with_details(json!({
+                "required_contract": audit::MUTATION_AUDIT_CONTRACT_ID,
+                "body_sha256": body.as_deref().map(sha256_hex),
+                "remote_response_received": false,
+                "remote_request_completed": false,
+                "remote_operation_completed": false,
+                "remote_operation_state": "request_not_sent",
+                "local_state_committed": false,
+                "safe_to_replay": true
+            }))
+            .with_hint("Use --dry-run to inspect the plan. Add a reviewed typed mutation and complete the audit-result contract before sending it."));
+        }
     }
     let replay = if coverage == PracticeCoverage::Reviewed {
         endpoint.map_or(ReplayPolicy::Unsafe, |entry| entry.replay)
@@ -133,7 +165,7 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
     }
     if runtime.globals.dry_run {
         let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
-        let auth_status = manager.status()?;
+        let auth_status = manager.status_until(deadline)?;
         let known_secrets = dry_run_known_secrets(runtime);
         let mut meta =
             Meta::new("api.request").with_target(&target, Some(&arguments.service.to_string()));
@@ -170,26 +202,39 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
             "network_request_sent": false
         });
         let output_guard = manager.redact_local_credentials(&mut plan, &known_secrets)?;
+        runtime
+            .ensure_not_cancelled("before_dry_run_output", false)
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        if Instant::now() >= deadline {
+            return Err(ReltioError::new(
+                "request_timeout",
+                ErrorCategory::Timeout,
+                "the command exceeded its overall timeout during local preflight",
+            )
+            .with_details(json!({
+                "phase": "dry_run",
+                "remote_response_received": false,
+                "remote_request_completed": false,
+                "remote_operation_completed": false,
+                "remote_operation_state": "request_not_sent",
+                "local_state_committed": false,
+                "safe_to_replay": true
+            }))
+            .with_output_guard(output_guard));
+        }
         return write_success_guarded(&plan, &meta, runtime.render, &output_guard);
     }
 
     let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
     let local_guard = manager.output_guard()?;
     let auth_status = manager
-        .status()
+        .status_until(deadline)
         .map_err(|error| error.with_output_guard(local_guard.clone()))?;
     if matches!(
         runtime.render.format,
         OutputFormat::Raw | OutputFormat::Table
     ) {
-        for warning in [
-            coverage_warning(coverage),
-            endpoint_warning(endpoint),
-            query_warning(endpoint, &query),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for warning in request_warnings(coverage, endpoint, &query) {
             write_warning_guarded(warning, runtime.globals.quiet, &local_guard)?;
         }
     }
@@ -209,9 +254,9 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
     spec.replay = replay;
     spec.practice_ids.clone_from(&practice_ids);
     let mut response = runtime
-        .http_client()
+        .http_client_until(deadline)
         .map_err(|error| error.with_output_guard(local_guard.clone()))?
-        .execute(&manager, spec)
+        .execute_until(&manager, spec, deadline)
         .await
         .map_err(|error| error.with_output_guard(local_guard.clone()))?;
     let mut output_guard = response.output_guard();
@@ -224,21 +269,26 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
         )
     })?;
     output_guard.merge(&refreshed_local_guard);
+    ensure_api_response_active(runtime, deadline, &response, read_semantic, &output_guard)?;
 
     if runtime.render.format == OutputFormat::Raw {
-        let boundary_reached = if search_window.is_some() {
-            let data = response.data_value().map_err(|error| {
-                response_output_error(
-                    error,
-                    response.status,
-                    response.request_id.clone(),
-                    !read_semantic,
+        let (search_boundary_reached, history_boundary_reached) =
+            if search_window.is_some() || history_window.is_some() {
+                let data = response.data_value().map_err(|error| {
+                    response_output_error(
+                        error,
+                        response.status,
+                        response.request_id.clone(),
+                        !read_semantic,
+                    )
+                })?;
+                (
+                    entity_search_boundary_reached(search_window, &data),
+                    entity_history_boundary_reached(history_window, &data),
                 )
-            })?;
-            entity_search_boundary_reached(search_window, &data)
-        } else {
-            false
-        };
+            } else {
+                (false, false)
+            };
         let body = response.redacted_body().map_err(|error| {
             response_output_error(
                 error,
@@ -249,16 +299,18 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
         })?;
         let status = response.status;
         let request_id = response.request_id.clone();
-        if boundary_reached {
-            write_warning_guarded(
-                SEARCH_BOUNDARY_WARNING,
-                runtime.globals.quiet,
-                &output_guard,
-            )
-            .map_err(|error| {
-                response_output_error(error, status, request_id.clone(), !read_semantic)
-            })?;
+        for warning in [
+            search_boundary_reached.then_some(SEARCH_BOUNDARY_WARNING),
+            history_boundary_reached.then_some(HISTORY_BOUNDARY_WARNING),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            write_warning_guarded(warning, runtime.globals.quiet, &output_guard).map_err(
+                |error| response_output_error(error, status, request_id.clone(), !read_semantic),
+            )?;
         }
+        ensure_api_response_active(runtime, deadline, &response, read_semantic, &output_guard)?;
         drop(response);
         return write_raw_guarded(&body, false, &output_guard)
             .map_err(|error| response_output_error(error, status, request_id, !read_semantic));
@@ -271,7 +323,8 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
             !read_semantic,
         )
     })?;
-    let boundary_reached = entity_search_boundary_reached(search_window, &response_data);
+    let search_boundary_reached = entity_search_boundary_reached(search_window, &response_data);
+    let history_boundary_reached = entity_history_boundary_reached(history_window, &response_data);
     let data = if arguments.include_headers {
         json!({
             "body": response_data,
@@ -291,29 +344,74 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
     meta.consistency = endpoint.map(|entry| entry.consistency);
     meta.auth_source = Some(auth_status.source);
     append_request_warnings(&mut meta, coverage, endpoint, &query);
-    if boundary_reached {
-        meta.warnings.push(SEARCH_BOUNDARY_WARNING.to_owned());
+    for warning in [
+        search_boundary_reached.then_some(SEARCH_BOUNDARY_WARNING),
+        history_boundary_reached.then_some(HISTORY_BOUNDARY_WARNING),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        meta.warnings.push(warning.to_owned());
         if runtime.render.format == OutputFormat::Table {
-            write_warning_guarded(
-                SEARCH_BOUNDARY_WARNING,
-                runtime.globals.quiet,
-                &output_guard,
-            )
-            .map_err(|error| {
-                response_output_error(
-                    error,
-                    response.status,
-                    response.request_id.clone(),
-                    !read_semantic,
-                )
-            })?;
+            write_warning_guarded(warning, runtime.globals.quiet, &output_guard).map_err(
+                |error| {
+                    response_output_error(
+                        error,
+                        response.status,
+                        response.request_id.clone(),
+                        !read_semantic,
+                    )
+                },
+            )?;
         }
     }
     let status = response.status;
     let request_id = response.request_id.clone();
+    ensure_api_response_active(runtime, deadline, &response, read_semantic, &output_guard)?;
     drop(response);
     write_success_guarded(&data, &meta, runtime.render, &output_guard)
         .map_err(|error| response_output_error(error, status, request_id, !read_semantic))
+}
+
+fn ensure_api_response_active(
+    runtime: &Runtime,
+    deadline: Instant,
+    response: &ApiResponse,
+    read_semantic: bool,
+    output_guard: &reltio_client::redaction::OutputGuard,
+) -> Result<()> {
+    let (code, category, message) = if runtime.cancellation.is_cancelled() {
+        (
+            "request_canceled",
+            ErrorCategory::Canceled,
+            "the command was canceled after a successful response was received",
+        )
+    } else if Instant::now() >= deadline {
+        (
+            "request_timeout",
+            ErrorCategory::Timeout,
+            "the command exceeded its overall timeout after a successful response was received",
+        )
+    } else {
+        return Ok(());
+    };
+    Err(ReltioError::new(code, category, message)
+        .with_http_status(response.status)
+        .with_request_id(response.request_id.clone())
+        .with_details(json!({
+            "phase": "response_processing",
+            "remote_response_received": true,
+            "remote_request_completed": true,
+            "remote_operation_completed": read_semantic.then_some(true),
+            "remote_operation_state": if read_semantic {
+                "success_response_received"
+            } else {
+                "success_response_received_completion_unknown"
+            },
+            "local_state_committed": false,
+            "safe_to_replay": read_semantic
+        }))
+        .with_output_guard(output_guard.clone()))
 }
 
 fn response_output_error(
@@ -368,15 +466,21 @@ fn append_request_warnings(
     endpoint: Option<&reltio_client::registry::Endpoint>,
     query: &[(String, String)],
 ) {
-    if let Some(warning) = coverage_warning(coverage) {
+    for warning in request_warnings(coverage, endpoint, query) {
         meta.warnings.push(warning.to_owned());
     }
-    if let Some(warning) = endpoint_warning(endpoint) {
-        meta.warnings.push(warning.to_owned());
-    }
-    if let Some(warning) = query_warning(endpoint, query) {
-        meta.warnings.push(warning.to_owned());
-    }
+}
+
+fn request_warnings(
+    coverage: PracticeCoverage,
+    endpoint: Option<&reltio_client::registry::Endpoint>,
+    query: &[(String, String)],
+) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    warnings.extend(coverage_warning(coverage));
+    warnings.extend(endpoint_warning(endpoint));
+    warnings.extend(query_warnings(endpoint, query));
+    warnings
 }
 
 fn coverage_warning(coverage: PracticeCoverage) -> Option<&'static str> {
@@ -392,27 +496,40 @@ fn coverage_warning(coverage: PracticeCoverage) -> Option<&'static str> {
 }
 
 fn endpoint_warning(endpoint: Option<&reltio_client::registry::Endpoint>) -> Option<&'static str> {
-    endpoint
-        .is_some_and(|endpoint| {
-            matches!(
-                endpoint.id.as_str(),
-                "entity.search.get" | "entity.search.get_alias"
-            )
-        })
-        .then_some("Reltio recommends POST /entities/_search with parameters in the request body")
+    match endpoint.map(|endpoint| endpoint.id.as_str()) {
+        Some("entity.search.get" | "entity.search.get_alias") => {
+            Some("Reltio recommends POST /entities/_search with parameters in the request body")
+        }
+        Some("entity.history") => Some(HISTORY_CANONICAL_VALUES_WARNING),
+        _ => None,
+    }
 }
 
-fn query_warning(
+fn query_warnings(
     endpoint: Option<&reltio_client::registry::Endpoint>,
     query: &[(String, String)],
-) -> Option<&'static str> {
-    (endpoint.is_some_and(|endpoint| endpoint.id == "entity.get")
-        && query
-            .iter()
-            .any(|(key, _)| key == "reverseTranscodeLookups"))
-    .then_some(
-        "reverseTranscodeLookups was introduced by Reltio as Preview; verify tenant availability and destination-system mappings before relying on the result",
-    )
+) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    match endpoint.map(|endpoint| endpoint.id.as_str()) {
+        Some("entity.get")
+            if query
+                .iter()
+                .any(|(key, _)| key == "reverseTranscodeLookups") =>
+        {
+            warnings.push(
+                "reverseTranscodeLookups was introduced by Reltio as Preview; verify tenant availability and destination-system mappings before relying on the result",
+            );
+        }
+        Some("entity.matches") => warnings.push(POTENTIAL_MATCHES_FRESHNESS_WARNING),
+        Some("entity.history")
+            if query_value(query, "filter").is_none()
+                && query_value(query, "showAll") != Some("true") =>
+        {
+            warnings.push(HISTORY_SELECTION_WARNING);
+        }
+        _ => {}
+    }
+    warnings
 }
 
 fn dry_run_known_secrets(runtime: &Runtime) -> Vec<&str> {
@@ -486,9 +603,31 @@ fn practices(runtime: &Runtime, command: ApiPracticesSubcommand) -> Result<()> {
                 })?,
             )
         }
-        ApiPracticesSubcommand::Check { strict } => {
+        ApiPracticesSubcommand::Check {
+            strict,
+            release_ready,
+            expected_release,
+        } => {
+            if let Some(expected_release) = expected_release {
+                let expected_release = normalized_stable_release(&expected_release)?;
+                let manifest_release = registry.requirements().target_release.as_str();
+                let cli_release = env!("CARGO_PKG_VERSION");
+                if !release_versions_match(&expected_release, manifest_release, cli_release) {
+                    return Err(ReltioError::new(
+                        "release_version_mismatch",
+                        ErrorCategory::Conflict,
+                        "the release tag, product contract, and built package version do not match",
+                    )
+                    .with_details(json!({
+                        "expected_release": expected_release,
+                        "manifest_release": manifest_release,
+                        "cli_version": cli_release
+                    }))
+                    .with_hint("Update the package and PRD-bound release manifest together before creating the stable tag."));
+                }
+            }
             let age = registry.review_age_days()?;
-            if strict && age > 14 {
+            if (strict || release_ready) && age > 14 {
                 return Err(ReltioError::new(
                     "practice_review_stale",
                     ErrorCategory::Conflict,
@@ -500,7 +639,7 @@ fn practices(runtime: &Runtime, command: ApiPracticesSubcommand) -> Result<()> {
                 .endpoints()
                 .iter()
                 .all(|endpoint| registry.coverage(Some(endpoint)) == PracticeCoverage::Reviewed);
-            if strict && !all_reviewed {
+            if (strict || release_ready) && !all_reviewed {
                 return Err(ReltioError::new(
                     "practice_coverage_incomplete",
                     ErrorCategory::Conflict,
@@ -516,13 +655,24 @@ fn practices(runtime: &Runtime, command: ApiPracticesSubcommand) -> Result<()> {
                         "service": endpoint.service,
                         "method": endpoint.method,
                         "path_pattern": endpoint.path_pattern,
-                        "commands": endpoint.commands,
+                        "commands": endpoint.commands().collect::<Vec<_>>(),
+                        "command_links": endpoint.command_links,
                         "practice_ids": endpoint.practice_ids,
                         "test_ids": endpoint.test_ids,
                         "coverage": registry.coverage(Some(endpoint))
                     })
                 })
                 .collect::<Vec<_>>();
+            let release_readiness = release::readiness(registry)?;
+            if release_ready && release_readiness["release_ready"] != true {
+                return Err(ReltioError::new(
+                    "release_operations_incomplete",
+                    ErrorCategory::Conflict,
+                    "the v0.1.0 product MVP still has missing operations, approved endpoint bindings, capabilities, acceptance scenarios, or contract evidence/runtime support",
+                )
+                .with_details(release_readiness)
+                .with_hint("Resolve every blocker reported by `reltio api practices check` before a stable v0.1.0 release."));
+            }
             (
                 "api.practices.check",
                 json!({
@@ -534,6 +684,7 @@ fn practices(runtime: &Runtime, command: ApiPracticesSubcommand) -> Result<()> {
                     "review_age_days": age,
                     "release_freshness_max_days": 14,
                     "release_fresh": age <= 14,
+                    "release_requirements": release_readiness,
                     "corpus_commit": registry.metadata().corpus_commit,
                     "release_notes_through": registry.metadata().release_notes_through,
                     "endpoints": endpoint_coverage
@@ -562,6 +713,34 @@ fn parse_method(value: &str) -> Result<Method> {
         ));
     }
     Ok(method)
+}
+
+fn normalized_stable_release(value: &str) -> Result<String> {
+    let normalized = value.strip_prefix('v').unwrap_or(value);
+    let segments = normalized.split('.').collect::<Vec<_>>();
+    let valid_segment = |segment: &&str| {
+        !segment.is_empty()
+            && segment.bytes().all(|byte| byte.is_ascii_digit())
+            && (segment.len() == 1 || !segment.starts_with('0'))
+    };
+    if segments.len() != 3 || !segments.iter().all(valid_segment) {
+        return Err(ReltioError::usage(
+            "invalid_expected_release",
+            format!("expected stable release version MAJOR.MINOR.PATCH, received {value:?}"),
+        ));
+    }
+    Ok(normalized.to_owned())
+}
+
+fn release_versions_match(expected: &str, manifest: &str, cli: &str) -> bool {
+    expected == manifest && expected == cli
+}
+
+fn request_is_read_semantic(endpoint_safety: Option<Safety>, method: &Method) -> bool {
+    endpoint_safety.map_or_else(
+        || matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS),
+        |safety| safety == Safety::Read,
+    )
 }
 
 fn parse_query(values: &[String]) -> Result<Vec<(String, String)>> {
@@ -675,11 +854,42 @@ fn endpoint_relative_path(base: &url::Url, request: &url::Url) -> Result<String>
 
 fn apply_endpoint_preflight(
     endpoint_id: &str,
+    endpoint_path: &str,
     query: &[(String, String)],
     headers: &HeaderMap,
     body: Option<&[u8]>,
 ) -> Result<bool> {
     match endpoint_id {
+        "entity.by-crosswalk" => {
+            if body.is_some() {
+                return Err(ReltioError::usage(
+                    "entity_crosswalk_body_refused",
+                    "reviewed GET entity by-crosswalk does not accept a request body",
+                ));
+            }
+            let value = endpoint_path.rsplit('/').next().ok_or_else(|| {
+                ReltioError::internal("matched entity by-crosswalk path has no value")
+            })?;
+            let lookup = EntityByCrosswalkRequest {
+                value: value.to_owned(),
+                source_type: query_value(query, "type")
+                    .ok_or_else(|| {
+                        ReltioError::usage(
+                            "crosswalk_type_required",
+                            "reviewed entity by-crosswalk requires query parameter type",
+                        )
+                    })?
+                    .to_owned(),
+                source_table: query_value(query, "sourceTable").map(ToOwned::to_owned),
+                options: query_value(query, "options")
+                    .map(|value| value.split(',').map(ToOwned::to_owned).collect())
+                    .unwrap_or_default(),
+            };
+            validate_by_crosswalk(&lookup)?;
+            Ok(query
+                .iter()
+                .all(|(key, _)| matches!(key.as_str(), "type" | "sourceTable" | "options")))
+        }
         "entity.get" => {
             if body.is_some() {
                 return Err(ReltioError::usage(
@@ -829,6 +1039,101 @@ fn apply_endpoint_preflight(
                 )
             }))
         }
+        "entity.history" => {
+            let explicit_order = query_value(query, "order").is_some();
+            let options = query_value(query, "options")
+                .map(|value| value.split(',').collect::<Vec<_>>())
+                .unwrap_or_default();
+            if options
+                .iter()
+                .any(|option| *option != "skipReferenceAttributesProcessing")
+            {
+                return Err(ReltioError::usage(
+                    "invalid_history_option",
+                    "the reviewed entity history option is skipReferenceAttributesProcessing",
+                ));
+            }
+            let history = EntityHistoryRequest {
+                max: query_operation_u32(query, "max", "entity_history")?.unwrap_or(50),
+                offset: query_operation_u32(query, "offset", "entity_history")?.unwrap_or(0),
+                order: query_value(query, "order").unwrap_or("desc").to_owned(),
+                filter: query_value(query, "filter").map(ToOwned::to_owned),
+                show_all: query_operation_bool(query, "showAll", "entity_history")?
+                    .unwrap_or(false),
+                show_major_events_only: query_operation_bool(
+                    query,
+                    "showMajorEventsOnly",
+                    "entity_history",
+                )?,
+                skip_reference_attributes_processing: !options.is_empty(),
+            };
+            validate_history("entities/reviewed", &history)?;
+            Ok(explicit_order
+                && query.iter().all(|(key, _)| {
+                    matches!(
+                        key.as_str(),
+                        "max"
+                            | "offset"
+                            | "order"
+                            | "filter"
+                            | "showAll"
+                            | "showMajorEventsOnly"
+                            | "options"
+                    )
+                }))
+        }
+        "entity.matches" => {
+            let transitive =
+                query_operation_bool(query, "transitive", "entity_matches")?.unwrap_or(false);
+            let force_match =
+                query_operation_bool(query, "forceMatch", "entity_matches")?.unwrap_or(false);
+            if force_match {
+                return Err(ReltioError::new(
+                    "raw_force_match_refused",
+                    ErrorCategory::Safety,
+                    "forceMatch=true is disabled until forced recalculation has a reviewed cost, state-change, and replay-safety contract",
+                )
+                .with_details(json!({
+                    "network_request_sent": false,
+                    "local_state_committed": false,
+                    "safe_to_replay": true
+                }))
+                .with_hint("Use forceMatch=false to retrieve stored direct matches."));
+            }
+            let deep = query_operation_u32(query, "deep", "entity_matches")?;
+            if deep == Some(0) {
+                return Err(ReltioError::usage(
+                    "invalid_matches_depth",
+                    "entity matches deep must be greater than zero",
+                ));
+            }
+            let match_type = query_value(query, "type");
+            if match_type.is_some_and(|match_type| {
+                match_type.is_empty() || match_type.contains(['\r', '\n', '\0'])
+            }) {
+                return Err(ReltioError::usage(
+                    "invalid_match_type",
+                    "entity matches type must be non-empty and contain no controls",
+                ));
+            }
+            let reviewed_match_type =
+                match_type.is_none_or(|match_type| ENTITY_MATCH_TYPES.contains(&match_type));
+            let matches = EntityMatchesRequest {
+                max: query_operation_u32(query, "max", "entity_matches")?.unwrap_or(200),
+                offset: query_operation_u32(query, "offset", "entity_matches")?.unwrap_or(0),
+                match_type: None,
+            };
+            validate_matches("entities/reviewed", &matches)?;
+            let narrowed_direct_read = !transitive && deep == Some(1);
+            Ok(narrowed_direct_read
+                && reviewed_match_type
+                && query.iter().all(|(key, _)| {
+                    matches!(
+                        key.as_str(),
+                        "transitive" | "forceMatch" | "deep" | "max" | "offset" | "type"
+                    )
+                }))
+        }
         _ => Ok(true),
     }
 }
@@ -875,6 +1180,30 @@ fn entity_search_boundary_reached(search_window: Option<(u32, u32)>, data: &Valu
     };
     let returned = u32::try_from(entities.len()).unwrap_or(u32::MAX);
     returned == maximum && offset.saturating_add(returned) >= SEARCH_RESULT_BOUNDARY
+}
+
+fn reviewed_entity_history_window(
+    endpoint: Option<&reltio_client::registry::Endpoint>,
+    query: &[(String, String)],
+) -> Result<Option<(u32, u32)>> {
+    if endpoint.is_none_or(|endpoint| endpoint.id != "entity.history") {
+        return Ok(None);
+    }
+    Ok(Some((
+        query_operation_u32(query, "offset", "entity_history")?.unwrap_or(0),
+        query_operation_u32(query, "max", "entity_history")?.unwrap_or(50),
+    )))
+}
+
+fn entity_history_boundary_reached(history_window: Option<(u32, u32)>, data: &Value) -> bool {
+    let Some((offset, maximum)) = history_window else {
+        return false;
+    };
+    let Some(changes) = data.as_array() else {
+        return false;
+    };
+    let returned = u32::try_from(changes.len()).unwrap_or(u32::MAX);
+    returned == maximum && offset.saturating_add(returned) >= HISTORY_RESULT_BOUNDARY
 }
 
 fn apply_practice_preflight(practice_id: &str, query: &[(String, String)]) -> Result<()> {
@@ -938,6 +1267,50 @@ fn query_bool(query: &[(String, String)], name: &str) -> Result<Option<bool>> {
                 "invalid_entity_search_query",
                 format!("entity search {name} must be true or false"),
             )),
+        })
+        .transpose()
+}
+
+fn query_operation_u32(
+    query: &[(String, String)],
+    name: &str,
+    operation: &str,
+) -> Result<Option<u32>> {
+    query_value(query, name)
+        .map(|value| {
+            value.parse::<u32>().map_err(|_| {
+                ReltioError::usage(
+                    format!("invalid_{operation}_query"),
+                    format!(
+                        "{} {name} must be an unsigned integer",
+                        operation.replace('_', " ")
+                    ),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn query_operation_bool(
+    query: &[(String, String)],
+    name: &str,
+    operation: &str,
+) -> Result<Option<bool>> {
+    query_value(query, name)
+        .map(|value| {
+            if value.eq_ignore_ascii_case("true") {
+                Ok(true)
+            } else if value.eq_ignore_ascii_case("false") {
+                Ok(false)
+            } else {
+                Err(ReltioError::usage(
+                    format!("invalid_{operation}_query"),
+                    format!(
+                        "{} {name} must be true or false",
+                        operation.replace('_', " ")
+                    ),
+                ))
+            }
         })
         .transpose()
 }
@@ -1043,6 +1416,27 @@ fn require_mutation_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_safety_overrides_http_method_defaults_fail_closed() {
+        assert!(!request_is_read_semantic(
+            Some(Safety::HighImpact),
+            &Method::GET
+        ));
+        assert!(request_is_read_semantic(Some(Safety::Read), &Method::POST));
+        assert!(request_is_read_semantic(None, &Method::GET));
+        assert!(!request_is_read_semantic(None, &Method::POST));
+    }
+
+    #[test]
+    fn release_version_binding_requires_one_stable_exact_version() {
+        assert_eq!(normalized_stable_release("v0.1.0").unwrap(), "0.1.0");
+        assert!(normalized_stable_release("0.1.0-alpha.1").is_err());
+        assert!(normalized_stable_release("v01.1.0").is_err());
+        assert!(release_versions_match("0.1.0", "0.1.0", "0.1.0"));
+        assert!(!release_versions_match("0.1.1", "0.1.0", "0.1.0"));
+        assert!(!release_versions_match("0.1.0", "0.1.0", "0.1.0-alpha.1"));
+    }
 
     #[test]
     fn output_failure_after_mutation_success_is_never_replayable() {

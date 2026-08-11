@@ -1310,6 +1310,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "rand 0.9.5",
  "tempfile",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 

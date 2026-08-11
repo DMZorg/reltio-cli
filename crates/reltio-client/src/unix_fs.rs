@@ -391,7 +391,7 @@ pub(super) fn private_file_status(path: &Path) -> Result<Option<bool>> {
     Ok(Some(private))
 }
 
-pub(super) fn validate_private_executable(path: &Path) -> Result<()> {
+pub(super) fn validate_private_executable(path: &Path) -> Result<File> {
     let guarded = GuardedParent::open(path, false)?;
     let file = File::from(
         rfs::openat(guarded.parent(), &guarded.leaf, READ_FLAGS, Mode::empty())
@@ -410,7 +410,21 @@ pub(super) fn validate_private_executable(path: &Path) -> Result<()> {
             "the credential-process file is not executable by its owner",
         ));
     }
-    guarded.revalidate()
+    let mut prefix = Vec::with_capacity(2);
+    (&file)
+        .take(2)
+        .read_to_end(&mut prefix)
+        .map_err(|error| ReltioError::io("failed to inspect the credential process", &error))?;
+    if prefix == b"#!" {
+        return Err(ReltioError::new(
+            "credential_process_script_refused",
+            ErrorCategory::Safety,
+            "credential-process scripts are refused; configure a private native executable",
+        ));
+    }
+    verify_private_file(&guarded.path(), &file)?;
+    guarded.revalidate()?;
+    Ok(file)
 }
 
 pub(super) fn remove_private_file(path: &Path) -> Result<bool> {

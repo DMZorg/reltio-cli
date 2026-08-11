@@ -7,17 +7,24 @@ use fs2::FileExt;
 use is_terminal::IsTerminal;
 use reltio_client::auth::TokenManagerOptions;
 use reltio_client::entities::{
-    EntityGetOptions, EntityScanRequest, EntitySearchRequest, SEARCH_BOUNDARY_WARNING,
-    validate_get, validate_scan, validate_search,
+    CROSSWALK_ID_FALLBACK_WARNING, EntityByCrosswalkRequest, EntityGetOptions,
+    EntityHistoryRequest, EntityMatchesRequest, EntityScanRequest, EntitySearchRequest,
+    HISTORY_BOUNDARY_WARNING, HISTORY_CANONICAL_VALUES_WARNING,
+    POTENTIAL_MATCHES_FRESHNESS_WARNING, SEARCH_BOUNDARY_WARNING, validate_by_crosswalk,
+    validate_get, validate_history, validate_matches, validate_scan, validate_search,
 };
 use reltio_client::error::{ErrorCategory, ReltioError, Result, json_parse_details};
 use reltio_client::fs::{atomic_write_private, open_private_lock, read_bounded_optional};
+use reltio_client::http::ApiResponse;
 use reltio_client::registry::{PracticeCoverage, Registry};
 use reltio_client::service::{Service, ServiceResolver};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::cli::{EntityGetArgs, EntityScanArgs, EntitySearchArgs, EntitySubcommand, OutputFormat};
+use crate::cli::{
+    EntityByCrosswalkArgs, EntityGetArgs, EntityHistoryArgs, EntityMatchesArgs, EntityScanArgs,
+    EntitySearchArgs, EntitySubcommand, OutputFormat,
+};
 use crate::commands::{Runtime, sha256_hex};
 use crate::output::{
     Meta, output_error, write_jsonl_event_guarded, write_raw_guarded, write_success_guarded,
@@ -37,13 +44,17 @@ pub async fn run(runtime: &Runtime, command: EntitySubcommand) -> Result<()> {
     }
     match command {
         EntitySubcommand::Get(arguments) => get(runtime, arguments).await,
+        EntitySubcommand::ByCrosswalk(arguments) => by_crosswalk(runtime, arguments).await,
         EntitySubcommand::Search(arguments) => search(runtime, arguments).await,
         EntitySubcommand::Scan(arguments) => scan(runtime, arguments).await,
+        EntitySubcommand::History(arguments) => history(runtime, arguments).await,
+        EntitySubcommand::Matches(arguments) => matches(runtime, arguments).await,
     }
 }
 
 async fn get(runtime: &Runtime, arguments: EntityGetArgs) -> Result<()> {
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     let options = EntityGetOptions {
         select: runtime.globals.fields.clone(),
         time: arguments.time,
@@ -59,16 +70,17 @@ async fn get(runtime: &Runtime, arguments: EntityGetArgs) -> Result<()> {
     let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
     let mut output_guard = manager.output_guard()?;
     let auth_status = manager
-        .status()
+        .status_until(deadline)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let client = runtime
-        .entities_client(&target, manager)
+        .entities_client_until(&target, manager, deadline)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let result = client
         .get(&arguments.entity, &options)
         .await
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     output_guard.merge(&result.response.output_guard());
+    ensure_finite_response_active(runtime, deadline, &result.response, &output_guard)?;
     if options.reverse_transcode_lookups.is_some()
         && matches!(
             runtime.render.format,
@@ -79,7 +91,8 @@ async fn get(runtime: &Runtime, arguments: EntityGetArgs) -> Result<()> {
             REVERSE_TRANSCODE_WARNING,
             runtime.globals.quiet,
             &output_guard,
-        )?;
+        )
+        .map_err(|error| read_response_output_error(error, &result.response))?;
     }
     if runtime.render.format == OutputFormat::Raw {
         drop(result.entity);
@@ -87,8 +100,9 @@ async fn get(runtime: &Runtime, arguments: EntityGetArgs) -> Result<()> {
             .response
             .redacted_body()
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        drop(result.response);
-        return write_raw_guarded(&body, false, &output_guard);
+        ensure_finite_response_active(runtime, deadline, &result.response, &output_guard)?;
+        return write_raw_guarded(&body, false, &output_guard)
+            .map_err(|error| read_response_output_error(error, &result.response));
     }
     let mut meta = response_meta(
         "entity.get",
@@ -103,12 +117,81 @@ async fn get(runtime: &Runtime, arguments: EntityGetArgs) -> Result<()> {
         meta.warnings.push(REVERSE_TRANSCODE_WARNING.to_owned());
     }
     let entity = result.entity;
-    drop(result.response);
+    ensure_finite_response_active(runtime, deadline, &result.response, &output_guard)?;
     write_success_guarded(&entity, &meta, runtime.render, &output_guard)
+        .map_err(|error| read_response_output_error(error, &result.response))
+}
+
+async fn by_crosswalk(runtime: &Runtime, arguments: EntityByCrosswalkArgs) -> Result<()> {
+    reject_fields(runtime, "entity by-crosswalk")?;
+    let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
+    let request = EntityByCrosswalkRequest {
+        value: arguments.value,
+        source_type: arguments.source_type,
+        source_table: arguments.source_table,
+        options: arguments.options,
+    };
+    validate_by_crosswalk(&request)?;
+    let (_, target) = runtime.config_and_target()?;
+    let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
+    let mut output_guard = manager.output_guard()?;
+    let auth_status = manager
+        .status_until(deadline)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    let client = runtime
+        .entities_client_until(&target, manager, deadline)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    let result = client
+        .by_crosswalk(&request)
+        .await
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    output_guard.merge(&result.response.output_guard());
+    ensure_finite_response_active(runtime, deadline, &result.response, &output_guard)?;
+    if result.id_fallback_detected
+        && matches!(
+            runtime.render.format,
+            OutputFormat::Raw | OutputFormat::Table
+        )
+    {
+        write_warning_guarded(
+            CROSSWALK_ID_FALLBACK_WARNING,
+            runtime.globals.quiet,
+            &output_guard,
+        )
+        .map_err(|error| read_response_output_error(error, &result.response))?;
+    }
+    if runtime.render.format == OutputFormat::Raw {
+        drop(result.entries);
+        let body = result
+            .response
+            .redacted_body()
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        ensure_finite_response_active(runtime, deadline, &result.response, &output_guard)?;
+        return write_raw_guarded(&body, false, &output_guard)
+            .map_err(|error| read_response_output_error(error, &result.response));
+    }
+    let mut meta = response_meta(
+        "entity.by-crosswalk",
+        &target,
+        &result.response,
+        started,
+        Some(result.consistency),
+    );
+    meta.auth_source = Some(auth_status.source);
+    meta.practice_coverage = Some(PracticeCoverage::Reviewed);
+    if result.id_fallback_detected {
+        meta.warnings.push(CROSSWALK_ID_FALLBACK_WARNING.to_owned());
+    }
+    let entries = Value::Array(result.entries);
+    ensure_finite_response_active(runtime, deadline, &result.response, &output_guard)?;
+    write_success_guarded(&entries, &meta, runtime.render, &output_guard)
+        .map_err(|error| read_response_output_error(error, &result.response))
 }
 
 async fn search(runtime: &Runtime, arguments: EntitySearchArgs) -> Result<()> {
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     let request = EntitySearchRequest {
         filter: arguments.filter,
         select: runtime.globals.fields.clone(),
@@ -126,16 +209,17 @@ async fn search(runtime: &Runtime, arguments: EntitySearchArgs) -> Result<()> {
     let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
     let mut output_guard = manager.output_guard()?;
     let auth_status = manager
-        .status()
+        .status_until(deadline)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let client = runtime
-        .entities_client(&target, manager)
+        .entities_client_until(&target, manager, deadline)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let page = client
         .search(&request)
         .await
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     output_guard.merge(&page.response.output_guard());
+    ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
     if page.boundary_reached
         && matches!(
             runtime.render.format,
@@ -146,7 +230,8 @@ async fn search(runtime: &Runtime, arguments: EntitySearchArgs) -> Result<()> {
             SEARCH_BOUNDARY_WARNING,
             runtime.globals.quiet,
             &output_guard,
-        )?;
+        )
+        .map_err(|error| read_response_output_error(error, &page.response))?;
     }
     if runtime.render.format == OutputFormat::Raw {
         drop(page.entities);
@@ -154,8 +239,9 @@ async fn search(runtime: &Runtime, arguments: EntitySearchArgs) -> Result<()> {
             .response
             .redacted_body()
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        drop(page.response);
-        return write_raw_guarded(&body, false, &output_guard);
+        ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
+        return write_raw_guarded(&body, false, &output_guard)
+            .map_err(|error| read_response_output_error(error, &page.response));
     }
     let returned = page.entities.len();
     let mut meta = response_meta(
@@ -195,8 +281,186 @@ async fn search(runtime: &Runtime, arguments: EntitySearchArgs) -> Result<()> {
         }))
     }));
     let entities = Value::Array(page.entities);
-    drop(page.response);
+    ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
     write_success_guarded(&entities, &meta, runtime.render, &output_guard)
+        .map_err(|error| read_response_output_error(error, &page.response))
+}
+
+async fn history(runtime: &Runtime, arguments: EntityHistoryArgs) -> Result<()> {
+    reject_fields(runtime, "entity history")?;
+    let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
+    let request = EntityHistoryRequest {
+        max: arguments.max_items,
+        offset: arguments.offset,
+        order: arguments.order,
+        filter: arguments.filter,
+        show_all: arguments.show_all,
+        show_major_events_only: arguments.show_major_events_only,
+        skip_reference_attributes_processing: arguments.skip_reference_attributes_processing,
+    };
+    validate_history(&arguments.entity, &request)?;
+    let (_, target) = runtime.config_and_target()?;
+    let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
+    let mut output_guard = manager.output_guard()?;
+    let auth_status = manager
+        .status_until(deadline)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    let client = runtime
+        .entities_client_until(&target, manager, deadline)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    let page = client
+        .history(&arguments.entity, &request)
+        .await
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    output_guard.merge(&page.response.output_guard());
+    ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
+    if matches!(
+        runtime.render.format,
+        OutputFormat::Raw | OutputFormat::Table
+    ) {
+        write_warning_guarded(
+            HISTORY_CANONICAL_VALUES_WARNING,
+            runtime.globals.quiet,
+            &output_guard,
+        )
+        .map_err(|error| read_response_output_error(error, &page.response))?;
+    }
+    if page.boundary_reached
+        && matches!(
+            runtime.render.format,
+            OutputFormat::Raw | OutputFormat::Table
+        )
+    {
+        write_warning_guarded(
+            HISTORY_BOUNDARY_WARNING,
+            runtime.globals.quiet,
+            &output_guard,
+        )
+        .map_err(|error| read_response_output_error(error, &page.response))?;
+    }
+    if runtime.render.format == OutputFormat::Raw {
+        drop(page.changes);
+        let body = page
+            .response
+            .redacted_body()
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
+        return write_raw_guarded(&body, false, &output_guard)
+            .map_err(|error| read_response_output_error(error, &page.response));
+    }
+    let returned = page.changes.len();
+    let mut meta = response_meta(
+        "entity.history",
+        &target,
+        &page.response,
+        started,
+        Some(page.consistency),
+    );
+    meta.auth_source = Some(auth_status.source);
+    meta.practice_coverage = Some(PracticeCoverage::Reviewed);
+    meta.warnings
+        .push(HISTORY_CANONICAL_VALUES_WARNING.to_owned());
+    if page.boundary_reached {
+        meta.warnings.push(HISTORY_BOUNDARY_WARNING.to_owned());
+    }
+    meta.pagination = Some(json!({
+        "kind": "offset",
+        "offset": page.offset,
+        "max": page.max,
+        "returned": returned,
+        "next_offset": page.next_offset,
+        "result_boundary": 1000,
+        "boundary_reached": page.boundary_reached,
+        "continuation": page.next_offset.map(|offset| json!({
+            "command": "entity.history",
+            "arguments": {
+                "entity": arguments.entity,
+                "max_items": request.max,
+                "offset": offset,
+                "order": request.order,
+                "filter": request.filter,
+                "show_all": request.show_all,
+                "show_major_events_only": request.show_major_events_only,
+                "skip_reference_attributes_processing": request.skip_reference_attributes_processing
+            }
+        }))
+    }));
+    let changes = Value::Array(page.changes);
+    ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
+    write_success_guarded(&changes, &meta, runtime.render, &output_guard)
+        .map_err(|error| read_response_output_error(error, &page.response))
+}
+
+async fn matches(runtime: &Runtime, arguments: EntityMatchesArgs) -> Result<()> {
+    reject_fields(runtime, "entity matches")?;
+    let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
+    let request = EntityMatchesRequest {
+        max: arguments.max_items,
+        offset: arguments.offset,
+        match_type: arguments.match_type,
+    };
+    validate_matches(&arguments.entity, &request)?;
+    let (_, target) = runtime.config_and_target()?;
+    let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
+    let mut output_guard = manager.output_guard()?;
+    let auth_status = manager
+        .status_until(deadline)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    let client = runtime
+        .entities_client_until(&target, manager, deadline)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    let page = client
+        .matches(&arguments.entity, &request)
+        .await
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    output_guard.merge(&page.response.output_guard());
+    ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
+    if matches!(
+        runtime.render.format,
+        OutputFormat::Raw | OutputFormat::Table
+    ) {
+        write_warning_guarded(
+            POTENTIAL_MATCHES_FRESHNESS_WARNING,
+            runtime.globals.quiet,
+            &output_guard,
+        )
+        .map_err(|error| read_response_output_error(error, &page.response))?;
+    }
+    if runtime.render.format == OutputFormat::Raw {
+        drop(page.matches);
+        let body = page
+            .response
+            .redacted_body()
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
+        return write_raw_guarded(&body, false, &output_guard)
+            .map_err(|error| read_response_output_error(error, &page.response));
+    }
+    let mut meta = response_meta(
+        "entity.matches",
+        &target,
+        &page.response,
+        started,
+        Some(page.consistency),
+    );
+    meta.auth_source = Some(auth_status.source);
+    meta.practice_coverage = Some(PracticeCoverage::Reviewed);
+    meta.warnings
+        .push(POTENTIAL_MATCHES_FRESHNESS_WARNING.to_owned());
+    meta.pagination = Some(json!({
+        "kind": "offset",
+        "offset": page.offset,
+        "max": page.max,
+        "returned": Value::Null,
+        "next_offset": Value::Null,
+        "continuation_known": false
+    }));
+    let matches = page.matches;
+    ensure_finite_response_active(runtime, deadline, &page.response, &output_guard)?;
+    write_success_guarded(&matches, &meta, runtime.render, &output_guard)
+        .map_err(|error| read_response_output_error(error, &page.response))
 }
 
 async fn scan(runtime: &Runtime, arguments: EntityScanArgs) -> Result<()> {
@@ -242,9 +506,7 @@ async fn scan(runtime: &Runtime, arguments: EntityScanArgs) -> Result<()> {
 
     let started = Instant::now();
     let timeout = runtime.timeout()?;
-    let deadline = started
-        .checked_add(timeout)
-        .ok_or_else(|| ReltioError::usage("invalid_timeout", "scan timeout is too large"))?;
+    let deadline = runtime.deadline_from(started)?;
     let (_, target) = runtime.config_and_target()?;
     let data_service_url = ServiceResolver::new(target.clone())
         .base_url(Service::Data)?
@@ -252,7 +514,7 @@ async fn scan(runtime: &Runtime, arguments: EntityScanArgs) -> Result<()> {
     let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
     let mut output_guard = manager.output_guard()?;
     let client = runtime
-        .entities_client(&target, manager)
+        .entities_client_until(&target, manager, deadline)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let _resume_lock = arguments
         .resume_file
@@ -728,6 +990,70 @@ fn scan_query_hash(runtime: &Runtime, arguments: &EntityScanArgs) -> String {
         "activeness": arguments.activeness
     });
     sha256_hex(normalized.to_string().as_bytes())
+}
+
+fn reject_fields(runtime: &Runtime, command: &str) -> Result<()> {
+    if runtime.globals.fields.is_some() {
+        Err(ReltioError::usage(
+            "fields_unsupported",
+            format!("--fields is not part of the reviewed {command} contract"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_finite_response_active(
+    runtime: &Runtime,
+    deadline: Instant,
+    response: &ApiResponse,
+    output_guard: &reltio_client::redaction::OutputGuard,
+) -> Result<()> {
+    let (code, category, message) = if runtime.cancellation.is_cancelled() {
+        (
+            "request_canceled",
+            ErrorCategory::Canceled,
+            "the command was canceled after a successful read response was received",
+        )
+    } else if Instant::now() >= deadline {
+        (
+            "request_timeout",
+            ErrorCategory::Timeout,
+            "the command exceeded its overall timeout after a successful read response was received",
+        )
+    } else {
+        return Ok(());
+    };
+    Err(ReltioError::new(code, category, message)
+        .with_http_status(response.status)
+        .with_request_id(response.request_id.clone())
+        .with_details(json!({
+            "phase": "response_processing",
+            "remote_response_received": true,
+            "remote_request_completed": true,
+            "remote_operation_completed": true,
+            "remote_operation_state": "success_response_received",
+            "local_state_committed": false,
+            "safe_to_replay": true
+        }))
+        .with_output_guard(output_guard.clone()))
+}
+
+fn read_response_output_error(mut error: ReltioError, response: &ApiResponse) -> ReltioError {
+    error.http_status = Some(response.status);
+    error.request_id.clone_from(&response.request_id);
+    let output_error = std::mem::replace(&mut error.details, Value::Null);
+    error.details = json!({
+        "output_error": output_error,
+        "remote_response_received": true,
+        "remote_request_completed": true,
+        "remote_operation_completed": true,
+        "remote_operation_state": "success_response_received",
+        "local_state_committed": false,
+        "safe_to_replay": true
+    });
+    error.retryable = false;
+    error
 }
 
 fn response_meta(

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use clap::{ArgAction, CommandFactory};
+use reltio_client::config::AuthMethod;
 use reltio_client::error::{ReltioError, Result};
 use serde::Serialize;
 use serde_json::{Value, json, to_value};
@@ -75,6 +76,19 @@ const ENTITY_GET_PRACTICES: &[&str] = &[
     "ENTITY-GET-REVERSE-TRANSCODE-001",
     "ENTITY-LOSSLESS-001",
 ];
+const ENTITY_BY_CROSSWALK_PRACTICES: &[&str] = &[
+    "AUTH-CENTRALIZED-001",
+    "AUTH-CLIENT-CREDENTIALS-001",
+    "AUTH-TOKEN-CACHE-001",
+    "AUTH-TOKEN-REISSUE-001",
+    "AUTH-OPAQUE-TOKEN-001",
+    "AUTH-TOKEN-RETRY-001",
+    "AUTH-BEARER-001",
+    "HTTP-RETRY-001",
+    "ENTITY-CROSSWALK-CONTRACT-001",
+    "ENTITY-CROSSWALK-CONSISTENCY-001",
+    "ENTITY-LOSSLESS-001",
+];
 const ENTITY_SEARCH_PRACTICES: &[&str] = &[
     "AUTH-CENTRALIZED-001",
     "AUTH-CLIENT-CREDENTIALS-001",
@@ -106,6 +120,33 @@ const ENTITY_SCAN_PRACTICES: &[&str] = &[
     "ENTITY-SEARCH-CONSISTENCY-001",
     "ENTITY-LOSSLESS-001",
 ];
+const ENTITY_HISTORY_PRACTICES: &[&str] = &[
+    "AUTH-CENTRALIZED-001",
+    "AUTH-CLIENT-CREDENTIALS-001",
+    "AUTH-TOKEN-CACHE-001",
+    "AUTH-TOKEN-REISSUE-001",
+    "AUTH-OPAQUE-TOKEN-001",
+    "AUTH-TOKEN-RETRY-001",
+    "AUTH-BEARER-001",
+    "HTTP-RETRY-001",
+    "ENTITY-HISTORY-CONTRACT-001",
+    "ENTITY-HISTORY-PERFORMANCE-001",
+    "ENTITY-HISTORY-CANONICAL-VALUES-001",
+    "ENTITY-HISTORY-BOUNDARY-001",
+];
+const ENTITY_MATCHES_PRACTICES: &[&str] = &[
+    "AUTH-CENTRALIZED-001",
+    "AUTH-CLIENT-CREDENTIALS-001",
+    "AUTH-TOKEN-CACHE-001",
+    "AUTH-TOKEN-REISSUE-001",
+    "AUTH-OPAQUE-TOKEN-001",
+    "AUTH-TOKEN-RETRY-001",
+    "AUTH-BEARER-001",
+    "HTTP-RETRY-001",
+    "ENTITY-MATCHES-CONTRACT-001",
+    "ENTITY-MATCHES-FRESHNESS-001",
+    "ENTITY-LOSSLESS-001",
+];
 const RAW_PRACTICES: &[&str] = &[
     "AUTH-CENTRALIZED-001",
     "AUTH-CLIENT-CREDENTIALS-001",
@@ -119,12 +160,20 @@ const RAW_PRACTICES: &[&str] = &[
     "ENTITY-GET-CONSISTENCY-001",
     "ENTITY-GET-PARAMETERS-001",
     "ENTITY-GET-REVERSE-TRANSCODE-001",
+    "ENTITY-CROSSWALK-CONTRACT-001",
+    "ENTITY-CROSSWALK-CONSISTENCY-001",
     "ENTITY-SEARCH-GET-001",
     "ENTITY-SEARCH-POST-001",
     "ENTITY-SEARCH-BOUNDARY-001",
     "ENTITY-SEARCH-CONSISTENCY-001",
     "ENTITY-SCAN-CURSOR-001",
     "ENTITY-FILTER-QUERY-001",
+    "ENTITY-HISTORY-CONTRACT-001",
+    "ENTITY-HISTORY-PERFORMANCE-001",
+    "ENTITY-HISTORY-CANONICAL-VALUES-001",
+    "ENTITY-HISTORY-BOUNDARY-001",
+    "ENTITY-MATCHES-CONTRACT-001",
+    "ENTITY-MATCHES-FRESHNESS-001",
     "ENTITY-LOSSLESS-001",
 ];
 #[cfg(test)]
@@ -133,8 +182,11 @@ const NETWORK_COMMANDS: &[&str] = &[
     "auth.check",
     "auth.token",
     "entity.get",
+    "entity.by-crosswalk",
     "entity.search",
     "entity.scan",
+    "entity.history",
+    "entity.matches",
     "api.request",
     "doctor",
 ];
@@ -164,6 +216,8 @@ struct ArgumentMetadata {
     possible_values: Vec<String>,
     environment: Option<String>,
     description: Option<String>,
+    conflicts_with: Vec<String>,
+    constraints: Vec<&'static str>,
 }
 
 pub fn all() -> &'static [CommandMetadata] {
@@ -306,6 +360,16 @@ pub fn all() -> &'static [CommandMetadata] {
             examples: &["reltio --profile dev entity get entities/00009qz"],
         },
         CommandMetadata {
+            name: "entity.by-crosswalk",
+            summary: "Retrieve entity wrapper results by a simple crosswalk identity.",
+            safety: "read",
+            input_formats: &[],
+            output: "finite envelope or raw upstream body",
+            practice_ids: ENTITY_BY_CROSSWALK_PRACTICES,
+            environment: AUTH_ENVIRONMENT,
+            examples: &["reltio --profile dev entity by-crosswalk --type CRM --value customer-123"],
+        },
+        CommandMetadata {
             name: "entity.search",
             summary: "Run a POST-body indexed search within the 10,000-result boundary.",
             safety: "read",
@@ -328,6 +392,26 @@ pub fn all() -> &'static [CommandMetadata] {
             examples: &[
                 "reltio --profile dev entity scan --filter equals(type,'configuration/entityTypes/Organization') --max-items 1000",
             ],
+        },
+        CommandMetadata {
+            name: "entity.history",
+            summary: "Retrieve an explicitly ordered page from the most recent 1,000 history events.",
+            safety: "read",
+            input_formats: &[],
+            output: "finite envelope or raw upstream body",
+            practice_ids: ENTITY_HISTORY_PRACTICES,
+            environment: AUTH_ENVIRONMENT,
+            examples: &["reltio --profile dev entity history entities/00009qz --max-items 50"],
+        },
+        CommandMetadata {
+            name: "entity.matches",
+            summary: "Retrieve stored direct matches without forcing recalculation.",
+            safety: "read",
+            input_formats: &[],
+            output: "finite envelope or raw upstream body",
+            practice_ids: ENTITY_MATCHES_PRACTICES,
+            environment: AUTH_ENVIRONMENT,
+            examples: &["reltio --profile dev entity matches entities/00009qz --max-items 50"],
         },
         CommandMetadata {
             name: "api.request",
@@ -476,8 +560,9 @@ fn schema_value(metadata: &CommandMetadata) -> Result<Value> {
         .unwrap_or_else(|| unreachable!("command metadata serializes as an object"))
         .insert("arguments".to_owned(), arguments);
     let consistency = match metadata.name {
-        "entity.get" => Value::String("consistent".to_owned()),
+        "entity.get" | "entity.by-crosswalk" => Value::String("consistent".to_owned()),
         "auth.check" | "entity.search" | "entity.scan" => Value::String("eventual".to_owned()),
+        "entity.history" | "entity.matches" => Value::String("unknown".to_owned()),
         "api.request" | "doctor" => Value::String("dynamic".to_owned()),
         _ => Value::Null,
     };
@@ -485,6 +570,13 @@ fn schema_value(metadata: &CommandMetadata) -> Result<Value> {
         .as_object_mut()
         .unwrap_or_else(|| unreachable!("command metadata serializes as an object"))
         .insert("consistency".to_owned(), consistency);
+    value
+        .as_object_mut()
+        .unwrap_or_else(|| unreachable!("command metadata serializes as an object"))
+        .insert(
+            "constraints".to_owned(),
+            json!(command_constraints(metadata.name)),
+        );
     if metadata.name == "entity.scan" {
         value
             .as_object_mut()
@@ -528,23 +620,24 @@ fn arguments(name: &str) -> Result<Vec<ArgumentMetadata>> {
     Ok(command
         .get_arguments()
         .filter(|argument| !matches!(argument.get_id().as_str(), "help" | "version"))
-        .map(|argument| argument_metadata(name, argument, &root_globals))
+        .map(|argument| argument_metadata(name, command, argument, &root_globals))
         .collect())
 }
 
 fn argument_metadata(
-    command: &str,
+    command_name: &str,
+    command: &clap::Command,
     argument: &clap::Arg,
     root_globals: &BTreeSet<String>,
 ) -> ArgumentMetadata {
     let action = argument.get_action();
-    let possible_values = argument_possible_values(command, argument, action);
+    let possible_values = argument_possible_values(command_name, argument, action);
     ArgumentMetadata {
         name: argument.get_id().as_str().to_owned(),
         long: argument.get_long().map(ToOwned::to_owned),
         positional: argument.get_index(),
         value_type: argument_type(
-            command,
+            command_name,
             argument.get_id().as_str(),
             action,
             &possible_values,
@@ -565,6 +658,55 @@ fn argument_metadata(
                 (argument.get_id().as_str() == "output").then(|| "RELTIO_OUTPUT".to_owned())
             }),
         description: argument.get_help().map(ToString::to_string),
+        conflicts_with: command
+            .get_arg_conflicts_with(argument)
+            .into_iter()
+            .map(|conflict| conflict.get_id().as_str().to_owned())
+            .collect(),
+        constraints: argument_constraints(command_name, argument.get_id().as_str()),
+    }
+}
+
+fn command_constraints(command: &str) -> &'static [&'static str] {
+    match command {
+        "entity.by-crosswalk" => &[
+            "global --fields is unsupported",
+            "ovOnly and nonOvOnly cannot be combined",
+            "GET accepts only RFC 3986 unreserved crosswalk values; other values require the deferred POST variant",
+        ],
+        "entity.history" => &[
+            "global --fields is unsupported",
+            "max_items must be greater than zero",
+            "offset + max_items must not exceed 1000",
+            "filter conflicts with show_all",
+        ],
+        "entity.matches" => &[
+            "global --fields is unsupported",
+            "max_items must be greater than zero",
+            "forceMatch=true is unavailable in typed and raw commands",
+            "grouped continuation cardinality is unknown; next_offset is not synthesized",
+        ],
+        "api.practices.check" => &["--expected-release requires --release-ready"],
+        _ => &[],
+    }
+}
+
+fn argument_constraints(command: &str, argument: &str) -> Vec<&'static str> {
+    match (command, argument) {
+        ("entity.by-crosswalk", "value") => vec!["RFC 3986 unreserved characters only"],
+        ("entity.by-crosswalk", "options") => {
+            vec!["ovOnly and nonOvOnly cannot be combined"]
+        }
+        ("entity.history", "max_items" | "offset") => {
+            vec!["max_items > 0", "offset + max_items <= 1000"]
+        }
+        ("entity.matches", "max_items") => {
+            vec!["max_items > 0; 200 is an API default, not a maximum"]
+        }
+        ("api.practices.check", "expected_release") => {
+            vec!["stable MAJOR.MINOR.PATCH; requires --release-ready"]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -586,8 +728,9 @@ fn argument_possible_values(
         .unwrap_or_default();
     if values.is_empty() {
         values = match (command, argument.get_id().as_str()) {
-            ("auth.login", "method") => ["bearer", "client-credentials", "credential-process"]
-                .into_iter()
+            ("auth.login", "method") => AuthMethod::cli_values()
+                .iter()
+                .copied()
                 .map(ToOwned::to_owned)
                 .collect(),
             ("profile.add" | "profile.update", "auth_method") => ["bearer", "client-credentials"]
@@ -621,6 +764,10 @@ fn argument_possible_values(
             .into_iter()
             .map(ToOwned::to_owned)
             .collect(),
+            ("entity.by-crosswalk", "options") => ["sendHidden", "ovOnly", "nonOvOnly"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
             _ => Vec::new(),
         };
     }
@@ -639,7 +786,9 @@ fn argument_type(
         ArgAction::Append => return "string_array",
         _ => {}
     }
-    if command == "profile.update" && name == "production" {
+    if (command == "profile.update" && name == "production")
+        || (command == "entity.history" && name == "show_major_events_only")
+    {
         return "boolean";
     }
     if !possible_values.is_empty() {
@@ -698,7 +847,7 @@ mod tests {
     fn endpoint_practices_are_present_in_affected_command_schemas() {
         let registry = Registry::embedded().expect("registry parses");
         for endpoint in registry.endpoints() {
-            for command in &endpoint.commands {
+            for command in endpoint.commands() {
                 let metadata = all()
                     .iter()
                     .find(|metadata| metadata.name == command)
@@ -742,7 +891,7 @@ mod tests {
                 registry
                     .endpoints()
                     .iter()
-                    .any(|endpoint| endpoint.commands.iter().any(|linked| linked == command)),
+                    .any(|endpoint| endpoint.commands().any(|linked| linked == *command)),
                 "network command {command} has no endpoint declaration"
             );
         }
@@ -855,6 +1004,48 @@ mod tests {
                 metadata.name
             );
         }
+    }
+
+    #[test]
+    fn history_schema_exposes_performance_tradeoffs() {
+        let history = schema(Some("entity.history")).expect("history schema");
+        let show_all = schema_argument(&history, "show_all");
+        assert!(
+            show_all["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("recommends"))
+        );
+        let skip = schema_argument(&history, "skip_reference_attributes_processing");
+        assert!(
+            skip["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("omitting"))
+        );
+        assert!(
+            schema_argument(&history, "filter")["conflicts_with"]
+                .as_array()
+                .expect("filter conflicts")
+                .contains(&Value::String("show_all".to_owned()))
+        );
+        assert!(
+            history["constraints"]
+                .as_array()
+                .expect("history constraints")
+                .iter()
+                .any(|constraint| constraint == "offset + max_items must not exceed 1000")
+        );
+
+        let matches = schema(Some("entity.matches")).expect("matches schema");
+        assert!(matches["constraints"]
+            .as_array()
+            .expect("matches constraints")
+            .iter()
+            .any(|constraint| constraint
+                == "grouped continuation cardinality is unknown; next_offset is not synthesized"));
+        assert_eq!(
+            schema_argument(&matches, "max_items")["constraints"][0],
+            "max_items > 0; 200 is an API default, not a maximum"
+        );
     }
 
     fn schema_argument<'a>(schema: &'a Value, name: &str) -> &'a Value {

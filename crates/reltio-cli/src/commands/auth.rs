@@ -13,7 +13,7 @@ use reltio_client::error::{ErrorCategory, ReltioError, Result};
 use reltio_client::registry::PracticeCoverage;
 use reltio_client::service::{Service, ServiceResolver};
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::json;
+use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::cli::{AuthLoginArgs, AuthSubcommand, OutputFormat};
@@ -45,6 +45,7 @@ pub async fn run(runtime: &Runtime, command: AuthSubcommand) -> Result<()> {
 
 async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     validate_login_arguments(&arguments)?;
     if runtime.environment.contains("RELTIO_ACCESS_TOKEN") && arguments.method != AuthMethod::Bearer
     {
@@ -56,6 +57,30 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     }
     let config = runtime.store.load()?;
     let profile_name = selected_profile(runtime, &config)?;
+    let resolution_overrides = ResolutionOverrides {
+        profile: runtime.globals.profile.clone(),
+        environment: runtime.globals.environment.clone(),
+        tenant: runtime.globals.tenant.clone(),
+    };
+    let previous_target = resolve_target(&config, &runtime.environment, &resolution_overrides)?;
+    if previous_target.routing_overridden || previous_target.tenant_overridden {
+        return Err(ReltioError::new(
+            "auth_login_target_override",
+            ErrorCategory::Safety,
+            "auth login cannot commit credentials while invocation-scoped routing or tenant changes are active",
+        )
+        .with_details(json!({
+            "routing_overridden": previous_target.routing_overridden,
+            "tenant_overridden": previous_target.tenant_overridden,
+            "secret_input_consumed": false,
+            "network_request_sent": false,
+            "local_state_committed": false,
+            "safe_to_replay": true
+        }))
+        .with_hint(
+            "Update the stored profile first, or remove the invocation-only environment, base, Auth URL, and tenant overrides before login.",
+        ));
+    }
 
     let secret_file = arguments
         .secret_file
@@ -104,12 +129,6 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
             )
         })?
         .clone();
-    let resolution_overrides = ResolutionOverrides {
-        profile: runtime.globals.profile.clone(),
-        environment: runtime.globals.environment.clone(),
-        tenant: runtime.globals.tenant.clone(),
-    };
-    let previous_target = resolve_target(&config, &runtime.environment, &resolution_overrides)?;
     let previous_output_guard = TokenManager::profile_output_guard(
         &previous_target,
         &runtime.environment,
@@ -159,6 +178,9 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
         ));
         one_shot_secret = Some(secret);
     }
+    runtime
+        .ensure_not_cancelled("credential_input", false)
+        .map_err(|error| error.with_output_guard(input_output_guard.clone()))?;
     let (provider, expires_at, cache_hit, mut output_guard, pending_login) = match arguments.method
     {
         AuthMethod::Bearer => {
@@ -219,10 +241,23 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
                 .output_guard()
                 .map_err(|error| error.with_output_guard(output_guard.clone()))?;
             output_guard.merge(&manager_guard);
-            let token = manager
-                .acquire_for_login()
-                .await
-                .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+            let token = {
+                let acquisition = manager.acquire_for_login_until(deadline);
+                tokio::pin!(acquisition);
+                tokio::select! {
+                    biased;
+                    result = &mut acquisition => result
+                        .map_err(|error| error.with_output_guard(output_guard.clone()))?,
+                    () = runtime.cancellation.cancelled() => {
+                        return Err(auth_command_canceled(
+                            "authentication",
+                            false,
+                            &output_guard,
+                            true,
+                        ));
+                    }
+                }
+            };
             output_guard.merge(token.output_guard());
             (
                 token.provider.clone(),
@@ -238,15 +273,43 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     };
     let mut cache_plan = match &pending_login {
         PendingLogin::Bearer { token, expires_at } => {
-            TokenManager::prepare_bearer_login(
+            let preparation = TokenManager::prepare_bearer_login_until(
                 &runtime.paths.cache_dir,
                 &profile_name,
                 token.clone(),
                 *expires_at,
-            )
-            .await
+                deadline,
+            );
+            tokio::pin!(preparation);
+            tokio::select! {
+                biased;
+                result = &mut preparation => result,
+                () = runtime.cancellation.cancelled() => {
+                    return Err(auth_command_canceled(
+                        "token_cache_snapshot",
+                        false,
+                        &output_guard,
+                        false,
+                    ));
+                }
+            }
         }
-        PendingLogin::Managed { manager, token } => manager.prepare_managed_login(token).await,
+        PendingLogin::Managed { manager, token } => {
+            let preparation = manager.prepare_managed_login_until(token, deadline);
+            tokio::pin!(preparation);
+            tokio::select! {
+                biased;
+                result = &mut preparation => result,
+                () = runtime.cancellation.cancelled() => {
+                    return Err(auth_command_canceled(
+                        "token_cache_snapshot",
+                        false,
+                        &output_guard,
+                        false,
+                    ));
+                }
+            }
+        }
     }
     .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     output_guard.merge(cache_plan.output_guard());
@@ -306,14 +369,32 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     let success = prepare_success_guarded(&data, &meta, runtime.render, &output_guard)?;
     drop(pending_login);
 
-    if let Err(error) = cache_plan.commit() {
+    runtime
+        .ensure_not_cancelled("before_token_cache_commit", false)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    if let Err(error) = cache_plan.commit_with_cancellation(&runtime.cancellation) {
         return Err(login_cache_error(error, output_guard));
+    }
+    if runtime.cancellation.is_cancelled() {
+        let cancellation =
+            auth_command_canceled("after_token_cache_commit", false, &output_guard, false);
+        let rollback = cache_plan.rollback();
+        drop(cache_plan);
+        if let Err(rollback_error) = rollback {
+            return Err(login_cache_rollback_error(
+                &cancellation,
+                &rollback_error,
+                output_guard,
+            ));
+        }
+        return Err(login_profile_commit_error(cancellation, output_guard));
     }
     if let Err(error) = commit_auth_profile(
         runtime,
         &profile_name,
         &previous_profile,
         &candidate_profile,
+        deadline,
         &output_guard,
     ) {
         if error.details["committed"] == true {
@@ -333,6 +414,10 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     }
     drop(cache_plan);
 
+    runtime
+        .ensure_not_cancelled("before_auth_login_output", true)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+
     success
         .write_stdout()
         .map_err(|error| login_output_error(error, output_guard))
@@ -343,31 +428,36 @@ fn commit_auth_profile(
     profile_name: &str,
     previous: &Profile,
     candidate: &Profile,
+    deadline: Instant,
     output_guard: &reltio_client::redaction::OutputGuard,
 ) -> Result<()> {
     let mut winning_config = None;
-    let result = runtime.store.modify(|config| {
-        let current = config.profiles.get(profile_name).cloned().ok_or_else(|| {
-            ReltioError::profile(
-                "profile_not_found",
-                format!("profile {profile_name:?} does not exist"),
-            )
-        })?;
-        if &current != previous {
-            winning_config = Some(config.clone());
-            return Err(ReltioError::new(
-                "auth_login_commit_conflict",
-                ErrorCategory::Conflict,
-                "the selected profile changed concurrently; refusing to commit authentication",
-            ));
-        }
-        config
-            .profiles
-            .get_mut(profile_name)
-            .expect("the selected profile was resolved above")
-            .clone_from(candidate);
-        Ok(())
-    });
+    let result = runtime.store.modify_until(
+        deadline,
+        || runtime.cancellation.is_cancelled(),
+        |config| {
+            let current = config.profiles.get(profile_name).cloned().ok_or_else(|| {
+                ReltioError::profile(
+                    "profile_not_found",
+                    format!("profile {profile_name:?} does not exist"),
+                )
+            })?;
+            if &current != previous {
+                winning_config = Some(config.clone());
+                return Err(ReltioError::new(
+                    "auth_login_commit_conflict",
+                    ErrorCategory::Conflict,
+                    "the selected profile changed concurrently; refusing to commit authentication",
+                ));
+            }
+            config
+                .profiles
+                .get_mut(profile_name)
+                .expect("the selected profile was resolved above")
+                .clone_from(candidate);
+            Ok(())
+        },
+    );
     match result {
         Ok(()) => Ok(()),
         Err(error) if error.code == "auth_login_commit_conflict" => {
@@ -408,6 +498,33 @@ fn commit_auth_profile(
         }
         Err(error) => Err(error.with_output_guard(output_guard.clone())),
     }
+}
+
+fn auth_command_canceled(
+    phase: &'static str,
+    local_state_committed: bool,
+    output_guard: &reltio_client::redaction::OutputGuard,
+    uninspected_provider_output: bool,
+) -> ReltioError {
+    let mut guard = output_guard.clone();
+    if uninspected_provider_output {
+        guard.merge(&reltio_client::redaction::OutputGuard::deny_all());
+    }
+    ReltioError::new(
+        "request_canceled",
+        ErrorCategory::Canceled,
+        "authentication was canceled",
+    )
+    .with_details(json!({
+        "phase": phase,
+        "remote_response_received": false,
+        "remote_request_completed": Value::Null,
+        "remote_operation_completed": Value::Null,
+        "remote_operation_state": "authentication_completion_unknown",
+        "local_state_committed": local_state_committed,
+        "safe_to_replay": false
+    }))
+    .with_output_guard(guard)
 }
 
 fn login_cache_error(
@@ -514,13 +631,15 @@ fn login_output_error(
 
 fn status(runtime: &Runtime) -> Result<()> {
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
+    runtime.ensure_not_cancelled("before_auth_status", false)?;
     let (_, target) = runtime.config_and_target()?;
     let (status, output_guard) =
         match runtime.token_manager(&target, TokenManagerOptions::default()) {
             Ok(manager) => {
                 let output_guard = manager.output_guard()?;
                 let status = manager
-                    .status()
+                    .status_until(deadline)
                     .map_err(|error| error.with_output_guard(output_guard.clone()))?;
                 (status, output_guard)
             }
@@ -550,6 +669,9 @@ fn status(runtime: &Runtime) -> Result<()> {
                 .to_owned(),
         );
     }
+    runtime
+        .ensure_not_cancelled("before_auth_status_output", false)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     write_success_guarded(
         &json!({
             "configured": status.configured,
@@ -568,14 +690,15 @@ fn status(runtime: &Runtime) -> Result<()> {
 
 async fn check(runtime: &Runtime) -> Result<()> {
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     let (_, target) = runtime.config_and_target()?;
     let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
     let mut output_guard = manager.output_guard()?;
     let auth_status = manager
-        .status()
+        .status_until(deadline)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let entities = runtime
-        .entities_client(&target, manager)
+        .entities_client_until(&target, manager, deadline)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let page = entities
         .search(&EntitySearchRequest {
@@ -626,9 +749,32 @@ async fn reveal_token(runtime: &Runtime, show: bool) -> Result<()> {
         .with_hint("Redirect stdout to the intended process or add --yes deliberately."));
     }
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     let (_, target) = runtime.config_and_target()?;
     let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
-    let token = manager.token(false).await?;
+    let manager_guard = manager.output_guard()?;
+    let acquisition = manager.token_until(false, deadline);
+    tokio::pin!(acquisition);
+    let token = tokio::select! {
+        biased;
+        result = &mut acquisition => result?,
+        () = runtime.cancellation.cancelled() => {
+            return Err(auth_command_canceled(
+                "authentication",
+                false,
+                &manager_guard,
+                manager.can_reacquire(),
+            ));
+        }
+    };
+    if runtime.cancellation.is_cancelled() {
+        return Err(auth_command_canceled(
+            "before_token_output",
+            false,
+            token.output_guard(),
+            false,
+        ));
+    }
     let disclosure_guard = token.output_guard().excluding_secret(token.expose_secret());
     if runtime.render.format == OutputFormat::Raw {
         return write_raw_guarded(token.expose_secret().as_bytes(), true, &disclosure_guard);
@@ -652,7 +798,12 @@ async fn reveal_token(runtime: &Runtime, show: bool) -> Result<()> {
 
 fn logout(runtime: &Runtime) -> Result<()> {
     let started = Instant::now();
-    let (removed, mut output_guard) = TokenManager::clear_local_cache(&runtime.paths.cache_dir)?;
+    let deadline = runtime.deadline_from(started)?;
+    let (removed, mut output_guard) = TokenManager::clear_local_cache_until(
+        &runtime.paths.cache_dir,
+        deadline,
+        &runtime.cancellation,
+    )?;
     let cleared = removed > 0;
     let mut meta = Meta::new("auth.logout");
     match runtime.config_and_target() {
@@ -675,6 +826,9 @@ fn logout(runtime: &Runtime) -> Result<()> {
             .filter_map(|name| runtime.environment.get(name))
             .collect::<Vec<_>>(),
     ));
+    runtime
+        .ensure_not_cancelled("before_auth_logout_output", cleared)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     write_success_guarded(
         &json!({
             "local_cache_cleared": cleared,

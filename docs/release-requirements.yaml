@@ -1,0 +1,143 @@
+schema_version: 1
+target_release: 0.1.0
+product_contract:
+  path: docs/PRD.md
+  sha256: fd1118addb075993c40fc47cdf58424666383c9fc21eb5f9ff9bbb05c8356cb4
+  sections: ["6.1", "7.2", "9.1", "13.4", "16.3", "19.1"]
+inventory_test_ids: [release_prd_inventory, release_endpoint_role_ownership, release_inventory_substitution_guard, release_safety_binding_downgrade_guard, release_unknown_field_guard, release_audit_evidence_separation, release_version_binding, release_cli_gate]
+
+operations:
+  - { id: profile.list, command: profile.list, kind: local, safety: read, source_section: "7.2" }
+  - { id: profile.show, command: profile.show, kind: local, safety: read, source_section: "7.2" }
+  - { id: profile.add, command: profile.add, kind: local, safety: local_write, source_section: "7.2" }
+  - { id: profile.update, command: profile.update, kind: local, safety: local_write, source_section: "7.2" }
+  - { id: profile.use, command: profile.use, kind: local, safety: local_write, source_section: "7.2" }
+  - { id: profile.remove, command: profile.remove, kind: local, safety: local_write, source_section: "7.2" }
+
+  - { id: auth.login, command: auth.login, kind: typed_api, safety: authentication, source_section: "9.4", required_endpoint_role: typed_primary, required_endpoint_ids: [auth.client_credentials] }
+  - { id: auth.status, command: auth.status, kind: local, safety: read, source_section: "9.4" }
+  - { id: auth.check, command: auth.check, kind: workflow, safety: read, source_section: "9.4", required_endpoint_role: workflow_component, required_endpoint_ids: [entity.search] }
+  - { id: auth.token, command: auth.token, kind: workflow, safety: secret_disclosure, source_section: "9.4", required_endpoint_role: auth_dependency, required_endpoint_ids: [auth.client_credentials] }
+  - { id: auth.logout, command: auth.logout, kind: local, safety: local_write, source_section: "9.4" }
+
+  - { id: entity.get, command: entity.get, kind: typed_api, safety: read, source_section: "12.1", required_endpoint_role: typed_primary, required_endpoint_ids: [entity.get] }
+  - { id: entity.get-many, command: entity.get-many, kind: typed_api, safety: read, source_section: "12.1", required_endpoint_role: typed_primary }
+  - { id: entity.by-crosswalk, command: entity.by-crosswalk, kind: typed_api, safety: read, source_section: "12.1", required_endpoint_role: typed_primary, required_endpoint_ids: [entity.by-crosswalk] }
+  - { id: entity.search, command: entity.search, kind: typed_api, safety: read, source_section: "12.1", required_endpoint_role: typed_primary, required_endpoint_ids: [entity.search] }
+  - { id: entity.scan, command: entity.scan, kind: typed_api, safety: read, source_section: "12.1", required_endpoint_role: typed_primary, required_endpoint_ids: [entity.scan] }
+  - { id: entity.create, command: entity.create, kind: typed_api, safety: remote_write, source_section: "12.1", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+  - { id: entity.upsert, command: entity.upsert, kind: typed_api, safety: remote_write, source_section: "12.1", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+  - { id: entity.update, command: entity.update, kind: typed_api, safety: remote_write, source_section: "12.1", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+  - { id: entity.delete, command: entity.delete, kind: typed_api, safety: remote_high_impact, source_section: "12.1", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+  - { id: entity.history, command: entity.history, kind: typed_api, safety: read, source_section: "12.1", required_endpoint_role: typed_primary, required_endpoint_ids: [entity.history] }
+  - { id: entity.matches, command: entity.matches, kind: typed_api, safety: read, source_section: "12.1", required_endpoint_role: typed_primary, required_endpoint_ids: [entity.matches] }
+
+  - { id: relation.get, command: relation.get, kind: typed_api, safety: read, source_section: "12.2", required_endpoint_role: typed_primary }
+  - { id: relation.search, command: relation.search, kind: typed_api, safety: read, source_section: "12.2", required_endpoint_role: typed_primary }
+  - { id: relation.scan, command: relation.scan, kind: typed_api, safety: read, source_section: "12.2", required_endpoint_role: typed_primary }
+  - { id: relation.create, command: relation.create, kind: typed_api, safety: remote_write, source_section: "12.2", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+  - { id: relation.update, command: relation.update, kind: typed_api, safety: remote_write, source_section: "12.2", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+  - { id: relation.delete, command: relation.delete, kind: typed_api, safety: remote_high_impact, source_section: "12.2", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+
+  - { id: config.get, command: config.get, kind: typed_api, safety: read, source_section: "12.3", required_endpoint_role: typed_primary }
+  - { id: config.pull, command: config.pull, kind: workflow, safety: read, source_section: "12.3", required_endpoint_role: typed_primary }
+  - { id: config.validate, command: config.validate, kind: workflow, safety: read, source_section: "12.3", required_endpoint_role: typed_primary }
+  - { id: config.diff, command: config.diff, kind: workflow, safety: read, source_section: "12.3", required_endpoint_role: typed_primary }
+  - { id: config.apply, command: config.apply, kind: workflow, safety: remote_high_impact, source_section: "12.3", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+  - { id: config.backup, command: config.backup, kind: workflow, safety: read, source_section: "12.3", required_endpoint_role: typed_primary }
+
+  - { id: task.get, command: task.get, kind: typed_api, safety: read, source_section: "11.2", required_endpoint_role: typed_primary }
+  - { id: task.list, command: task.list, kind: typed_api, safety: read, source_section: "11.2", required_endpoint_role: typed_primary }
+  - { id: task.wait, command: task.wait, kind: workflow, safety: read, source_section: "11.2", required_endpoint_role: typed_primary }
+  - { id: task.cancel, command: task.cancel, kind: typed_api, safety: remote_high_impact, source_section: "11.2", required_endpoint_role: typed_primary, contract_ids: [mutation_audit_v1] }
+
+  - { id: api.request, command: api.request, kind: raw_adapter, safety: dynamic, source_section: "12.4", contract_ids: [mutation_audit_v1] }
+  - { id: api.practices.list, command: api.practices.list, kind: discovery, safety: read, source_section: "10.5" }
+  - { id: api.practices.show, command: api.practices.show, kind: discovery, safety: read, source_section: "10.5" }
+  - { id: api.practices.check, command: api.practices.check, kind: discovery, safety: read, source_section: "10.5" }
+
+  - { id: skills.list, command: skills.list, kind: discovery, safety: read, source_section: "10.5" }
+  - { id: skills.get, command: skills.get, kind: discovery, safety: read, source_section: "10.5" }
+  - { id: skills.path, command: skills.path, kind: discovery, safety: read, source_section: "10.5" }
+  - { id: agent.guide, command: agent.guide, kind: discovery, safety: read, source_section: "10.5" }
+  - { id: command.schema, command: command.schema, kind: discovery, safety: read, source_section: "10.5" }
+  - { id: completion.generate, command: completion.generate, kind: local, safety: read, source_section: "7.2" }
+  - { id: completion.install, command: completion.install, kind: local, safety: local_write, source_section: "7.2" }
+  - { id: doctor, command: doctor, kind: workflow, safety: read, source_section: "14.4", required_endpoint_role: healthcheck_dependency, required_endpoint_ids: [entity.search] }
+
+capabilities:
+  - id: auth.provider.authorization-code
+    command: auth.login
+    argument: method
+    required_value: authorization-code
+    source_section: "9.1"
+    implementation_test_ids: []
+
+acceptance_scenarios:
+  - { id: MVP-ACCEPT-001, summary: "Profile creation, client-credential or SSO login, and entity retrieval without manual config editing", source_section: "16.3.1", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-002, summary: "Headless environment and credential-process authentication without secret arguments", source_section: "16.3.2", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-003, summary: "Twenty processes share cached client-credential state without a token storm", source_section: "16.3.3", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-004, summary: "Expired-token refresh and at most one explicit 401 replay", source_section: "16.3.4", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-005, summary: "Entity and relation scans stream cursor pages and resumable checkpoints", source_section: "16.3.5", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-006, summary: "Entity-create transport timeout cannot trigger a duplicate write", source_section: "16.3.6", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-007, summary: "Structured stdout remains valid around progress warnings and retries", source_section: "16.3.7", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-008, summary: "Every documented exit condition has its stable code and envelope", source_section: "16.3.8", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-009, summary: "Configuration apply rejects inherited stale invalid mismatched or unconfirmed input", source_section: "16.3.9", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-010, summary: "Trace output excludes every credential and sensitive header class", source_section: "16.3.10", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-011, summary: "Raw requests cannot leak authorization through redirects or protected headers", source_section: "16.3.11", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-012, summary: "Agent skills and schemas use only exact-version commands and flags", source_section: "16.3.12", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-013, summary: "Every MVP typed endpoint has complete source-linked practice disposition", source_section: "16.3.13", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-014, summary: "Retry tests prove exact status ceilings and no ambiguous mutation replay", source_section: "16.3.14", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-015, summary: "Entity batching enforces object body concurrency and adaptive-pressure limits", source_section: "16.3.15", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-016, summary: "Search and scan prove boundaries encoding page ceilings expiry and resume behavior", source_section: "16.3.16", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-017, summary: "Configuration apply uses If-Unmodified-Since and non-retried 412 conflict handling", source_section: "16.3.17", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-018, summary: "Opaque multi-kilobyte tokens survive every provider cache and redaction path", source_section: "16.3.18", implementation_test_ids: [] }
+  - { id: MVP-ACCEPT-019, summary: "Raw metadata distinguishes coverage and unreviewed mutation acknowledgement", source_section: "16.3.19", implementation_test_ids: [] }
+
+contracts:
+  - id: mutation_audit_v1
+    source_section: "13.4"
+    required_result_fields:
+      - operation_id
+      - request_ids
+      - command
+      - cli_version
+      - profile
+      - environment
+      - tenant
+      - service
+      - principal
+      - input_sha256
+      - affected_resources
+      - started_at
+      - ended_at
+      - result
+      - backup_reference
+      - task_reference
+    allowed_results: [not_sent, failed, partial, accepted, succeeded, canceled, completion_unknown]
+    guard_test_ids: [mutation_audit_absence_fails_closed, mutation_method_safety_fail_closed]
+    field_test_ids:
+      operation_id: []
+      request_ids: []
+      command: []
+      cli_version: []
+      profile: []
+      environment: []
+      tenant: []
+      service: []
+      principal: []
+      input_sha256: []
+      affected_resources: []
+      started_at: []
+      ended_at: []
+      result: []
+      backup_reference: []
+      task_reference: []
+    result_test_ids:
+      not_sent: []
+      failed: []
+      partial: []
+      accepted: []
+      succeeded: []
+      canceled: []
+      completion_unknown: []

@@ -48,8 +48,10 @@ When an active credential equals a normal error field name, value, boolean spell
 | `resume_cursor_expired` | Saved cursor is beyond conservative lifetime | Start a new scan |
 | `protected_header_refused` | Raw request attempted to override a security-controlled header | Remove the header |
 | `dry_run_raw_output_unsupported` | Raw output cannot represent a structured dry-run plan | Use JSON or YAML output |
+| `raw_force_match_refused` | Raw potential-match retrieval requested server-side recalculation through `forceMatch=true` | Remove `forceMatch` and read stored direct matches; use a reviewed future mutation workflow for recalculation |
 | `redirect_refused` | Server returned a redirect | Verify the configured service URL; auth was not forwarded |
-| `unreviewed_mutation_refused` | Raw mutation lacks reviewed endpoint policy | Add reviewed typed support or use all dedicated acknowledgements after review |
+| `unreviewed_mutation_refused` | Raw mutation lacks reviewed endpoint policy or its planning acknowledgements | Add reviewed typed support or use all dedicated acknowledgements for a dry run |
+| `mutation_audit_unavailable` | A raw mutation would execute without the required versioned audit-result contract | Use `--dry-run`; implement and evidence `mutation_audit_v1` before sending a mutation |
 | `api_internal_error` | Reltio returned `500`, which is not retried | Validate the request and contact support if persistent |
 | `api_response_redaction_failed` | A response could not be represented without risking credential disclosure or silent field loss | Retain the request ID, narrow the response, and contact support; do not request raw output to bypass the refusal |
 | `credential_output_refused` | Final rendered output would reproduce an active credential through generated envelope or formatting bytes | Treat stdout as omitted; inspect the guarded error and never replay a mutation unless it explicitly says replay is safe |
@@ -63,7 +65,14 @@ When an active credential equals a normal error field name, value, boolean spell
 | `profile_remove_rollback_failed` | Profile removal did not commit and bearer restoration could not be verified | Do not retry; inspect the profile and run `auth logout` |
 | `doctor_unhealthy` | One or more diagnostic checks warned or failed | Inspect `error.details.checks`, correct every non-pass check, and rerun `doctor` |
 | `output_write_failed` | A physical output sink failed after rendering | Inspect commit-state details; never replay when `local_state_committed` is true |
+| `credential_process_containment_failed` | A Windows credential broker could not be assigned to its kill-on-close process Job before execution | Repair local Windows process policy; the suspended broker was terminated and no request was sent |
+| `auth_timeout` | The shared command deadline expired during credential acquisition, auth locking, broker execution, or token replay | Inspect commit-state details and retry only when `safe_to_replay` permits it |
+| `config_timeout` | The shared command deadline expired while waiting for or committing local configuration | Inspect `local_state_committed`; do not blindly replay a committed or uncertain operation |
 | `request_timeout` | Overall local timeout expired | Verify the remote outcome before repeating an ambiguous operation |
+| `request_canceled` | SIGINT or another cancellation source interrupted local work or an in-flight request | Inspect local/remote completion and `safe_to_replay`; SIGINT exits `130` and never becomes success |
+| `release_operations_incomplete` | The product-MVP gate found missing PRD operations, exact endpoint bindings, capabilities, acceptance scenarios, or contract evidence/runtime support | Inspect `error.details.blockers`; do not publish or tag the target stable release, and run the separate platform/distribution gates |
+| `invalid_expected_release` | `--expected-release` is not a stable `MAJOR.MINOR.PATCH` value | Pass the exact stable tag version without prerelease/build metadata |
+| `release_version_mismatch` | The expected tag version, PRD-bound manifest target, and built CLI package version differ | Update all three together before creating or publishing a stable tag |
 
 `doctor_unhealthy` preserves the category, HTTP status, request ID, and retryability of the first concrete failed check. A warning-only report uses category `internal` and exit `1`. Its ordinary structured form carries the bounded diagnostic report, including every check completed before an unrecoverable prerequisite failure, under `error.details`; irreducible credential collisions use the guarded fallback contract. Unhealthy diagnostics never use a success envelope or exit `0`.
 

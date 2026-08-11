@@ -9,6 +9,8 @@ const MAX_LOCAL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct PrivateExecutableGuard {
+    #[cfg(unix)]
+    _inner: File,
     #[cfg(windows)]
     _inner: reltio_windows_security::PrivateExecutableGuard,
 }
@@ -195,8 +197,7 @@ pub(crate) fn validate_private_executable(path: &Path) -> Result<PrivateExecutab
 
 #[cfg(unix)]
 pub(crate) fn validate_private_executable(path: &Path) -> Result<PrivateExecutableGuard> {
-    unix::validate_private_executable(path)?;
-    Ok(PrivateExecutableGuard {})
+    unix::validate_private_executable(path).map(|file| PrivateExecutableGuard { _inner: file })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -250,7 +251,7 @@ fn map_windows_error(error: &reltio_windows_security::Error) -> ReltioError {
             "local_file_too_large",
             "the local file exceeds the 64 MB local input limit",
         ),
-        ErrorKind::InsecurePolicy | ErrorKind::UnsafeAncestor => ReltioError::new(
+        ErrorKind::InsecurePolicy | ErrorKind::UnsafeAncestor | ErrorKind::ProcessContainment => ReltioError::new(
             "insecure_file_permissions",
             ErrorCategory::Safety,
             "the Windows path does not satisfy the private filesystem policy",

@@ -10,7 +10,7 @@ This guide matches `reltio` version `0.1.0-alpha.1`.
 - Inspect failures by `error.code`, `error.retryable`, `error.http_status`, and `error.hint`; do not parse prose alone. If the document is a positional `reltio_guarded_failure` array, follow the output-contract field order instead.
 - A scan is successful only if it emits a final `summary` event. Persist checkpoint events or use `--resume-file`.
 - Resume files require the exact CLI version, target, route, normalized query, and page size that created them.
-- Direct `entity get` is consistent. Indexed `entity search` and `entity scan` are eventually consistent.
+- Direct `entity get` and `entity by-crosswalk` are consistent. Entity history and stored potential-match consistency are unknown; indexed `entity search` and `entity scan` are eventually consistent.
 - Never put client secrets or bearer tokens in command arguments. Use environment injection, hidden input, stdin flags, an owner-only secret file, or a credential process.
 - Do not retry a mutation merely because it failed. The CLI retries only operations registered as replay-safe.
 
@@ -35,7 +35,7 @@ reltio skills get reltio-data
 reltio --profile dev doctor
 ```
 
-Use `api request` only when a typed command does not exist. Partially reviewed paths enforce every catalog rule matched by method, service, and path while retaining conservative retry behavior. Reads with no endpoint-specific match report unknown practice coverage and receive no automatic retries. Unreviewed mutations fail unless all dedicated acknowledgements are supplied; prefer adding a reviewed typed operation instead.
+Use `api request` only when a typed command does not exist. Partially reviewed paths enforce every catalog rule matched by method, service, and path while retaining conservative retry behavior. Reads with no endpoint-specific match report unknown practice coverage and receive no automatic retries. Mutation dry runs require all dedicated acknowledgements, but actual raw mutations are disabled until the audit-result contract is implemented; prefer adding a reviewed typed operation.
 
 `doctor` exits `0` only when every check passes. On any warning or failure, read the guarded `doctor_unhealthy` report from `error.details.checks` when safely representable; otherwise follow the general guarded-error fallback contract.
 
