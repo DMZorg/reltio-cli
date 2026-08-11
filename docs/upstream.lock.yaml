@@ -1,0 +1,29 @@
+schema_version: 1
+corpus:
+  repository: https://github.com/reltio-ai/reltio-ai-ready-docs
+  commit: 1c290ec16beb53b7754c0aa3195e9918d0d41ef6
+  generated_at: 2026-08-07T02:14:00Z
+deprecations:
+  index_url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance
+  sitemap_url: https://docs.reltio.com/en/reltio/sitemap.xml
+  notice_count: 11
+  notice_url_set_sha256: dab53d373dbddb1b49bf5990726be1fae1b101c197d4b8ecaab560c9bed18a28
+  notice_state_sha256: cd1923e285eeaccf0414ec5ba780eaeb4ecc8742226f94973a53c072f2d0055e
+release_notes:
+  sitemap_url: https://docs.reltio.com/en/reltio/sitemap.xml
+  family: "2026.1"
+  page_count: 2
+  page_url_set_sha256: 7fd333bd5690ba60d4f67c85dc76f7de88b61618fd5efd38bb5575ce0a5f0f3f
+  page_state_sha256: 5e41291996bd615708d9d38ecbb20639ad72a64cf73ad546e9c54b63f7602637
+review:
+  reviewed_at: 2026-08-10
+  language: en
+  release_notes_through: 2026.1.8.0
+  notes: >-
+    Reviewed the official AI-ready corpus, current English documentation,
+    2026.1 release notes, and current deprecation notices for the operations
+    registered in endpoints.yaml. Rechecked the complete Get Entity parameter
+    contract and the Preview introduction status of reverseTranscodeLookups.
+    Rechecked current authentication token lifetime, same-token original-validity,
+    caching, request-limit, retry, response-shape, and opaque JWT guidance for
+    the auth hardening change.

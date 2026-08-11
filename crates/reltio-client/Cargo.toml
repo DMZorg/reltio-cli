@@ -1,0 +1,57 @@
+[package]
+name = "reltio-client"
+description = "Core client, authentication, routing, and policy engine for reltio-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+build = "build.rs"
+publish = false
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+directories.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+httpdate.workspace = true
+memchr.workspace = true
+percent-encoding.workspace = true
+rand.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+reltio-windows-security = { path = "../reltio-windows-security" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+rustix.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))'.dependencies]
+exacl.workspace = true
+
+[build-dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

@@ -257,7 +257,7 @@ Later typed families add `match`, `export`, `load`, `interaction`, `rdm`, `workf
 | `--timeout <duration>` | Overall request or wait timeout, depending on the command. |
 | `--connect-timeout <duration>` | HTTP connection timeout. |
 | `--no-retry` | Disable safe automatic retries. |
-| `--dry-run` | Resolve and validate a mutation without sending it. |
+| `--dry-run` | Resolve and validate an API request without sending it. |
 | `--yes` | Confirm a prompt in non-interactive mode; does not bypass production tenant confirmation. |
 | `--confirm-tenant <id>` | Confirm the exact tenant for high-impact production actions. |
 | `--no-color` | Disable color on human-readable stderr/table output. |
@@ -452,6 +452,7 @@ Client-credential setup directs users to one confidential client/secret pair per
 - Cache entries are keyed by auth host, client/user identity, grant/provider, and relevant scopes—not only by profile name.
 - Treat access tokens as opaque variable-length secrets. Parsing JWT claims is never required for correctness, and storage, IPC, headers, redaction, and tests support current JWT-form tokens of roughly 3 KB and future larger values rather than assuming a UUID-shaped token.
 - `auth logout` revokes a token where supported, clears cached material, and reports any SSO logout URL without opening it in non-interactive mode.
+- Removing a profile transactionally removes its imported bearer cache under the cache-maintenance lock; ordinary pre-commit configuration failures restore and verify the exact token preimage, while committed or uncertain outcomes report both local states.
 
 ### 9.4 Auth commands
 
@@ -589,7 +590,7 @@ Signal-derived process codes remain platform-standard. `task wait` timing out ne
 - `search` returns one page by default and includes how to request the next page.
 - `scan` iterates a cursor and streams JSONL by default; it never buffers an unbounded tenant result in memory.
 - Entity search refuses to imply exhaustive coverage beyond Reltio's 10,000-result search boundary; it directs larger jobs to cursor scan or export. Typed search prefers the documented POST-body form.
-- Query-string filters whose documented processed length would be exceeded fail locally instead of allowing silent truncation. Filter encoding preserves literal `+` as `%2B`, and file-backed `listEquals` inputs enforce the documented 5,000-row and 10 MB limits.
+- Entity filters whose documented processed length would be exceeded fail locally instead of allowing silent truncation. Query encoding preserves literal `+` as `%2B`, and file-backed `listEquals` inputs enforce the documented 5,000-row and 10 MB limits.
 - First-scan filters are validated locally where possible and otherwise fail with the original Reltio diagnostic.
 - `--max-items`, `--page-size`, and `--max-pages` bound agent work independently.
 - A resume file includes endpoint, profile identity, tenant, normalized filter hash, page size, cursor, sequence, and CLI version. A mismatched resume attempt fails instead of silently changing the query.
@@ -753,7 +754,7 @@ Deferral of a typed family does not defer its practice review. Before any later 
 
 ### 13.2 Dry run
 
-`--dry-run` must:
+`--dry-run` primarily plans mutations, and may also perform a deterministic local preflight for a read request. It must:
 
 - resolve profile, tenant, service, auth provider, and endpoint;
 - parse and validate input;

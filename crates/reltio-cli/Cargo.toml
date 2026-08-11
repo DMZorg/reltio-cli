@@ -1,0 +1,44 @@
+[package]
+name = "reltio-cli"
+description = "An agent-native command-line interface for Reltio public APIs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "reltio"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+humantime.workspace = true
+fs2.workspace = true
+is-terminal.workspace = true
+reltio-client = { path = "../reltio-client" }
+reqwest.workspace = true
+rpassword.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile.workspace = true
+wiremock.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["pty"] }
+
+[lints]
+workspace = true

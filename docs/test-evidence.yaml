@@ -1,0 +1,266 @@
+schema_version: 1
+tests:
+  - id: auth_url_is_centralized
+    path: crates/reltio-client/src/service.rs
+    function: auth_url_is_centralized_and_deprecated_path_is_absent
+  - id: deprecated_auth_path_absent
+    path: crates/reltio-client/src/service.rs
+    function: auth_url_is_centralized_and_deprecated_path_is_absent
+  - id: deprecated_auth_path_refused
+    path: crates/reltio-client/src/service.rs
+    function: deprecated_auth_token_path_is_refused
+  - id: auth_client_credentials_request
+    path: crates/reltio-client/src/auth.rs
+    function: client_credentials_uses_basic_form_and_cache
+  - id: auth_login_secret_source_conflict
+    path: crates/reltio-cli/tests/cli.rs
+    function: client_credentials_rejects_conflicting_direct_secret_sources_before_io
+  - id: auth_login_secret_read_order
+    path: crates/reltio-cli/tests/cli.rs
+    function: login_resolves_the_selected_profile_before_reading_secret_stdin
+  - id: auth_login_prior_credential_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: login_guards_displaced_secret_file_and_basic_credentials
+  - id: auth_malformed_cache_guard
+    path: crates/reltio-client/src/auth.rs
+    function: output_guard_errors_retain_discovered_secret_and_malformed_cache_values
+  - id: auth_malformed_cache_duplicate_guard
+    path: crates/reltio-client/src/auth.rs
+    function: malformed_cache_guard_preserves_duplicate_values_and_rejects_unknown_schema
+  - id: auth_global_cache_output_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: malformed_cache_generation_does_not_hide_later_help_guard
+  - id: auth_cached_help_output_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: help_output_is_guarded_against_cached_credentials
+  - id: auth_orphan_cache_output_guard
+    path: crates/reltio-client/src/auth.rs
+    function: cache_output_guard_covers_orphaned_atomic_token_images
+  - id: auth_singleflight_cache
+    path: crates/reltio-client/src/auth.rs
+    function: concurrent_managers_singleflight_token_acquisition
+  - id: auth_cross_process_singleflight
+    path: crates/reltio-cli/tests/cli.rs
+    function: twenty_cli_processes_singleflight_client_credentials
+  - id: auth_expired_cache_refresh
+    path: crates/reltio-client/src/auth.rs
+    function: expired_cache_is_reacquired
+  - id: auth_provider_expiry_guard
+    path: crates/reltio-client/src/auth.rs
+    function: provider_token_inside_expiry_skew_is_rejected_without_cache
+  - id: auth_candidate_expiry_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: unusable_bearer_candidate_preserves_valid_cache_preimage
+  - id: auth_provider_preparse_guard
+    path: crates/reltio-client/src/auth.rs
+    function: malformed_token_response_guards_duplicate_candidate_values
+  - id: auth_credential_process_preparse_guard
+    path: crates/reltio-client/src/auth.rs
+    function: credential_process_executes_a_private_absolute_file_and_bounds_failures
+  - id: auth_same_token_reissue_guard
+    path: crates/reltio-client/src/auth.rs
+    function: concurrent_rejections_stop_when_the_provider_reissues_the_same_token
+  - id: auth_explicit_reissue_lifetime
+    path: crates/reltio-client/src/auth.rs
+    function: explicit_login_preserves_reissued_token_lifetime
+  - id: auth_login_cache_transaction
+    path: crates/reltio-client/src/auth.rs
+    function: managed_login_retains_displaced_bearer_and_restores_exact_preimage
+  - id: auth_login_cache_reader_isolation
+    path: crates/reltio-client/src/auth.rs
+    function: managed_login_rollback_is_hidden_from_waiting_token_readers
+  - id: auth_login_profile_rollback
+    path: crates/reltio-cli/tests/cli.rs
+    function: failed_config_commit_does_not_persist_a_new_provider_token
+  - id: auth_login_malformed_displaced_cache
+    path: crates/reltio-cli/tests/cli.rs
+    function: malformed_displaced_bearer_fails_closed_without_touching_managed_cache
+  - id: auth_login_commit_conflict
+    path: crates/reltio-cli/tests/cli.rs
+    function: login_commit_conflict_guards_the_winning_profile_and_rolls_back_cache
+  - id: auth_login_output_preflight
+    path: crates/reltio-cli/tests/cli.rs
+    function: refresh_token_guard_survives_successful_login_rendering
+  - id: auth_login_warning_preflight
+    path: crates/reltio-cli/tests/cli.rs
+    function: warning_guard_refusal_does_not_commit_login_state
+  - id: auth_login_output_state
+    path: crates/reltio-cli/tests/cli.rs
+    function: login_output_failure_reports_that_local_state_was_committed
+  - id: auth_login_broken_pipe_state
+    path: crates/reltio-cli/tests/cli.rs
+    function: login_broken_pipe_is_reported_after_local_commit
+  - id: auth_refresh_token_validation
+    path: crates/reltio-client/src/auth.rs
+    function: refresh_tokens_reject_empty_line_broken_and_oversized_values
+  - id: auth_refresh_token_no_commit
+    path: crates/reltio-cli/tests/cli.rs
+    function: line_broken_refresh_token_is_rejected_without_output_or_local_commit
+  - id: auth_logout_partial_commit
+    path: crates/reltio-client/src/auth.rs
+    function: cache_cleanup_errors_preserve_partial_and_current_commit_state
+  - id: auth_token_non_rate_limit_no_retry
+    path: crates/reltio-client/src/auth.rs
+    function: token_endpoint_does_not_retry_non_rate_limit_failures
+  - id: auth_rate_limit_single_retry
+    path: crates/reltio-client/src/auth.rs
+    function: token_endpoint_retries_rate_limit_once
+  - id: auth_rate_limit_oversized_replay
+    path: crates/reltio-client/src/auth.rs
+    function: oversized_token_rate_limit_response_does_not_suppress_replay
+  - id: auth_rate_limit_oversized_terminal
+    path: crates/reltio-client/src/auth.rs
+    function: repeated_oversized_token_rate_limit_preserves_terminal_status
+  - id: auth_no_retry_disables_token_replay
+    path: crates/reltio-client/src/auth.rs
+    function: no_retry_disables_token_rate_limit_replay
+  - id: opaque_token_roundtrip
+    path: crates/reltio-client/src/auth.rs
+    function: client_credentials_uses_basic_form_and_cache
+  - id: opaque_token_redaction
+    path: crates/reltio-client/src/redaction.rs
+    function: redacts_opaque_multikilobyte_token
+  - id: auth_token_raw_cumulative_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_auth_token_retains_transient_refresh_guard
+  - id: auth_prior_cache_disclosure_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_auth_token_retains_prior_cache_generation_guard
+  - id: auth_raw_broken_pipe_state
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_auth_token_broken_pipe_is_reported
+  - id: auth_output_newline_guard
+    path: crates/reltio-cli/src/output.rs
+    function: final_render_guard_covers_appended_newline_boundaries
+  - id: auth_token_raw_newline_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_auth_token_rejects_refresh_token_that_spans_its_appended_newline
+  - id: api_mutation_broken_pipe_state
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_mutation_broken_pipe_preserves_non_replayable_outcome
+  - id: api_structured_output_single_error
+    path: crates/reltio-cli/tests/cli.rs
+    function: structured_mutation_broken_pipe_emits_one_error_document
+  - id: api_warning_output_preflight
+    path: crates/reltio-cli/tests/cli.rs
+    function: mutation_warning_sink_failure_precedes_network_request
+  - id: protected_authorization_header
+    path: crates/reltio-client/src/http.rs
+    function: protected_headers_are_refused
+  - id: retry_matrix
+    path: crates/reltio-client/src/http.rs
+    function: retry_matrix_matches_reviewed_guidance
+  - id: retry_backoff_sequence
+    path: crates/reltio-client/src/http.rs
+    function: backoff_sequence_is_one_three_seven
+  - id: retry_oversized_body_replay
+    path: crates/reltio-client/src/http.rs
+    function: oversized_retryable_errors_do_not_suppress_successful_retry
+  - id: retry_oversized_body_terminal
+    path: crates/reltio-client/src/http.rs
+    function: oversized_retryable_errors_preserve_status_after_attempt_ceiling
+  - id: no_retry_500
+    path: crates/reltio-cli/tests/cli.rs
+    function: http_500_is_not_retried_and_echoed_token_is_redacted
+  - id: post_body_size_guard
+    path: crates/reltio-client/src/http.rs
+    function: post_limit_is_checked_before_allocating_a_request
+  - id: entity_uri_normalization
+    path: crates/reltio-client/src/service.rs
+    function: normalizes_entity_ids
+  - id: entity_get_contract
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_get_contract_and_consistency_metadata
+  - id: entity_get_consistency
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_get_contract_and_consistency_metadata
+  - id: entity_get_query_parameters
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_get_contract_and_consistency_metadata
+  - id: raw_entity_get_query_parameters
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_entity_get_recognizes_every_reviewed_query_parameter
+  - id: raw_entity_get_invalid_query
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_entity_get_rejects_malformed_reviewed_query_parameters
+  - id: entity_get_parameter_validation
+    path: crates/reltio-client/src/entities.rs
+    function: get_select_and_options_match_the_reviewed_contract
+  - id: entity_get_preview_warning_outputs
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_get_preview_warning_reaches_raw_and_table_outputs
+  - id: entity_search_post_body
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_search_uses_post_body_and_eventual_metadata
+  - id: entity_search_boundary
+    path: crates/reltio-client/src/entities.rs
+    function: enforces_search_boundary
+  - id: entity_search_boundary_warning_outputs
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_search_boundary_warning_reaches_structured_raw_and_table_outputs
+  - id: raw_entity_search_boundary_warning_outputs
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_entity_search_boundary_warning_reaches_reviewed_api_outputs
+  - id: entity_search_consistency
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_search_uses_post_body_and_eventual_metadata
+  - id: entity_search_filter_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_search_filter_guard_precedes_typed_and_raw_post_network_io
+  - id: auth_check_reviewed_search
+    path: crates/reltio-cli/tests/cli.rs
+    function: auth_check_reports_reviewed_search_metadata
+  - id: doctor_online_reviewed_search
+    path: crates/reltio-cli/tests/cli.rs
+    function: doctor_online_uses_the_registered_search_contract
+  - id: doctor_unhealthy_error
+    path: crates/reltio-cli/tests/cli.rs
+    function: doctor_unhealthy_online_check_is_a_structured_failure
+  - id: entity_scan_pages
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_streams_pages_and_writes_resume_checkpoint
+  - id: entity_scan_filter_guard
+    path: crates/reltio-client/src/entities.rs
+    function: refuses_silently_truncated_scan_filter
+  - id: entity_scan_consistency
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_streams_pages_and_writes_resume_checkpoint
+  - id: entity_scan_resume_validation
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_refuses_invalid_or_mismatched_resume_context
+  - id: entity_scan_resume_cli_version
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_resume_is_bound_to_cli_version
+  - id: entity_scan_resume_expiry
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_refuses_an_expired_resume_cursor
+  - id: entity_scan_active_cursor_expiry
+    path: crates/reltio-cli/src/commands/entity.rs
+    function: active_scan_refuses_an_expired_cursor_before_the_next_request
+  - id: entity_scan_cursor_deadline
+    path: crates/reltio-cli/src/commands/entity.rs
+    function: continuation_deadline_never_outlives_the_cursor
+  - id: entity_scan_resume_route
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_resume_is_bound_to_original_service_route
+  - id: query_plus_encoding
+    path: crates/reltio-client/src/entities.rs
+    function: plus_is_percent_encoded_by_url_query_serializer
+  - id: raw_query_filter_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: partially_reviewed_raw_filter_guard_runs_before_network
+  - id: raw_get_search_preflight
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_get_search_enforces_boundary_and_reports_recommendation
+  - id: entity_lossless_roundtrip
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_get_contract_and_consistency_metadata
+  - id: entity_response_fidelity
+    path: crates/reltio-client/src/http.rs
+    function: successful_raw_and_plain_text_responses_preserve_fidelity
+  - id: entity_response_arbitrary_precision
+    path: crates/reltio-client/src/http.rs
+    function: response_json_preserves_arbitrary_precision_numbers
+  - id: entity_typed_raw_fidelity
+    path: crates/reltio-cli/tests/cli.rs
+    function: typed_entity_raw_output_preserves_upstream_bytes

@@ -1,0 +1,403 @@
+schema_version: 1
+catalog:
+  corpus_commit: 1c290ec16beb53b7754c0aa3195e9918d0d41ef6
+  reviewed_at: 2026-08-10
+  release_notes_through: 2026.1.8.0
+practices:
+  - id: AUTH-CENTRALIZED-001
+    title: Use the centralized authentication service
+    classification: deprecation
+    enforcement: hard_guard
+    api_family: authentication
+    service: auth
+    methods: [POST]
+    path_patterns: ["/oauth/token"]
+    summary: Use https://auth.reltio.com/oauth/token by default and hard-reject the retired tenant-internal sign-in path; explicit custom identity-provider hosts remain partially reviewed.
+    source:
+      url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/internal-api-sign-in-service---oct-2023
+      section: Internal API sign in service
+      updated_at: 2024-12-09
+    reviewed_at: 2026-08-10
+    commands: [auth.login, auth.check, auth.token, entity.get, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/service.rs
+    test_ids: [auth_url_is_centralized, deprecated_auth_path_absent, deprecated_auth_path_refused]
+
+  - id: AUTH-CLIENT-CREDENTIALS-001
+    title: Authenticate confidential machine clients with client credentials
+    classification: requirement
+    enforcement: hard_guard
+    api_family: authentication
+    service: auth
+    methods: [POST]
+    path_patterns: ["/oauth/token"]
+    summary: Send client credentials with HTTP Basic authentication and a form-encoded client_credentials grant; never place credentials in a URL.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/obtaining-access-tokens-with-client-credentials-grant-type
+      section: Request
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-10
+    commands: [auth.login, auth.check, auth.token, entity.get, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/auth.rs
+    test_ids: [auth_client_credentials_request, auth_login_secret_source_conflict, auth_login_secret_read_order, auth_login_prior_credential_guard, auth_provider_preparse_guard, auth_credential_process_preparse_guard]
+
+  - id: AUTH-TOKEN-CACHE-001
+    title: Cache and reuse access tokens until expiry
+    classification: limit
+    enforcement: adaptive_policy
+    api_family: authentication
+    service: auth
+    methods: [POST]
+    path_patterns: ["/oauth/token"]
+    limits:
+      token_requests_per_second: 10
+      default_token_lifetime_seconds: 3600
+    summary: Reuse a token until expiry, reject candidates that are unusable inside the local skew window before replacing a cache preimage, coordinate acquisition to avoid the token endpoint's 10-request-per-second limit, and stop rather than creating repeated refresh generations when a rejected token is reissued unchanged.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/obtaining-access-tokens-with-client-credentials-grant-type
+      section: Token API request limit
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-10
+    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/auth.rs
+    test_ids: [auth_singleflight_cache, auth_cross_process_singleflight, auth_expired_cache_refresh, auth_provider_expiry_guard, auth_candidate_expiry_guard, auth_same_token_reissue_guard, auth_login_cache_transaction, auth_login_cache_reader_isolation, auth_login_profile_rollback, auth_login_malformed_displaced_cache, auth_login_commit_conflict, auth_login_output_preflight, auth_login_warning_preflight, auth_login_output_state, auth_login_broken_pipe_state, auth_logout_partial_commit, auth_global_cache_output_guard, auth_orphan_cache_output_guard]
+
+  - id: AUTH-TOKEN-REISSUE-001
+    title: Preserve the original validity of reissued client-credentials tokens
+    classification: requirement
+    enforcement: adaptive_policy
+    api_family: authentication
+    service: auth
+    methods: [POST]
+    path_patterns: ["/oauth/token"]
+    summary: Without Multi Token Support, identical token bytes retain the validity established when first issued; an early acquisition or explicit login must preserve the earlier acquisition time and must not extend the cached expiry.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/multi-token-support
+      section: Understanding Multi Token Support
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-10
+    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/auth.rs
+    test_ids: [auth_explicit_reissue_lifetime, auth_same_token_reissue_guard]
+
+  - id: AUTH-OPAQUE-TOKEN-001
+    title: Treat access tokens as opaque variable-length secrets
+    classification: deprecation
+    enforcement: hard_guard
+    api_family: authentication
+    service: auth
+    methods: [POST]
+    path_patterns: ["/oauth/token"]
+    limits:
+      documented_jwt_size_characters: 3000
+    summary: JWT access tokens replaced UUID tokens; storage and redaction must not assume a UUID shape or fixed length, and every final or orphaned local cache generation remains part of final-byte output guards.
+    source:
+      url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/uuid-format-for-60-minute-authentication-tokens---apr-2024
+      section: What action do you need to take?
+      updated_at: 2024-12-09
+    reviewed_at: 2026-08-10
+    commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/auth.rs
+    test_ids: [opaque_token_roundtrip, opaque_token_redaction, auth_token_raw_cumulative_guard, auth_prior_cache_disclosure_guard, auth_raw_broken_pipe_state, auth_output_newline_guard, auth_token_raw_newline_guard, auth_malformed_cache_guard, auth_malformed_cache_duplicate_guard, auth_global_cache_output_guard, auth_cached_help_output_guard, auth_orphan_cache_output_guard, auth_provider_preparse_guard, auth_credential_process_preparse_guard, auth_refresh_token_validation, auth_refresh_token_no_commit, auth_login_output_preflight, auth_login_warning_preflight]
+
+  - id: AUTH-TOKEN-RETRY-001
+    title: Do not retry token failures except one bounded rate-limit replay
+    classification: requirement
+    enforcement: hard_guard
+    api_family: authentication
+    service: auth
+    methods: [POST]
+    path_patterns: ["/oauth/token"]
+    limits:
+      status_429_replays: 1
+    summary: Token transport and non-429 HTTP failures receive one attempt; a 429 may be replayed once within the auth deadline even when its diagnostic body is oversized, and --no-retry disables that replay.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/access-reltio-apis
+      section: API Error Retries
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-10
+    commands: [auth.login, auth.check, auth.token, entity.get, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/auth.rs
+    test_ids: [auth_token_non_rate_limit_no_retry, auth_rate_limit_single_retry, auth_rate_limit_oversized_replay, auth_rate_limit_oversized_terminal, auth_no_retry_disables_token_replay]
+
+  - id: AUTH-BEARER-001
+    title: Sign Data API requests with a bearer access token
+    classification: requirement
+    enforcement: automatic_default
+    api_family: data
+    service: data
+    methods: [GET, POST]
+    path_patterns: ["/entities", "/entities/{id}", "/entities/_search", "/entities/_scan"]
+    operations:
+      - { method: GET, path_pattern: "/entities" }
+      - { method: GET, path_pattern: "/entities/{id}" }
+      - { method: GET, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_scan" }
+    summary: Add exactly one Authorization header in Bearer access-token format.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api
+      section: Entities API
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-08
+    commands: [auth.check, entity.get, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/http.rs
+    test_ids: [entity_get_contract, protected_authorization_header]
+
+  - id: HTTP-RETRY-001
+    title: Apply status-specific retry ceilings only to replay-safe requests
+    classification: recommendation
+    enforcement: adaptive_policy
+    api_family: cross_cutting
+    service: any
+    methods: [GET, POST]
+    path_patterns: ["*"]
+    limits:
+      status_429_attempts: 5
+      status_502_attempts: 10
+      status_503_attempts: 12
+      status_504_attempts: 5
+    summary: Outside the token endpoint's more specific policy, do not retry 403, 404, or 500; honor Retry-After for replay-safe 429 responses and use 1,3,7,... second exponential backoff for replay-safe 429, 502, 503, and 504 responses.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/search-using-activity-log-api/api-error-codes
+      section: Best Practice for Retry Mechanism
+      updated_at: 2025-04-29
+    reviewed_at: 2026-08-08
+    commands: [auth.check, entity.get, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/http.rs
+    test_ids: [retry_matrix, retry_backoff_sequence, retry_oversized_body_replay, retry_oversized_body_terminal, no_retry_500]
+
+  - id: HTTP-POST-SIZE-001
+    title: Keep every POST body at or below 50 MB
+    classification: limit
+    enforcement: hard_guard
+    api_family: cross_cutting
+    service: any
+    methods: [POST]
+    path_patterns: ["*"]
+    limits:
+      hard_body_bytes: 52428800
+      recommended_min_body_bytes: 10485760
+      recommended_max_body_bytes: 20971520
+    summary: Reject POST bodies over 50 MB before network I/O; batching workflows should target 10-20 MB.
+    source:
+      url: https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-at-a-glance/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits
+      section: Maximum POST request size
+      updated_at: 2025-06-27
+    reviewed_at: 2026-08-08
+    commands: [auth.check, entity.search, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/http.rs
+    test_ids: [post_body_size_guard]
+
+  - id: ENTITY-GET-CONSISTENCY-001
+    title: Classify direct entity retrieval as consistent
+    classification: behavior
+    enforcement: metadata
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}"]
+    summary: A direct entity read by ID or URI immediately reflects the latest committed update.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis
+      section: Consistent API endpoints
+      updated_at: 2025-01-17
+    reviewed_at: 2026-08-08
+    commands: [entity.get, api.request]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_get_consistency]
+
+  - id: ENTITY-GET-PARAMETERS-001
+    title: Preserve the documented Get Entity query contract
+    classification: behavior
+    enforcement: hard_guard
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}"]
+    limits:
+      select_top_level: [uri, type, tags, createdBy, createdTime, updatedBy, updatedTime, isFavorite, analyticsAttributes, label, secondaryLabel, crosswalks, attributes]
+      select_attribute_path: attributes.<non-empty path>
+      options: [sendHidden, ovOnly, nonOvOnly, serializeInitialSourcesInCrosswalks, cleanEntity, showAppliedSurvivorshipRules, showEndDatedReferenceAttributes, explainOv]
+    summary: Expose and validate the exact documented select grammar, historical time in Unix milliseconds, response options, duplicate-crosswalk merging, value limits, explicit survivorship groups, reverse transcoding, and viewing-mode masking without silently dropping caller intent.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity
+      section: Parameters
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-09
+    commands: [entity.get, api.request]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_get_query_parameters, raw_entity_get_query_parameters, raw_entity_get_invalid_query, entity_get_parameter_validation]
+
+  - id: ENTITY-GET-REVERSE-TRANSCODE-001
+    title: Warn when requesting Preview reverse transcoding
+    classification: release_change
+    enforcement: actionable_warning
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities/{id}"]
+    summary: Reltio's introduction note classified reverseTranscodeLookups as Preview and no later GA notice was found in the reviewed corpus; expose the documented parameter while warning callers to verify tenant availability and destination mappings.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity
+      section: Reverse Transcoding
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-09
+    commands: [entity.get, api.request]
+    implementation: crates/reltio-cli/src/commands/entity.rs
+    test_ids: [entity_get_query_parameters, raw_entity_get_query_parameters, entity_get_preview_warning_outputs]
+
+  - id: ENTITY-SEARCH-POST-001
+    title: Prefer POST-body entity search
+    classification: recommendation
+    enforcement: automatic_default
+    api_family: entity
+    service: data
+    methods: [POST]
+    path_patterns: ["/entities/_search"]
+    summary: Use POST /entities/_search and place search parameters in the JSON body.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-search
+      section: Request
+      updated_at: 2026-08-07
+    reviewed_at: 2026-08-08
+    commands: [entity.search, auth.check, api.request, doctor]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_search_post_body]
+
+  - id: ENTITY-SEARCH-GET-001
+    title: Prefer POST while guarding supported GET entity search
+    classification: recommendation
+    enforcement: actionable_warning
+    api_family: entity
+    service: data
+    methods: [GET]
+    path_patterns: ["/entities", "/entities/_search"]
+    summary: Reltio supports both GET search paths but recommends POST /entities/_search; raw GET remains available only with the same filter and result-boundary preflights.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-search
+      section: Request
+      updated_at: 2026-08-07
+    reviewed_at: 2026-08-08
+    commands: [api.request]
+    implementation: crates/reltio-cli/src/commands/api.rs
+    test_ids: [raw_get_search_preflight]
+
+  - id: ENTITY-SEARCH-BOUNDARY-001
+    title: Enforce the 10,000-result offset-search boundary
+    classification: limit
+    enforcement: hard_guard
+    api_family: entity
+    service: data
+    methods: [GET, POST]
+    path_patterns: ["/entities", "/entities/_search"]
+    operations:
+      - { method: GET, path_pattern: "/entities" }
+      - { method: GET, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_search" }
+    limits:
+      offset_plus_max: 10000
+      default_max: 50
+    summary: Refuse offset and max combinations above 10,000, warn when a full page reaches the boundary, and direct exhaustive work to cursor scan or export.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-search
+      section: Parameters
+      updated_at: 2026-08-07
+    reviewed_at: 2026-08-08
+    commands: [entity.search, auth.check, api.request, doctor]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_search_boundary, entity_search_boundary_warning_outputs, raw_entity_search_boundary_warning_outputs]
+
+  - id: ENTITY-SEARCH-CONSISTENCY-001
+    title: Classify indexed entity search as eventually consistent
+    classification: behavior
+    enforcement: metadata
+    api_family: entity
+    service: data
+    methods: [GET, POST]
+    path_patterns: ["/entities", "/entities/_search", "/entities/_scan"]
+    operations:
+      - { method: GET, path_pattern: "/entities" }
+      - { method: GET, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_scan" }
+    summary: Indexed searches may not immediately reflect a preceding write.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis
+      section: Eventually Consistent API endpoints
+      updated_at: 2025-01-17
+    reviewed_at: 2026-08-08
+    commands: [entity.search, entity.scan, auth.check, api.request, doctor]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_search_consistency, entity_scan_consistency]
+
+  - id: ENTITY-SCAN-CURSOR-001
+    title: Respect entity cursor lifecycle and terminal pages
+    classification: behavior
+    enforcement: adaptive_policy
+    api_family: entity
+    service: data
+    methods: [POST]
+    path_patterns: ["/entities/_scan"]
+    limits:
+      ordinary_ttl_seconds_after_last_read: 86400
+      preserved_ttl_seconds_after_last_read: 3600
+    summary: Require a filter on the first request, continue with the returned cursor, and treat a cursor-only response as exhaustion.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/search-entity-with-cursor
+      section: Search Entity with Cursor
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-08
+    commands: [entity.scan, api.request]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_scan_pages, entity_scan_resume_validation, entity_scan_resume_cli_version, entity_scan_resume_expiry, entity_scan_active_cursor_expiry, entity_scan_cursor_deadline, entity_scan_resume_route]
+
+  - id: ENTITY-FILTER-QUERY-001
+    title: Prevent query-filter truncation and preserve literal plus signs
+    classification: limit
+    enforcement: hard_guard
+    api_family: entity
+    service: data
+    methods: [GET, POST]
+    path_patterns: ["/entities", "/entities/_search", "/entities/_scan"]
+    operations:
+      - { method: GET, path_pattern: "/entities" }
+      - { method: GET, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_scan" }
+    limits:
+      processed_query_characters: 256
+      list_equals_rows: 5000
+      list_equals_file_bytes: 10485760
+    summary: Reject entity filters over 256 characters, encode query-transport literal plus as %2B, and enforce file-backed listEquals limits when the CLI owns the file.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/filtering-entities
+      section: Format
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-08
+    commands: [entity.search, auth.check, entity.scan, api.request, doctor]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_search_filter_guard, entity_scan_filter_guard, query_plus_encoding, raw_query_filter_guard]
+
+  - id: ENTITY-LOSSLESS-001
+    title: Preserve evolving entity response fields losslessly
+    classification: release_change
+    enforcement: automatic_default
+    api_family: entity
+    service: data
+    methods: [GET, POST]
+    path_patterns: ["/entities", "/entities/{id}", "/entities/_search", "/entities/_scan"]
+    operations:
+      - { method: GET, path_pattern: "/entities" }
+      - { method: GET, path_pattern: "/entities/{id}" }
+      - { method: GET, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_search" }
+      - { method: POST, path_pattern: "/entities/_scan" }
+    summary: Preserve every field and value returned by Reltio, including newer explainOv survivorship details, rather than remodeling the received payload lossily; explicit upstream field/value limits remain caller-visible.
+    source:
+      url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api
+      section: Entity object structure
+      updated_at: 2026-07-31
+    reviewed_at: 2026-08-08
+    commands: [entity.get, entity.search, entity.scan, auth.check, api.request, doctor]
+    implementation: crates/reltio-client/src/entities.rs
+    test_ids: [entity_lossless_roundtrip, entity_response_fidelity, entity_response_arbitrary_precision, entity_typed_raw_fidelity]

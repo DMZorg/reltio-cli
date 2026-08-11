@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTUP_TOOLCHAIN: 1.85.0
+
+jobs:
+  quality:
+    name: Format, lint, and policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal --component rustfmt,clippy
+      - name: Install Linux ACL development library
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libacl1-dev
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Documentation links
+        run: cargo test --locked -p reltio-cli --test cli shipped_local_markdown_links_resolve
+      - name: Practice release gate
+        run: cargo run --locked -p reltio-cli -- --compact api practices check --strict > practice-coverage.json
+      - name: Upload API-practice coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: api-practice-coverage
+          path: practice-coverage.json
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-quality:
+    name: Windows lint and security boundary
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal --component clippy
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Install Linux ACL development library
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libacl1-dev
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Release build smoke test
+        run: cargo build --workspace --release --locked
+      - name: Binary smoke test
+        if: runner.os != 'Windows'
+        run: ./target/release/reltio --version
+      - name: Windows binary smoke test
+        if: runner.os == 'Windows'
+        run: ./target/release/reltio.exe --version
+
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Install dependency-tool Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install cargo-audit
+        run: cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
+      - name: Install cargo-deny
+        run: cargo +1.88.0 install cargo-deny --version 0.20.2 --locked
+      - name: Audit advisories
+        run: cargo audit --deny warnings
+      - name: Check licenses, bans, and sources
+        run: cargo deny check

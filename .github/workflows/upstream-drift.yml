@@ -1,0 +1,129 @@
+name: Reltio documentation drift
+
+on:
+  schedule:
+    - cron: "17 21 * * 3,5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Compare reviewed corpus position
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reviewed="$(awk '/^  commit:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_release="$(awk '/^  release_notes_through:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_release_family="$(awk '/^  family:/ { print $2; exit }' docs/upstream.lock.yaml | tr -d '"')"
+          reviewed_release_page_count="$(awk '/^  page_count:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_release_urls="$(awk '/^  page_url_set_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_release_state="$(awk '/^  page_state_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_deprecation_count="$(awk '/^  notice_count:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_deprecations="$(awk '/^  notice_url_set_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          reviewed_deprecation_state="$(awk '/^  notice_state_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
+          latest="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/reltio-ai/reltio-ai-ready-docs/commits/main | jq -r .sha)"
+          release_url="https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/release-notes-at-a-glance/${reviewed_release_family}-release-notes/${reviewed_release_family}-bi-weekly-release-notes-rn"
+          deprecation_url='https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance'
+          deprecation_sitemap_url='https://docs.reltio.com/en/reltio/sitemap.xml'
+          release_page="$(curl --fail --location --silent --show-error "${release_url}")"
+          curl --fail --location --silent --show-error --output /dev/null "${deprecation_url}"
+          sitemap="$(curl --fail --location --silent --show-error "${deprecation_sitemap_url}")"
+          fingerprints="$(RELEASE_FAMILY="${reviewed_release_family}" python3 -c '
+          import hashlib
+          import os
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.fromstring(sys.stdin.buffer.read())
+          rows = []
+          for node in root:
+              location = next((child.text or "" for child in node if child.tag.endswith("loc")), "")
+              location = location.split("?", 1)[0].split("#", 1)[0]
+              modified = next((child.text or "" for child in node if child.tag.endswith("lastmod")), "")
+              rows.append((location, modified))
+
+          def fingerprint(selected):
+              selected = sorted(set(selected))
+              urls = "\n".join(url for url, _ in selected)
+              state = "\n".join(f"{url}\t{modified}" for url, modified in selected)
+              return len(selected), hashlib.sha256(urls.encode()).hexdigest(), hashlib.sha256(state.encode()).hexdigest()
+
+          family = os.environ["RELEASE_FAMILY"]
+          families = {
+              match.group(1)
+              for location, _ in rows
+              if (match := re.search(r"/(\d{4}\.\d+)-release-notes(?:/|$)", location))
+          }
+          if not families:
+              raise SystemExit("official sitemap contains no release-note families")
+          latest_family = max(
+              families,
+              key=lambda value: tuple(int(part) for part in value.split(".")),
+          )
+          deprecated = fingerprint(row for row in rows if "/deprecation-notices-at-a-glance/" in row[0])
+          releases = fingerprint(row for row in rows if f"/{family}-release-notes/" in row[0])
+          print(*deprecated, *releases, latest_family)
+          ' <<< "${sitemap}")"
+          read -r current_deprecation_count current_deprecations current_deprecation_state current_release_page_count current_release_urls current_release_state current_release_family <<< "${fingerprints}"
+          latest_release="$(printf '%s' "${release_page}" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+\.0 RN' | sed 's/ RN$//' | sort -V | awk 'END { print }' || true)"
+          if [[ -z "${latest_release}" ]]; then
+            release_page="$(curl --fail --location --silent --show-error "https://r.jina.ai/http://${release_url#https://}")"
+            latest_release="$(printf '%s' "${release_page}" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+\.0 RN' | sed 's/ RN$//' | sort -V | awk 'END { print }' || true)"
+          fi
+          source_count=0
+          while IFS= read -r source_url; do
+            curl --fail --location --silent --show-error --output /dev/null "${source_url}"
+            source_count=$((source_count + 1))
+          done < <(awk '/^      url: https:\/\// { print $2 }' docs/reltio-api-practices.yaml | sort -u)
+          practice_ids="$(awk '/^  - id:/ { printf "%s%s", separator, $3; separator=", " }' docs/reltio-api-practices.yaml)"
+          commands="$(awk '/^    commands: \[/ { line=$0; sub(/^    commands: \[/, "", line); sub(/\]$/, "", line); print line }' docs/reltio-api-practices.yaml | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sort -u | awk 'NF { printf "%s%s", separator, $0; separator=", " }')"
+          {
+            echo '# Reltio documentation drift report'
+            echo
+            echo "Reviewed corpus commit: \`${reviewed}\`"
+            echo "Current corpus commit: \`${latest}\`"
+            echo "Reviewed release notes through: \`${reviewed_release}\`"
+            echo "Current release-notes page reports: \`${latest_release:-unknown}\`"
+            echo "Reviewed release-note family: \`${reviewed_release_family}\`"
+            echo "Current newest release-note family: \`${current_release_family}\`"
+            echo "Reviewed release-note pages: \`${reviewed_release_page_count}\` (URL hash \`${reviewed_release_urls}\`, state hash \`${reviewed_release_state}\`)"
+            echo "Current release-note pages: \`${current_release_page_count}\` (URL hash \`${current_release_urls}\`, state hash \`${current_release_state}\`)"
+            echo "Current official practice source URLs checked: \`${source_count}\`"
+            echo "Reviewed deprecation notices: \`${reviewed_deprecation_count}\` (URL-set hash \`${reviewed_deprecations}\`)"
+            echo "Current deprecation notices: \`${current_deprecation_count}\` (URL-set hash \`${current_deprecations}\`)"
+            echo "Reviewed deprecation state hash: \`${reviewed_deprecation_state}\`"
+            echo "Current deprecation state hash: \`${current_deprecation_state}\`"
+            echo
+            if [[ "${reviewed}" == "${latest}" && "${reviewed_release}" == "${latest_release}" && "${reviewed_release_family}" == "${current_release_family}" && "${reviewed_release_page_count}" == "${current_release_page_count}" && "${reviewed_release_urls}" == "${current_release_urls}" && "${reviewed_release_state}" == "${current_release_state}" && "${reviewed_deprecation_count}" == "${current_deprecation_count}" && "${reviewed_deprecations}" == "${current_deprecations}" && "${reviewed_deprecation_state}" == "${current_deprecation_state}" ]]; then
+              echo 'Status: no corpus, release-position, or deprecation-index drift detected.'
+            else
+              echo 'Status: review required. Runtime policy has not changed automatically.'
+              echo
+              echo "Compare: https://github.com/reltio-ai/reltio-ai-ready-docs/compare/${reviewed}...${latest}"
+              echo
+              echo "Conservative triage practice IDs: ${practice_ids}"
+              echo
+              echo "Potentially affected commands: ${commands}"
+            fi
+          } > reltio-documentation-drift.md
+          cat reltio-documentation-drift.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload review artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: reltio-documentation-drift
+          path: reltio-documentation-drift.md
+          if-no-files-found: error
+          retention-days: 30

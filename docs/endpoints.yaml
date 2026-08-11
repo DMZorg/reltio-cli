@@ -1,0 +1,127 @@
+schema_version: 1
+endpoints:
+  - id: auth.client_credentials
+    service: auth
+    method: POST
+    path_pattern: /oauth/token
+    safety: authentication
+    consistency: not_applicable
+    replay: safe_with_limit
+    pagination: none
+    commands: [auth.login, auth.check, auth.token, entity.get, entity.search, entity.scan, api.request, doctor]
+    practice_ids:
+      - AUTH-CENTRALIZED-001
+      - AUTH-CLIENT-CREDENTIALS-001
+      - AUTH-TOKEN-CACHE-001
+      - AUTH-TOKEN-REISSUE-001
+      - AUTH-OPAQUE-TOKEN-001
+      - AUTH-TOKEN-RETRY-001
+    test_ids: [auth_client_credentials_request, auth_login_secret_source_conflict, auth_login_secret_read_order, auth_login_prior_credential_guard, auth_singleflight_cache, auth_cross_process_singleflight, auth_expired_cache_refresh, auth_provider_expiry_guard, auth_candidate_expiry_guard, auth_same_token_reissue_guard, auth_explicit_reissue_lifetime, auth_login_cache_transaction, auth_login_cache_reader_isolation, auth_login_profile_rollback, auth_login_malformed_displaced_cache, auth_login_commit_conflict, auth_login_output_preflight, auth_login_warning_preflight, auth_login_output_state, auth_login_broken_pipe_state, auth_refresh_token_validation, auth_refresh_token_no_commit, auth_logout_partial_commit, opaque_token_roundtrip, auth_token_raw_cumulative_guard, auth_prior_cache_disclosure_guard, auth_raw_broken_pipe_state, auth_output_newline_guard, auth_token_raw_newline_guard, auth_malformed_cache_guard, auth_malformed_cache_duplicate_guard, auth_global_cache_output_guard, auth_cached_help_output_guard, auth_orphan_cache_output_guard, auth_provider_preparse_guard, auth_credential_process_preparse_guard, auth_token_non_rate_limit_no_retry, auth_rate_limit_single_retry, auth_rate_limit_oversized_replay, auth_rate_limit_oversized_terminal]
+    verified_at: 2026-08-10
+
+  - id: entity.get
+    service: data
+    method: GET
+    path_pattern: /entities/{id}
+    safety: read
+    consistency: consistent
+    replay: safe
+    pagination: none
+    commands: [entity.get, api.request]
+    practice_ids:
+      - AUTH-BEARER-001
+      - AUTH-OPAQUE-TOKEN-001
+      - HTTP-RETRY-001
+      - ENTITY-GET-CONSISTENCY-001
+      - ENTITY-GET-PARAMETERS-001
+      - ENTITY-GET-REVERSE-TRANSCODE-001
+      - ENTITY-LOSSLESS-001
+    test_ids: [entity_uri_normalization, entity_get_contract, entity_get_consistency, entity_get_query_parameters, raw_entity_get_query_parameters, raw_entity_get_invalid_query, entity_get_parameter_validation, entity_get_preview_warning_outputs]
+    verified_at: 2026-08-09
+
+  - id: entity.search
+    service: data
+    method: POST
+    path_pattern: /entities/_search
+    safety: read
+    consistency: eventual
+    replay: safe
+    pagination: offset
+    max_body_bytes: 52428800
+    result_boundary: 10000
+    commands: [entity.search, auth.check, api.request, doctor]
+    practice_ids:
+      - AUTH-BEARER-001
+      - HTTP-RETRY-001
+      - HTTP-POST-SIZE-001
+      - ENTITY-SEARCH-POST-001
+      - ENTITY-SEARCH-BOUNDARY-001
+      - ENTITY-SEARCH-CONSISTENCY-001
+      - ENTITY-FILTER-QUERY-001
+      - ENTITY-LOSSLESS-001
+    test_ids: [entity_search_post_body, entity_search_boundary, entity_search_boundary_warning_outputs, raw_entity_search_boundary_warning_outputs, entity_search_consistency, entity_search_filter_guard, auth_check_reviewed_search, doctor_online_reviewed_search, doctor_unhealthy_error]
+    verified_at: 2026-08-08
+
+  - id: entity.search.get
+    service: data
+    method: GET
+    path_pattern: /entities
+    safety: read
+    consistency: eventual
+    replay: safe
+    pagination: offset
+    result_boundary: 10000
+    commands: [api.request]
+    practice_ids:
+      - AUTH-BEARER-001
+      - HTTP-RETRY-001
+      - ENTITY-SEARCH-GET-001
+      - ENTITY-SEARCH-BOUNDARY-001
+      - ENTITY-SEARCH-CONSISTENCY-001
+      - ENTITY-FILTER-QUERY-001
+      - ENTITY-LOSSLESS-001
+    test_ids: [raw_get_search_preflight, raw_query_filter_guard, raw_entity_search_boundary_warning_outputs, entity_search_boundary, entity_search_consistency]
+    verified_at: 2026-08-08
+
+  - id: entity.search.get_alias
+    service: data
+    method: GET
+    path_pattern: /entities/_search
+    safety: read
+    consistency: eventual
+    replay: safe
+    pagination: offset
+    result_boundary: 10000
+    commands: [api.request]
+    practice_ids:
+      - AUTH-BEARER-001
+      - HTTP-RETRY-001
+      - ENTITY-SEARCH-GET-001
+      - ENTITY-SEARCH-BOUNDARY-001
+      - ENTITY-SEARCH-CONSISTENCY-001
+      - ENTITY-FILTER-QUERY-001
+      - ENTITY-LOSSLESS-001
+    test_ids: [raw_get_search_preflight, raw_query_filter_guard, raw_entity_search_boundary_warning_outputs, entity_search_boundary, entity_search_consistency]
+    verified_at: 2026-08-08
+
+  - id: entity.scan
+    service: data
+    method: POST
+    path_pattern: /entities/_scan
+    safety: read
+    consistency: eventual
+    replay: safe
+    pagination: cursor
+    max_body_bytes: 52428800
+    cursor_ttl_seconds: 3600
+    commands: [entity.scan, api.request]
+    practice_ids:
+      - AUTH-BEARER-001
+      - HTTP-RETRY-001
+      - HTTP-POST-SIZE-001
+      - ENTITY-SCAN-CURSOR-001
+      - ENTITY-FILTER-QUERY-001
+      - ENTITY-SEARCH-CONSISTENCY-001
+      - ENTITY-LOSSLESS-001
+    test_ids: [entity_scan_pages, entity_scan_filter_guard, entity_scan_consistency, entity_scan_resume_validation, entity_scan_resume_cli_version, entity_scan_resume_expiry, entity_scan_active_cursor_expiry, entity_scan_cursor_deadline, entity_scan_resume_route]
+    verified_at: 2026-08-08
