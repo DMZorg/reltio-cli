@@ -451,6 +451,15 @@ impl DirectoryGuards {
         }
         Ok(())
     }
+
+    fn immediate_parent(&self) -> Result<&File> {
+        self.handles.last().ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the local path has no guarded parent directory",
+            )
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -513,6 +522,12 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
             "the local path has no parent directory",
         )
     })?;
+    let destination_name = path.file_name().ok_or_else(|| {
+        Error::policy(
+            ErrorKind::InvalidPath,
+            "the local path has no destination file name",
+        )
+    })?;
     let context = ffi::SecurityContext::new()?;
     let guards = ensure_directory_tree(parent, &context)?;
     guards.revalidate(&context)?;
@@ -544,7 +559,11 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         validate_private_file_handle(&existing, &context)?;
     }
 
-    ffi::move_replace(&temporary.file, &path)?;
+    ffi::move_replace(
+        &temporary.file,
+        guards.immediate_parent()?,
+        destination_name,
+    )?;
     // A successful rename is the commit point. Cleanup must never delete the
     // installed destination if any later diagnostic were to fail.
     temporary.disarm();
@@ -632,12 +651,7 @@ pub fn inspect_private_executable(path: &Path) -> Result<PrivateExecutableGuard>
     let file = ffi::open_file_for_inspection(&path)?;
     validate_private_file_handle(&file, &context)?;
     directories.revalidate(&context)?;
-    let executable_directory = directories.handles.last().ok_or_else(|| {
-        Error::policy(
-            ErrorKind::InvalidPath,
-            "the executable path has no guarded parent directory",
-        )
-    })?;
+    let executable_directory = directories.immediate_parent()?;
     ffi::inspect_executable_directory_policy(executable_directory, &context)?;
     require_dedicated_executable_directory(parent)?;
     ffi::reset_process_dll_directory()?;

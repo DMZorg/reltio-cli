@@ -10,7 +10,7 @@ use std::fs::File;
 use std::mem::{align_of, offset_of, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
@@ -43,10 +43,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_LIST_DIRECTORY,
-    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO,
-    FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo,
     FileDispositionInfo, FileRenameInfoEx, FileStandardInfo, GetDriveTypeW,
     GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, OPEN_EXISTING,
     READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SetFileInformationByHandle,
@@ -733,7 +733,7 @@ pub(crate) fn create_private_directory(path: &Path, context: &SecurityContext) -
 pub(crate) fn open_directory(path: &Path) -> Result<File> {
     open_file(
         path,
-        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
         FILE_SHARE_READ,
         OPEN_EXISTING,
         COMMON_OPEN_FLAGS | FILE_FLAG_BACKUP_SEMANTICS,
@@ -1380,8 +1380,12 @@ fn basic_allowed_ace(dacl: *mut ACL, index: u32) -> Result<Option<AllowedAceView
     }))
 }
 
-pub(crate) fn move_replace(source: &File, destination: &Path) -> Result<()> {
-    let destination = wide_path(destination)?;
+pub(crate) fn move_replace(
+    source: &File,
+    destination_parent: &File,
+    destination_name: &OsStr,
+) -> Result<()> {
+    let destination = wide_leaf(destination_name)?;
     let file_name_units = destination.len().checked_sub(1).ok_or_else(|| {
         Error::policy(
             ErrorKind::InvalidPath,
@@ -1441,17 +1445,17 @@ pub(crate) fn move_replace(source: &File, destination: &Path) -> Result<()> {
         std::ptr::addr_of_mut!((*information).Anonymous).write(FILE_RENAME_INFO_0 {
             Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
         });
-        std::ptr::addr_of_mut!((*information).RootDirectory).write(null_mut());
+        std::ptr::addr_of_mut!((*information).RootDirectory).write(raw_handle(destination_parent));
         std::ptr::addr_of_mut!((*information).FileNameLength).write(file_name_bytes);
         destination.as_ptr().copy_to_nonoverlapping(
             std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
             destination.len(),
         );
     }
-    // SAFETY: `source` remains live and grants DELETE access, and `information`
-    // points to the initialized variable-length buffer described above. POSIX
-    // replacement keeps already-open snapshots valid while assigning the
-    // destination name to this verified source handle.
+    // SAFETY: `source` remains live and grants DELETE access. The held parent
+    // handle grants traverse and read-attribute access, and `information`
+    // contains one relative leaf name. POSIX replacement keeps already-open
+    // snapshots valid while assigning that name to the verified source handle.
     if unsafe {
         SetFileInformationByHandle(
             raw_handle(source),
@@ -1650,6 +1654,30 @@ fn wide_path(path: &Path) -> Result<Vec<u16>> {
     wide.extend(encoded);
     wide.push(0);
     Ok(wide)
+}
+
+fn wide_leaf(name: &OsStr) -> Result<Vec<u16>> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(component)) if component == name)
+        || components.next().is_some()
+    {
+        return Err(Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement name is not one file name",
+        ));
+    }
+    let mut encoded = name.encode_wide().collect::<Vec<_>>();
+    if encoded
+        .iter()
+        .any(|character| *character == 0 || *character == u16::from(b':'))
+    {
+        return Err(Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement name is invalid",
+        ));
+    }
+    encoded.push(0);
+    Ok(encoded)
 }
 
 fn raw_handle(file: &File) -> HANDLE {
