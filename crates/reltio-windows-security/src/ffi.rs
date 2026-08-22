@@ -13,10 +13,14 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path};
 use std::ptr::{null, null_mut};
 
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0, FILE_RENAME_POSIX_SEMANTICS,
+    FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformationEx, NtSetInformationFile,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES,
     ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    LocalFree, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    LocalFree, RtlNtStatusToDosError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 #[cfg(test)]
@@ -44,10 +48,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo,
-    FileDispositionInfo, FileRenameInfoEx, FileStandardInfo, GetDriveTypeW,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    FILE_WRITE_EA, FileAttributeTagInfo, FileDispositionInfo, FileStandardInfo, GetDriveTypeW,
     GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, OPEN_EXISTING,
     READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SetFileInformationByHandle,
     VOLUME_NAME_NT, WRITE_DAC, WRITE_OWNER,
@@ -58,6 +61,7 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, IO_STATUS_BLOCK_0};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -79,9 +83,7 @@ use windows_sys::Win32::System::Threading::{
     OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
     WaitForSingleObject,
 };
-use windows_sys::Win32::System::WindowsProgramming::{
-    DRIVE_FIXED, FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
-};
+use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
 use crate::{Error, ErrorKind, Result};
 
@@ -101,7 +103,7 @@ const UNTRUSTED_EXECUTABLE_DIRECTORY_MUTATION: u32 =
     UNTRUSTED_ANCESTOR_MUTATION | FILE_WRITE_DATA | FILE_APPEND_DATA;
 const CONSOLE_READ_NOWAIT: u16 = 0x0002;
 const MAX_FINAL_PATH_UNITS: usize = 32_768;
-const _: () = assert!(align_of::<FILE_RENAME_INFO>() <= align_of::<usize>());
+const _: () = assert!(align_of::<FILE_RENAME_INFORMATION>() <= align_of::<usize>());
 
 type ReadConsoleInputExW =
     unsafe extern "system" fn(HANDLE, *mut INPUT_RECORD, u32, *mut u32, u16) -> i32;
@@ -1386,33 +1388,23 @@ pub(crate) fn move_replace(
     destination_name: &OsStr,
 ) -> Result<()> {
     let destination = wide_leaf(destination_name)?;
-    let file_name_units = destination.len().checked_sub(1).ok_or_else(|| {
-        Error::policy(
-            ErrorKind::InvalidPath,
-            "the Windows replacement path is empty",
-        )
-    })?;
-    let file_name_bytes = file_name_units
+    let file_name_bytes = destination
+        .len()
         .checked_mul(size_of::<u16>())
-        .and_then(|size| u32::try_from(size).ok())
         .ok_or_else(|| {
             Error::policy(
                 ErrorKind::InvalidPath,
                 "the Windows replacement path is too long",
             )
         })?;
-    let buffer_size = offset_of!(FILE_RENAME_INFO, FileName)
-        .checked_add(
-            destination
-                .len()
-                .checked_mul(size_of::<u16>())
-                .ok_or_else(|| {
-                    Error::policy(
-                        ErrorKind::InvalidPath,
-                        "the Windows replacement path is too long",
-                    )
-                })?,
+    let file_name_length = u32::try_from(file_name_bytes).map_err(|_| {
+        Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement path is too long",
         )
+    })?;
+    let buffer_size = size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(file_name_bytes)
         .ok_or_else(|| {
             Error::policy(
                 ErrorKind::InvalidPath,
@@ -1436,37 +1428,46 @@ pub(crate) fn move_replace(
             )
         })?;
     let mut buffer = vec![0_usize; word_count];
-    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: The usize buffer has sufficient size and alignment for the
-    // variable-length FILE_RENAME_INFO. Every fixed field is initialized, and
-    // the copied UTF-16 destination includes its terminating NUL while the
-    // reported FileNameLength deliberately excludes it.
+    // variable-length FILE_RENAME_INFORMATION. Every fixed field is
+    // initialized, and FileNameLength exactly describes the copied leaf.
     unsafe {
-        std::ptr::addr_of_mut!((*information).Anonymous).write(FILE_RENAME_INFO_0 {
-            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        std::ptr::addr_of_mut!((*information).Anonymous).write(FILE_RENAME_INFORMATION_0 {
+            Flags: FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
         });
         std::ptr::addr_of_mut!((*information).RootDirectory).write(raw_handle(destination_parent));
-        std::ptr::addr_of_mut!((*information).FileNameLength).write(file_name_bytes);
+        std::ptr::addr_of_mut!((*information).FileNameLength).write(file_name_length);
         destination.as_ptr().copy_to_nonoverlapping(
             std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
             destination.len(),
         );
     }
+    let mut io_status = IO_STATUS_BLOCK {
+        Anonymous: IO_STATUS_BLOCK_0 { Status: 0 },
+        Information: 0,
+    };
     // SAFETY: `source` remains live and grants DELETE access. The held parent
-    // handle grants traverse and read-attribute access, and `information`
-    // contains one relative leaf name. POSIX replacement keeps already-open
-    // snapshots valid while assigning that name to the verified source handle.
-    if unsafe {
-        SetFileInformationByHandle(
+    // handle grants traverse and read-attribute access, `io_status` is writable,
+    // and `information` contains one relative leaf name. POSIX replacement
+    // keeps already-open snapshots valid while assigning that name to the
+    // verified source handle.
+    let status = unsafe {
+        NtSetInformationFile(
             raw_handle(source),
-            FileRenameInfoEx,
+            &mut io_status,
             information.cast::<c_void>(),
             buffer_size_u32,
+            FileRenameInformationEx,
         )
-    } == 0
-    {
-        return Err(last_error(
+    };
+    if status < 0 {
+        // SAFETY: RtlNtStatusToDosError accepts any NTSTATUS value and has no
+        // pointer or lifetime requirements.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(Error::from_win32(
             "failed to atomically install the private Windows file",
+            code,
         ));
     }
     Ok(())
@@ -1666,7 +1667,7 @@ fn wide_leaf(name: &OsStr) -> Result<Vec<u16>> {
             "the Windows replacement name is not one file name",
         ));
     }
-    let mut encoded = name.encode_wide().collect::<Vec<_>>();
+    let encoded = name.encode_wide().collect::<Vec<_>>();
     if encoded
         .iter()
         .any(|character| *character == 0 || *character == u16::from(b':'))
@@ -1676,7 +1677,6 @@ fn wide_leaf(name: &OsStr) -> Result<Vec<u16>> {
             "the Windows replacement name is invalid",
         ));
     }
-    encoded.push(0);
     Ok(encoded)
 }
 
