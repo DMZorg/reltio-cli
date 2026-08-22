@@ -4794,11 +4794,11 @@ mod tests {
         let mut second_target = first_target.clone();
         second_target.tenant = "OtherTenant".to_owned();
 
-        let first = imported_bearer_cache_key(Path::new("/config/one.toml"), &first_target)
+        let first = imported_bearer_cache_key(Path::new("config/one.toml"), &first_target)
             .expect("first cache key");
-        let other_config = imported_bearer_cache_key(Path::new("/config/two.toml"), &first_target)
+        let other_config = imported_bearer_cache_key(Path::new("config/two.toml"), &first_target)
             .expect("second cache key");
-        let other_route = imported_bearer_cache_key(Path::new("/config/one.toml"), &second_target)
+        let other_route = imported_bearer_cache_key(Path::new("config/one.toml"), &second_target)
             .expect("routed cache key");
 
         assert_ne!(first, other_config);
@@ -4808,10 +4808,10 @@ mod tests {
         first_generation.auth.bearer_cache_generation = Some("a".repeat(64));
         let mut second_generation = first_generation.clone();
         second_generation.auth.bearer_cache_generation = Some("b".repeat(64));
-        let generated = imported_bearer_cache_key(Path::new("/config/one.toml"), &first_generation)
+        let generated = imported_bearer_cache_key(Path::new("config/one.toml"), &first_generation)
             .expect("generated cache key");
         let other_generation =
-            imported_bearer_cache_key(Path::new("/config/one.toml"), &second_generation)
+            imported_bearer_cache_key(Path::new("config/one.toml"), &second_generation)
                 .expect("other generated cache key");
         assert_ne!(first, generated);
         assert_ne!(generated, other_generation);
@@ -6129,7 +6129,11 @@ mod tests {
         let directory = tempdir().expect("temp dir");
         let broker = directory
             .path()
-            .join("broker")
+            .join(if cfg!(windows) {
+                "broker.exe"
+            } else {
+                "broker"
+            })
             .to_string_lossy()
             .into_owned();
         let mut first_target = target("https://auth.reltio.com");
@@ -6656,6 +6660,13 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let parent = directory.path().join("broker-directory");
         let broker = parent.join("broker.exe");
+        let marker = parent.join("cwd.marker");
+        let contract = directory.path().join("contract.cmd");
+        fs::write(
+            &contract,
+            "@echo off\r\nif defined PATH exit /b 9\r\ntype nul > cwd.marker\r\necho {\"access_token\":\"broker-token\",\"expires_in\":3600}\r\n",
+        )
+        .expect("write broker contract");
         let command_interpreter = PathBuf::from(
             std::env::var_os("SystemRoot").expect("Windows SystemRoot environment variable"),
         )
@@ -6663,19 +6674,14 @@ mod tests {
         .join("cmd.exe");
         let bytes = fs::read(command_interpreter).expect("read system command interpreter");
         atomic_write_private(&broker, &bytes).expect("private broker PE");
-        let expected_directory = parent.to_string_lossy();
-        let contract = format!(
-            r#"if defined PATH (echo {{"access_token":"path-present","expires_in":3600}}) else if /I "%CD%"=="{expected_directory}" (echo {{"access_token":"broker-token","expires_in":3600}}) else (echo {{"access_token":"cwd-invalid","expires_in":3600}})"#
-        );
         let mut broker_target = target("https://auth.reltio.com");
         broker_target.auth = AuthProfile {
             method: Some(AuthMethod::CredentialProcess),
             credential_process: Some(vec![
                 broker.to_string_lossy().into_owned(),
                 "/D".to_owned(),
-                "/S".to_owned(),
                 "/C".to_owned(),
-                contract,
+                contract.to_string_lossy().into_owned(),
             ]),
             ..AuthProfile::default()
         };
@@ -6690,6 +6696,10 @@ mod tests {
 
         let token = manager.token(false).await.expect("broker token");
         assert_eq!(token.expose_secret(), "broker-token");
+        assert!(
+            marker.is_file(),
+            "broker did not run in its guarded directory"
+        );
     }
 
     #[tokio::test]

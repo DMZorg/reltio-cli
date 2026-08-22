@@ -11,6 +11,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use zeroize::Zeroizing;
 
 #[allow(unsafe_code)]
@@ -91,6 +92,11 @@ impl Error {
                 Some(80 | 183)
             )
     }
+
+    fn is_sharing_violation(&self) -> bool {
+        self.source.as_ref().and_then(std::io::Error::raw_os_error)
+            == Some(i32::try_from(ERROR_SHARING_VIOLATION).unwrap_or(i32::MAX))
+    }
 }
 
 impl fmt::Display for Error {
@@ -114,6 +120,8 @@ impl StdError for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 const WINDOWS_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ATOMIC_REPLACE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const ATOMIC_REPLACE_MAX_SHARING_FAILURES: usize = 100;
 const VK_BACK: u16 = 0x08;
 const VK_RETURN: u16 = 0x0D;
 const VK_MENU: u16 = 0x12;
@@ -582,11 +590,29 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     // write-sharing handle while the strict guard still pins the parent, then
     // prove both handles identify the same object before releasing that guard.
     guards.permit_immediate_child_replacement(parent, &context)?;
-    ffi::move_replace(
-        &temporary.file,
-        guards.immediate_parent()?,
-        destination_name,
-    )?;
+    let mut sharing_failures = 0;
+    loop {
+        match ffi::move_replace(
+            &temporary.file,
+            guards.immediate_parent()?,
+            destination_name,
+        ) {
+            Ok(()) => break,
+            Err(error)
+                if error.is_sharing_violation()
+                    && sharing_failures < ATOMIC_REPLACE_MAX_SHARING_FAILURES =>
+            {
+                sharing_failures += 1;
+                std::thread::sleep(ATOMIC_REPLACE_RETRY_INTERVAL);
+                validate_private_file_handle(&temporary.file, &context)?;
+                guards.revalidate(&context)?;
+                if let Some(existing) = open_existing_for_inspection(&path)? {
+                    validate_private_file_handle(&existing, &context)?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
     // A successful rename is the commit point. Cleanup must never delete the
     // installed destination if any later diagnostic were to fail.
     temporary.disarm();
@@ -1230,7 +1256,6 @@ mod tests {
     use std::fs::OpenOptions;
     use std::os::windows::fs::{OpenOptionsExt, symlink_dir, symlink_file};
     use std::process::Command;
-    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_APPEND_DATA, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_WRITE_DATA,
@@ -1376,6 +1401,26 @@ mod tests {
 
         inspect_private_directory(&parent).expect("private directory policy");
         let reader = open_bounded_file(&path, 64, true).expect("private file policy");
+        assert_eq!(reader.read_all().expect("bounded read"), b"replacement");
+    }
+
+    #[test]
+    fn atomic_replacement_retries_a_transient_parent_read_guard() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = temporary.path().join("private").join("secret");
+        atomic_write_private(&path, b"initial").expect("initial private write");
+
+        let parent = ffi::open_directory(path.parent().expect("private parent"))
+            .expect("transient strict parent guard");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(parent);
+        });
+
+        atomic_write_private(&path, b"replacement")
+            .expect("replacement waits for the transient guard");
+        release.join().expect("guard release thread");
+        let reader = open_bounded_file(&path, 64, true).expect("replacement remains private");
         assert_eq!(reader.read_all().expect("bounded read"), b"replacement");
     }
 

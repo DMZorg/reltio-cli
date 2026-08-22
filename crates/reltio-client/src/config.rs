@@ -1210,7 +1210,11 @@ mod tests {
 
     #[test]
     fn storage_paths_reject_config_cache_and_state_aliases() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let current = std::env::current_dir().expect("current test directory");
+        let directory = tempfile::Builder::new()
+            .prefix(".reltio-config-")
+            .tempdir_in(current)
+            .expect("temporary directory without an inherited 8.3 alias");
         let cache_dir = directory.path().join("cache");
         let state_dir = directory.path().join("state");
         let environment = Environment::from_pairs([

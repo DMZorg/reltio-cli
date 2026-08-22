@@ -1784,7 +1784,11 @@ mod tests {
     #[test]
     fn credential_process_cancellation_before_tenant_request_is_not_replayable() {
         let directory = tempdir().expect("temporary directory");
-        let executable = directory.path().join("broker");
+        let executable = directory.path().join(if cfg!(windows) {
+            "broker.exe"
+        } else {
+            "broker"
+        });
         let mut target = auth_target("https://auth.reltio.com");
         target.auth = AuthProfile {
             method: Some(AuthMethod::CredentialProcess),
