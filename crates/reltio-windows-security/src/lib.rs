@@ -120,8 +120,8 @@ impl StdError for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 const WINDOWS_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const ATOMIC_REPLACE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-const ATOMIC_REPLACE_MAX_SHARING_FAILURES: usize = 100;
+const TRANSIENT_SHARING_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_TRANSIENT_SHARING_FAILURES: usize = 100;
 const VK_BACK: u16 = 0x08;
 const VK_RETURN: u16 = 0x0D;
 const VK_MENU: u16 = 0x12;
@@ -559,9 +559,7 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut guards = ensure_directory_tree(parent, &context)?;
     guards.revalidate(&context)?;
 
-    if let Some(existing) = open_existing_for_inspection(&path)? {
-        validate_private_file_handle(&existing, &context)?;
-    }
+    retry_transient_sharing(|| validate_optional_private_file(&path, &context))?;
 
     let mut temporary = loop {
         let name = format!(".reltio-{:032x}.tmp", rand::random::<u128>());
@@ -582,37 +580,20 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     validate_private_file_handle(&temporary.file, &context)?;
     guards.revalidate(&context)?;
 
-    if let Some(existing) = open_existing_for_inspection(&path)? {
-        validate_private_file_handle(&existing, &context)?;
-    }
-
     // Windows opens the relative rename target for FILE_WRITE_DATA. Acquire a
     // write-sharing handle while the strict guard still pins the parent, then
     // prove both handles identify the same object before releasing that guard.
     guards.permit_immediate_child_replacement(parent, &context)?;
-    let mut sharing_failures = 0;
-    loop {
-        match ffi::move_replace(
+    retry_transient_sharing(|| {
+        validate_private_file_handle(&temporary.file, &context)?;
+        guards.revalidate(&context)?;
+        validate_optional_private_file(&path, &context)?;
+        ffi::move_replace(
             &temporary.file,
             guards.immediate_parent()?,
             destination_name,
-        ) {
-            Ok(()) => break,
-            Err(error)
-                if error.is_sharing_violation()
-                    && sharing_failures < ATOMIC_REPLACE_MAX_SHARING_FAILURES =>
-            {
-                sharing_failures += 1;
-                std::thread::sleep(ATOMIC_REPLACE_RETRY_INTERVAL);
-                validate_private_file_handle(&temporary.file, &context)?;
-                guards.revalidate(&context)?;
-                if let Some(existing) = open_existing_for_inspection(&path)? {
-                    validate_private_file_handle(&existing, &context)?;
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
+        )
+    })?;
     // A successful rename is the commit point. Cleanup must never delete the
     // installed destination if any later diagnostic were to fail.
     temporary.disarm();
@@ -808,11 +789,14 @@ pub fn open_private_lock(path: &Path) -> Result<File> {
     let guards = ensure_directory_tree(parent, &context)?;
     guards.revalidate(&context)?;
 
-    let file = match ffi::create_private_lock(&path, &context) {
-        Ok(file) => file,
-        Err(error) if error.is_already_exists() => ffi::open_existing_lock(&path)?,
-        Err(error) => return Err(error),
-    };
+    let file = retry_transient_sharing(|| {
+        guards.revalidate(&context)?;
+        match ffi::create_private_lock(&path, &context) {
+            Ok(file) => Ok(file),
+            Err(error) if error.is_already_exists() => ffi::open_existing_lock(&path),
+            Err(error) => Err(error),
+        }
+    })?;
     validate_private_file_handle(&file, &context)?;
     guards.revalidate(&context)?;
     Ok(file)
@@ -855,6 +839,30 @@ fn open_existing_for_inspection(path: &Path) -> Result<Option<File>> {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.is_not_found() => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+fn validate_optional_private_file(path: &Path, context: &ffi::SecurityContext) -> Result<()> {
+    if let Some(existing) = open_existing_for_inspection(path)? {
+        validate_private_file_handle(&existing, context)?;
+    }
+    Ok(())
+}
+
+fn retry_transient_sharing<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut sharing_failures = 0;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if error.is_sharing_violation()
+                    && sharing_failures < MAX_TRANSIENT_SHARING_FAILURES =>
+            {
+                sharing_failures += 1;
+                std::thread::sleep(TRANSIENT_SHARING_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -1483,6 +1491,26 @@ mod tests {
 
         let error = open_private_lock(&lock_path).expect_err("hard-linked lock must fail");
         assert_eq!(error.kind(), ErrorKind::MultipleLinks);
+    }
+
+    #[test]
+    fn private_lock_open_retries_transient_sharing() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let lock_path = temporary.path().join("state.lock");
+        drop(open_private_lock(&lock_path).expect("create lock"));
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&lock_path)
+            .expect("exclusive transient reader");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(blocker);
+        });
+
+        let lock = open_private_lock(&lock_path).expect("lock open waits for transient sharing");
+        release.join().expect("reader release thread");
+        drop(lock);
     }
 
     #[test]
