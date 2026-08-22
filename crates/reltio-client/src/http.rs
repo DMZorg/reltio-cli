@@ -44,6 +44,11 @@ struct AuthPhaseContext<'a> {
     output_guard: &'a OutputGuard,
 }
 
+enum RetryBackoff {
+    Slept,
+    BudgetExhausted(Duration),
+}
+
 #[derive(Clone)]
 enum RemoteCancellationState {
     RequestNotSent,
@@ -151,6 +156,18 @@ impl ApiResponse {
         Ok(value)
     }
 
+    pub(crate) fn unredacted_top_level_key_presence(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        let value = secure_json_value(&self.body).map_err(|error| self.json_error(&error))?;
+        Ok(keys
+            .iter()
+            .map(|key| {
+                value
+                    .as_object()
+                    .is_some_and(|object| object.contains_key(*key))
+            })
+            .collect())
+    }
+
     pub fn data_value(&self) -> Result<Value> {
         let known_secrets = self.known_secrets();
         if self.body.is_empty() {
@@ -246,7 +263,7 @@ impl ApiResponse {
         .with_output_guard(self.output_guard())
     }
 
-    fn redaction_error(&self, reason: &'static str) -> ReltioError {
+    pub(crate) fn redaction_error(&self, reason: &'static str) -> ReltioError {
         ReltioError::new(
             "api_response_redaction_failed",
             ErrorCategory::Api,
@@ -447,7 +464,7 @@ impl HttpClient {
         let deadline = caller_deadline.min(client_deadline);
         let mut attempts = 0_u32;
         let mut auth_replayed = false;
-        let mut cumulative_output_guard = token_manager.output_guard()?;
+        let mut cumulative_output_guard = token_manager.credential_output_guard()?;
         self.ensure_not_cancelled(
             &request,
             attempts,
@@ -547,16 +564,26 @@ impl HttpClient {
                         &cumulative_output_guard,
                     )?;
                     if self.should_retry_transport(&request, attempts, &error) {
-                        self.sleep_before_retry(
-                            attempts,
-                            None,
-                            deadline,
-                            &request,
-                            RemoteCancellationState::RequestSentCompletionUnknown,
-                            &cumulative_output_guard,
-                        )
-                        .await?;
-                        continue;
+                        match self
+                            .sleep_before_retry(
+                                attempts,
+                                None,
+                                deadline,
+                                &request,
+                                RemoteCancellationState::RequestSentCompletionUnknown,
+                                &cumulative_output_guard,
+                            )
+                            .await?
+                        {
+                            RetryBackoff::Slept => continue,
+                            RetryBackoff::BudgetExhausted(delay) => {
+                                return Err(retry_budget_error(
+                                    attempts,
+                                    delay,
+                                    &cumulative_output_guard,
+                                ));
+                            }
+                        }
                     }
                     return Err(transport_error(
                         &request.operation,
@@ -615,6 +642,7 @@ impl HttpClient {
             {
                 auth_replayed = true;
                 drop(response);
+                let cancellation_state = response_state.clone();
                 token = self
                     .token_after_rejection_before_deadline(
                         token_manager,
@@ -628,23 +656,69 @@ impl HttpClient {
                         },
                     )
                     .await?;
+                cumulative_output_guard.merge(token.output_guard());
+                if self.cancellation.is_cancelled() {
+                    return Err(authentication_canceled_error(
+                        &request.operation,
+                        attempts,
+                        true,
+                        "authentication",
+                        cancellation_state,
+                        token_manager,
+                    )
+                    .with_output_guard(cumulative_output_guard.clone()));
+                }
                 continue;
             }
 
             if !status.is_success() && self.should_retry_status(&request, status, attempts) {
                 let retry_after = parse_retry_after(response.headers());
                 // Diagnostic body limits must not suppress a status-qualified retry.
-                drop(response);
-                self.sleep_before_retry(
-                    attempts,
-                    retry_after,
-                    deadline,
-                    &request,
-                    response_state,
-                    &cumulative_output_guard,
-                )
-                .await?;
-                continue;
+                match self
+                    .sleep_before_retry(
+                        attempts,
+                        retry_after,
+                        deadline,
+                        &request,
+                        response_state.clone(),
+                        &cumulative_output_guard,
+                    )
+                    .await?
+                {
+                    RetryBackoff::Slept => {
+                        drop(response);
+                        continue;
+                    }
+                    RetryBackoff::BudgetExhausted(delay) => {
+                        let original_content_type = response
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok());
+                        let content_type = original_content_type
+                            .and_then(|value| sanitized_structured_text(value, &known_tokens));
+                        let mut error = api_error(
+                            status,
+                            request_id,
+                            &[],
+                            original_content_type,
+                            &known_tokens,
+                            request.replay != ReplayPolicy::Unsafe,
+                            attempts,
+                        );
+                        error.details["response"] = json!({
+                            "body_omitted": true,
+                            "content_type": content_type,
+                            "reason": "retry_budget_exhausted_before_body"
+                        });
+                        error.details["retry_budget_exhausted"] = Value::Bool(true);
+                        error.details["next_retry_delay_ms"] =
+                            Value::from(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+                        error.details["automatic_retry_abandoned"] =
+                            Value::String("overall_timeout_budget".to_owned());
+                        error.details["response_body_truncated"] = Value::Bool(false);
+                        return Err(error.with_output_guard(cumulative_output_guard.clone()));
+                    }
+                }
             }
 
             self.ensure_not_cancelled(
@@ -771,24 +845,25 @@ impl HttpClient {
         tokio::pin!(acquisition);
         tokio::select! {
             biased;
-            result = &mut acquisition => result.map_err(|error| {
-                target_auth_error(error, &request.operation, attempts)
-                    .with_output_guard(output_guard.clone())
-            }),
             () = self.cancellation.cancelled() => {
                 let mut cancellation_guard = output_guard.clone();
                 if token_manager.can_reacquire() {
                     cancellation_guard.merge(&OutputGuard::deny_all());
                 }
-                Err(request_canceled_error(
+                Err(authentication_canceled_error(
                     &request.operation,
                     attempts,
                     true,
                     "authentication",
                     RemoteCancellationState::RequestNotSent,
+                    token_manager,
                 )
                 .with_output_guard(cancellation_guard))
             },
+            result = &mut acquisition => result.map_err(|error| {
+                target_auth_error(error, &request.operation, attempts)
+                    .with_output_guard(output_guard.clone())
+            }),
         }
     }
 
@@ -819,22 +894,23 @@ impl HttpClient {
         tokio::pin!(acquisition);
         tokio::select! {
             biased;
-            result = &mut acquisition => result.map_err(|error| {
-                target_auth_error(error, &context.request.operation, context.attempts)
-                    .with_output_guard(context.output_guard.clone())
-            }),
             () = self.cancellation.cancelled() => {
                 let mut cancellation_guard = context.output_guard.clone();
                 cancellation_guard.merge(&OutputGuard::deny_all());
-                Err(request_canceled_error(
+                Err(authentication_canceled_error(
                     &context.request.operation,
                     context.attempts,
                     context.request.replay != ReplayPolicy::Unsafe,
                     "authentication",
                     context.cancellation_state,
+                    token_manager,
                 )
                 .with_output_guard(cancellation_guard))
             },
+            result = &mut acquisition => result.map_err(|error| {
+                target_auth_error(error, &context.request.operation, context.attempts)
+                    .with_output_guard(context.output_guard.clone())
+            }),
         }
     }
 
@@ -892,7 +968,7 @@ impl HttpClient {
         request: &RequestSpec,
         cancellation_state: RemoteCancellationState,
         output_guard: &OutputGuard,
-    ) -> Result<()> {
+    ) -> Result<RetryBackoff> {
         self.ensure_not_cancelled(
             request,
             attempts,
@@ -911,17 +987,7 @@ impl HttpClient {
             delay = delay.min(cap);
         }
         if delay >= deadline.saturating_duration_since(Instant::now()) {
-            return Err(ReltioError::new(
-                "retry_budget_exhausted",
-                ErrorCategory::Timeout,
-                "the next safe retry would exceed the overall timeout",
-            )
-            .with_details(json!({
-                "attempts": attempts,
-                "next_delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                "practice_id": "HTTP-RETRY-001"
-            }))
-            .with_output_guard(output_guard.clone()));
+            return Ok(RetryBackoff::BudgetExhausted(delay));
         }
         tokio::select! {
             biased;
@@ -933,15 +999,32 @@ impl HttpClient {
                 cancellation_state.clone(),
             )
             .with_output_guard(output_guard.clone())),
-            () = tokio::time::sleep(delay) => self.ensure_not_cancelled(
-                request,
-                attempts,
-                "retry_backoff",
-                cancellation_state,
-                output_guard,
-            ),
+            () = tokio::time::sleep(delay) => {
+                self.ensure_not_cancelled(
+                    request,
+                    attempts,
+                    "retry_backoff",
+                    cancellation_state,
+                    output_guard,
+                )?;
+                Ok(RetryBackoff::Slept)
+            },
         }
     }
+}
+
+fn retry_budget_error(attempts: u32, delay: Duration, output_guard: &OutputGuard) -> ReltioError {
+    ReltioError::new(
+        "retry_budget_exhausted",
+        ErrorCategory::Timeout,
+        "the next safe retry would exceed the overall timeout",
+    )
+    .with_details(json!({
+        "attempts": attempts,
+        "next_delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        "practice_id": "HTTP-RETRY-001"
+    }))
+    .with_output_guard(output_guard.clone())
 }
 
 pub fn validate_user_header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue)> {
@@ -1167,12 +1250,26 @@ async fn read_response_body(
     Ok((body, false))
 }
 
-fn target_auth_error(error: ReltioError, operation: &str, attempts: u32) -> ReltioError {
+fn target_auth_error(mut error: ReltioError, operation: &str, attempts: u32) -> ReltioError {
     if error.code != "auth_timeout" {
         return error;
     }
     let output_guard = error.output_guard().cloned();
-    let mut error = timeout_error(operation, attempts, true, "authentication");
+    let auth_details = std::mem::take(&mut error.details);
+    let safe_to_replay = auth_details["safe_to_replay"].as_bool().unwrap_or(true);
+    let mut error = timeout_error(operation, attempts, safe_to_replay, "authentication");
+    if let (Some(details), Value::Object(auth_details)) =
+        (error.details.as_object_mut(), auth_details)
+    {
+        for (key, value) in auth_details {
+            details.insert(key, value);
+        }
+        details.insert("attempts".to_owned(), Value::from(attempts));
+        details.insert(
+            "phase".to_owned(),
+            Value::String("authentication".to_owned()),
+        );
+    }
     if let Some(output_guard) = output_guard {
         error = error.with_output_guard(output_guard);
     }
@@ -1230,6 +1327,36 @@ fn request_canceled_error(
             response_operation_state(status),
         ),
     }
+}
+
+fn authentication_canceled_error(
+    operation: &str,
+    attempts: u32,
+    replay_safe: bool,
+    phase: &str,
+    state: RemoteCancellationState,
+    token_manager: &TokenManager,
+) -> ReltioError {
+    let mut error = request_canceled_error(operation, attempts, replay_safe, phase, state);
+    if !token_manager.uses_credential_process() {
+        return error;
+    }
+    let details = error
+        .details
+        .as_object_mut()
+        .unwrap_or_else(|| unreachable!("cancellation details are always an object"));
+    details.insert("credential_process_started".to_owned(), Value::Null);
+    details.insert(
+        "credential_process_side_effects".to_owned(),
+        Value::String("unknown".to_owned()),
+    );
+    details.insert("network_request_sent".to_owned(), Value::Null);
+    details.insert("safe_to_replay".to_owned(), Value::Bool(false));
+    error.hint = Some(
+        "Inspect broker side effects before considering a deliberate retry; cancellation may have dropped a running credential process."
+            .to_owned(),
+    );
+    error
 }
 
 fn response_body_error(
@@ -1628,6 +1755,66 @@ mod tests {
             },
             sources: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn credential_process_auth_timeout_remains_replay_unsafe_at_request_boundary() {
+        let error = ReltioError::new(
+            "auth_timeout",
+            ErrorCategory::Timeout,
+            "credential process timed out",
+        )
+        .with_details(json!({
+            "credential_process_started": true,
+            "credential_process_side_effects": "unknown",
+            "safe_to_replay": false
+        }))
+        .with_output_guard(OutputGuard::deny_all());
+
+        let mapped = target_auth_error(error, "entity.get", 0);
+
+        assert_eq!(mapped.code, "request_timeout");
+        assert!(!mapped.retryable);
+        assert_eq!(mapped.details["safe_to_replay"], false);
+        assert_eq!(mapped.details["credential_process_started"], true);
+        assert_eq!(mapped.details["credential_process_side_effects"], "unknown");
+        assert!(mapped.output_guard().is_some());
+    }
+
+    #[test]
+    fn credential_process_cancellation_before_tenant_request_is_not_replayable() {
+        let directory = tempdir().expect("temporary directory");
+        let executable = directory.path().join("broker");
+        let mut target = auth_target("https://auth.reltio.com");
+        target.auth = AuthProfile {
+            method: Some(AuthMethod::CredentialProcess),
+            credential_process: Some(vec![executable.to_string_lossy().into_owned()]),
+            ..AuthProfile::default()
+        };
+        let manager = TokenManager::from_target(
+            &target,
+            &Environment::default(),
+            directory.path().join("cache"),
+            TokenManagerOptions::default(),
+            Duration::from_secs(5),
+        )
+        .expect("credential-process manager");
+
+        let error = authentication_canceled_error(
+            "entity.scan",
+            0,
+            true,
+            "authentication",
+            RemoteCancellationState::RequestNotSent,
+            &manager,
+        );
+
+        assert_eq!(error.code, "request_canceled");
+        assert_eq!(error.details["remote_operation_state"], "request_not_sent");
+        assert_eq!(error.details["credential_process_started"], Value::Null);
+        assert_eq!(error.details["credential_process_side_effects"], "unknown");
+        assert_eq!(error.details["network_request_sent"], Value::Null);
+        assert_eq!(error.details["safe_to_replay"], false);
     }
 
     fn bearer_manager(cache_dir: &std::path::Path, token: &str) -> TokenManager {
@@ -2877,6 +3064,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(429)
                     .insert_header("retry-after", "18446744073709551615")
+                    .insert_header("x-request-id", "retry-budget-request-1")
                     .set_body_json(json!({"message": "wait"})),
             )
             .expect(1)
@@ -2911,7 +3099,73 @@ mod tests {
             .await
             .expect_err("retry cannot fit");
 
-        assert_eq!(error.code, "retry_budget_exhausted");
+        assert_eq!(error.code, "api_rate_limited");
+        assert_eq!(error.http_status, Some(429));
+        assert_eq!(error.request_id.as_deref(), Some("retry-budget-request-1"));
+        assert_eq!(error.details["response"]["body_omitted"], true);
+        assert_eq!(
+            error.details["response"]["reason"],
+            "retry_budget_exhausted_before_body"
+        );
+        assert_eq!(error.details["retry_budget_exhausted"], true);
+        assert_eq!(
+            error.details["automatic_retry_abandoned"],
+            "overall_timeout_budget"
+        );
+        assert_eq!(error.details["safe_to_replay"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_budget_exhaustion_does_not_wait_for_the_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("server address");
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let (release_server, released) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 9999\r\nX-Request-ID: retry-budget-body-1\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{",
+                )
+                .expect("write headers and partial body");
+            stream.flush().expect("flush response prefix");
+            let _ = headers_sent.send(());
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        });
+        let directory = tempdir().expect("temporary directory");
+        let manager = bearer_manager(directory.path(), "retry-budget-token");
+        let client = HttpClient::new(HttpOptions {
+            timeout: Duration::from_secs(2),
+            ..HttpOptions::default()
+        })
+        .expect("HTTP client");
+        let mut request = RequestSpec::new(
+            Method::GET,
+            Url::parse(&format!("http://{address}/rate")).expect("URL"),
+            "retry-budget.body",
+        );
+        request.replay = ReplayPolicy::Safe;
+        let execution = tokio::spawn(async move { client.execute(&manager, request).await });
+        headers_received.await.expect("response prefix sent");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("budget exhaustion returns before the stalled body")
+            .expect("request task completes")
+            .expect_err("retry cannot fit");
+        let _ = release_server.send(());
+        server.join().expect("server thread");
+
+        assert_eq!(error.code, "api_rate_limited");
+        assert_eq!(error.http_status, Some(429));
+        assert_eq!(error.request_id.as_deref(), Some("retry-budget-body-1"));
+        assert_eq!(error.details["retry_budget_exhausted"], true);
+        assert_eq!(
+            error.details["response"]["reason"],
+            "retry_budget_exhausted_before_body"
+        );
     }
 
     #[test]

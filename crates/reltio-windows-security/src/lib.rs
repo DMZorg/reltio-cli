@@ -9,6 +9,9 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::time::{Duration, Instant};
+
+use zeroize::Zeroizing;
 
 #[allow(unsafe_code)]
 mod ffi;
@@ -26,6 +29,11 @@ pub enum ErrorKind {
     MultipleLinks,
     AlreadyExists,
     ProcessContainment,
+    Canceled,
+    TimedOut,
+    InvalidUnicode,
+    ConsoleUnavailable,
+    InputCleanup,
     Io,
 }
 
@@ -105,6 +113,248 @@ impl StdError for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+const WINDOWS_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const VK_BACK: u16 = 0x08;
+const VK_RETURN: u16 = 0x0D;
+const VK_MENU: u16 = 0x12;
+const VK_C: u16 = 0x43;
+const LEFT_CTRL_PRESSED: u32 = 0x0008;
+const RIGHT_CTRL_PRESSED: u32 = 0x0004;
+
+#[derive(Debug, Default)]
+struct HiddenInputState {
+    value: Zeroizing<String>,
+    pending_high_surrogate: Option<(u16, u16)>,
+}
+
+impl HiddenInputState {
+    fn apply(&mut self, event: ffi::ConsoleInputEvent, maximum_bytes: u64) -> Result<bool> {
+        let ffi::ConsoleInputEvent::Key {
+            key_down,
+            repeat_count,
+            virtual_key_code,
+            unicode_char,
+            control_key_state,
+        } = event
+        else {
+            return Ok(false);
+        };
+        let alt_numpad_character = !key_down && virtual_key_code == VK_MENU && unicode_char != 0;
+        if !key_down && !alt_numpad_character {
+            return Ok(false);
+        }
+        if virtual_key_code == VK_RETURN {
+            if self.pending_high_surrogate.is_some() {
+                return Err(Error::policy(
+                    ErrorKind::InvalidUnicode,
+                    "hidden Windows credential input ended inside a UTF-16 surrogate pair",
+                ));
+            }
+            return Ok(true);
+        }
+        if virtual_key_code == VK_BACK {
+            for _ in 0..repeat_count.max(1) {
+                if self.pending_high_surrogate.take().is_none() {
+                    self.value.pop();
+                }
+            }
+            return Ok(false);
+        }
+        if unicode_char == 0 {
+            return Ok(false);
+        }
+        let control_pressed = control_key_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0;
+        if unicode_char == 3 || control_pressed && virtual_key_code == VK_C {
+            return Err(Error::policy(
+                ErrorKind::Canceled,
+                "hidden Windows credential input was canceled",
+            ));
+        }
+        if control_pressed && unicode_char == 21 {
+            self.value.clear();
+            self.pending_high_surrogate = None;
+            return Ok(false);
+        }
+        if control_pressed && unicode_char == 23 {
+            for _ in 0..repeat_count.max(1) {
+                while self
+                    .value
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+                {
+                    self.value.pop();
+                }
+                while self
+                    .value
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| !character.is_whitespace())
+                {
+                    self.value.pop();
+                }
+            }
+            return Ok(false);
+        }
+        self.push_utf16(unicode_char, repeat_count.max(1), maximum_bytes)?;
+        Ok(false)
+    }
+
+    fn push_utf16(&mut self, unit: u16, repeat_count: u16, maximum_bytes: u64) -> Result<()> {
+        let character = if (0xD800..=0xDBFF).contains(&unit) {
+            if self.pending_high_surrogate.is_some() {
+                return Err(Error::policy(
+                    ErrorKind::InvalidUnicode,
+                    "hidden Windows credential input contains consecutive high surrogates",
+                ));
+            }
+            self.pending_high_surrogate = Some((unit, repeat_count));
+            return Ok(());
+        } else if (0xDC00..=0xDFFF).contains(&unit) {
+            let (high, high_repeat_count) =
+                self.pending_high_surrogate.take().ok_or_else(|| {
+                    Error::policy(
+                        ErrorKind::InvalidUnicode,
+                        "hidden Windows credential input contains an unmatched low surrogate",
+                    )
+                })?;
+            if repeat_count != high_repeat_count {
+                return Err(Error::policy(
+                    ErrorKind::InvalidUnicode,
+                    "hidden Windows credential input has mismatched surrogate repeat counts",
+                ));
+            }
+            char::decode_utf16([high, unit])
+                .next()
+                .and_then(std::result::Result::ok)
+                .ok_or_else(|| {
+                    Error::policy(
+                        ErrorKind::InvalidUnicode,
+                        "hidden Windows credential input contains invalid UTF-16",
+                    )
+                })?
+        } else {
+            if self.pending_high_surrogate.take().is_some() {
+                return Err(Error::policy(
+                    ErrorKind::InvalidUnicode,
+                    "hidden Windows credential input contains an unmatched high surrogate",
+                ));
+            }
+            char::from_u32(u32::from(unit)).ok_or_else(|| {
+                Error::policy(
+                    ErrorKind::InvalidUnicode,
+                    "hidden Windows credential input contains invalid UTF-16",
+                )
+            })?
+        };
+        let repeated_bytes = character
+            .len_utf8()
+            .saturating_mul(usize::from(repeat_count));
+        let next_length = self.value.len().saturating_add(repeated_bytes);
+        if u64::try_from(next_length).unwrap_or(u64::MAX) > maximum_bytes {
+            return Err(Error::policy(
+                ErrorKind::TooLarge,
+                "hidden Windows credential input exceeds its byte limit",
+            ));
+        }
+        for _ in 0..repeat_count {
+            self.value.push(character);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> String {
+        std::mem::take(&mut *self.value)
+    }
+}
+
+/// Reads one non-echoing line from the native Windows console without changing
+/// shared console modes or leaving a blocking read behind.
+///
+/// # Errors
+///
+/// Returns a typed, path-free error when no native console is available, the
+/// deadline or cancellation callback fires, input is invalid or oversized, or
+/// abandoned console input cannot be cleared safely.
+pub fn read_hidden_console_line_until(
+    deadline: Instant,
+    maximum_bytes: u64,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<String> {
+    let input = ffi::open_console_input()?;
+    let mut state = HiddenInputState::default();
+    loop {
+        let control_error = if is_cancelled() {
+            Some(Error::policy(
+                ErrorKind::Canceled,
+                "hidden Windows credential input was canceled",
+            ))
+        } else if Instant::now() >= deadline {
+            Some(Error::policy(
+                ErrorKind::TimedOut,
+                "hidden Windows credential input exceeded its deadline",
+            ))
+        } else {
+            None
+        };
+        if let Some(error) = control_error {
+            return match input.flush() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(cleanup),
+            };
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = WINDOWS_INPUT_POLL_INTERVAL.min(remaining);
+        let wait_millis = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
+        if wait_millis == 0 {
+            std::thread::yield_now();
+            continue;
+        }
+        let available = match input.wait(wait_millis) {
+            Ok(available) => available,
+            Err(error) => {
+                return match input.flush() {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+        };
+        if !available {
+            continue;
+        }
+        if is_cancelled() {
+            return match input.flush() {
+                Ok(()) => Err(Error::policy(
+                    ErrorKind::Canceled,
+                    "hidden Windows credential input was canceled",
+                )),
+                Err(cleanup) => Err(cleanup),
+            };
+        }
+        let event = match input.read_event_nowait() {
+            Ok(Some(event)) => event,
+            Ok(None) => continue,
+            Err(error) => {
+                return match input.flush() {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+        };
+        match state.apply(event, maximum_bytes) {
+            Ok(true) => return Ok(state.finish()),
+            Ok(false) => {}
+            Err(error) => {
+                return match input.flush() {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+        }
+    }
+}
+
 /// A regular-file reader that cannot return more than its configured bound.
 #[derive(Debug)]
 pub struct BoundedFile {
@@ -144,8 +394,10 @@ impl CredentialProcessJob {
     ///
     /// # Errors
     ///
-    /// Returns a fail-closed containment error if assignment, thread identity
-    /// validation, or the single resume transition cannot be proven.
+    /// Returns a containment error if assignment, thread identity validation,
+    /// or the single resume transition cannot be proven. Windows reports the
+    /// prior suspend count only after attempting the resume, so an unexpected
+    /// count leaves the contained child's execution state uncertain.
     pub fn assign_and_resume(&self, child: &tokio::process::Child) -> Result<()> {
         ffi::assign_credential_process_and_resume(&self.inner, child)
     }
@@ -649,7 +901,14 @@ fn require_single_link(number_of_links: u32) -> Result<()> {
     }
 }
 
-fn normalize_local_path(path: &Path) -> Result<PathBuf> {
+/// Resolves a local path lexically without following reparse points or
+/// converting it to a verbatim namespace.
+///
+/// # Errors
+///
+/// Returns a policy or I/O error when the path is ambiguous, remote, or does
+/// not reside on a fixed local drive.
+pub fn normalize_local_path(path: &Path) -> Result<PathBuf> {
     if path.as_os_str().is_empty() {
         return Err(Error::policy(
             ErrorKind::InvalidPath,
@@ -737,6 +996,90 @@ fn normalize_local_path(path: &Path) -> Result<PathBuf> {
         normalized.push(name);
     }
     Ok(normalized)
+}
+
+/// Returns whether `path` is the same as or beneath `ancestor` using Windows'
+/// ordinal case-insensitive component comparison.
+///
+/// # Errors
+///
+/// Returns a policy or I/O error if either path is not an ordinary fixed-drive
+/// local path or Windows cannot compare a component.
+pub fn local_path_is_same_or_descendant(path: &Path, ancestor: &Path) -> Result<bool> {
+    let path = local_path_comparison_key(path)?;
+    let ancestor = local_path_comparison_key(ancestor)?;
+    let mut path_components = path.components();
+    for ancestor_component in ancestor.components() {
+        let Some(path_component) = path_components.next() else {
+            return Ok(false);
+        };
+        if !ffi::os_str_eq_ordinal_ignore_case(
+            path_component.as_os_str(),
+            ancestor_component.as_os_str(),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn local_path_comparison_key(path: &Path) -> Result<PathBuf> {
+    let normalized = normalize_local_path(path)?;
+    validate_storage_comparison_path(&normalized)?;
+    let chain = directory_chain(&normalized)?;
+    let mut deepest = None;
+    for (index, component_path) in chain.iter().enumerate() {
+        let handle = match ffi::open_path_for_comparison(component_path) {
+            Ok(handle) => handle,
+            Err(error) if error.is_not_found() => break,
+            Err(error) => return Err(error),
+        };
+        let information = ffi::handle_information(&handle)?;
+        if information.reparse_point {
+            return Err(Error::policy(
+                ErrorKind::ReparsePoint,
+                "reparse points are refused in local path comparisons",
+            ));
+        }
+        if index + 1 < chain.len() && !information.directory {
+            return Err(Error::policy(
+                ErrorKind::NotDirectory,
+                "a local path comparison component is not a directory",
+            ));
+        }
+        deepest = Some((
+            index,
+            PathBuf::from(ffi::final_normalized_nt_path(&handle)?),
+        ));
+    }
+    let (index, mut key) = deepest.ok_or_else(|| {
+        Error::policy(
+            ErrorKind::InvalidPath,
+            "the fixed-drive root could not be resolved for path comparison",
+        )
+    })?;
+    for component_path in &chain[index + 1..] {
+        let name = component_path.file_name().ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "a local path comparison suffix was ambiguous",
+            )
+        })?;
+        key.push(name);
+    }
+    Ok(key)
+}
+
+fn validate_storage_comparison_path(path: &Path) -> Result<()> {
+    if path.components().any(|component| {
+        matches!(component, Component::Normal(name) if name.encode_wide().any(|unit| unit == u16::from(b'~')))
+    }) {
+        return Err(Error::policy(
+            ErrorKind::InvalidPath,
+            "tilde components are refused in storage paths because 8.3 aliases cannot be resolved safely",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_terminal_component(path: &Path) -> Result<()> {
@@ -863,6 +1206,128 @@ mod tests {
 
     const JOB_TEST_ROLE: &str = "RELTIO_WINDOWS_JOB_TEST_ROLE";
     const JOB_TEST_DIRECTORY: &str = "RELTIO_WINDOWS_JOB_TEST_DIRECTORY";
+
+    fn key_event(
+        key_down: bool,
+        repeat_count: u16,
+        virtual_key_code: u16,
+        unicode_char: u16,
+    ) -> ffi::ConsoleInputEvent {
+        ffi::ConsoleInputEvent::Key {
+            key_down,
+            repeat_count,
+            virtual_key_code,
+            unicode_char,
+            control_key_state: 0,
+        }
+    }
+
+    #[test]
+    fn hidden_input_parser_preserves_unicode_editing_and_utf8_limit() {
+        let mut state = HiddenInputState::default();
+        state
+            .apply(key_event(true, 2, 0, u16::from(b'a')), 10)
+            .expect("repeated ASCII input");
+        state
+            .apply(key_event(true, 2, 0, 0xD83D), 10)
+            .expect("repeated high surrogate");
+        state
+            .apply(key_event(true, 2, 0, 0xDE00), 10)
+            .expect("matching repeated low surrogate");
+        assert_eq!(&*state.value, "aa😀😀");
+        state
+            .apply(key_event(true, 2, VK_BACK, 0), 6)
+            .expect("repeated backspace");
+        assert_eq!(&*state.value, "aa");
+        assert!(
+            state.apply(key_event(true, 1, 0, 0x20AC), 3).is_err(),
+            "a multibyte character crossing the byte limit must fail"
+        );
+
+        let mut words = HiddenInputState::default();
+        words.value.push_str("one two three");
+        words
+            .apply(
+                ffi::ConsoleInputEvent::Key {
+                    key_down: true,
+                    repeat_count: 2,
+                    virtual_key_code: 0,
+                    unicode_char: 23,
+                    control_key_state: LEFT_CTRL_PRESSED,
+                },
+                64,
+            )
+            .expect("repeated word deletion");
+        assert_eq!(&*words.value, "one ");
+    }
+
+    #[test]
+    fn hidden_input_parser_rejects_malformed_surrogates_and_completes_on_enter() {
+        let mut malformed = HiddenInputState::default();
+        assert_eq!(
+            malformed
+                .apply(key_event(true, 1, 0, 0xDC00), 64)
+                .expect_err("unmatched low surrogate")
+                .kind(),
+            ErrorKind::InvalidUnicode
+        );
+
+        let mut complete = HiddenInputState::default();
+        complete
+            .apply(key_event(true, 1, 0, u16::from(b'x')), 64)
+            .expect("ordinary input");
+        assert!(
+            complete
+                .apply(key_event(true, 1, VK_RETURN, u16::from(b'\r')), 64)
+                .expect("enter completes")
+        );
+        assert_eq!(complete.finish(), "x");
+
+        let mut mismatched_repeats = HiddenInputState::default();
+        mismatched_repeats
+            .apply(key_event(true, 2, 0, 0xD83D), 64)
+            .expect("repeated high surrogate");
+        assert_eq!(
+            mismatched_repeats
+                .apply(key_event(true, 1, 0, 0xDE00), 64)
+                .expect_err("surrogate repeat counts must match")
+                .kind(),
+            ErrorKind::InvalidUnicode
+        );
+    }
+
+    #[test]
+    fn local_path_normalization_rejects_remote_namespaces_and_compares_case_aliases() {
+        for path in [r"\\server\share\config.toml", r"\\?\C:\config.toml"] {
+            assert_eq!(
+                normalize_local_path(Path::new(path))
+                    .expect_err("remote and verbatim paths fail before filesystem access")
+                    .kind(),
+                ErrorKind::InvalidPath
+            );
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let ancestor = temporary.path().join("Cache");
+        let descendant = temporary.path().join("cache").join("tokens");
+        assert!(
+            local_path_is_same_or_descendant(&descendant, &ancestor)
+                .expect("ordinal path comparison")
+        );
+        let normalized = normalize_local_path(&ancestor).expect("ordinary drive path");
+        assert!(!normalized.to_string_lossy().starts_with(r"\\?\"));
+
+        let existing_tilde = temporary.path().join("existing~1");
+        fs::create_dir(&existing_tilde).expect("existing tilde directory");
+        for path in [existing_tilde, temporary.path().join("future~1")] {
+            assert_eq!(
+                local_path_is_same_or_descendant(&path, temporary.path())
+                    .expect_err("tilde storage components must fail closed")
+                    .kind(),
+                ErrorKind::InvalidPath
+            );
+        }
+    }
 
     #[test]
     fn creation_uses_private_file_and_directory_acls() {
@@ -1249,16 +1714,15 @@ mod tests {
         assert!(directory.path().join("parent-ready").exists());
         assert!(directory.path().join("grandchild-ready").exists());
 
-        job.terminate().expect("terminate contained process tree");
+        drop(job);
         tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
             .await
-            .expect("contained child exits promptly")
+            .expect("contained child exits promptly when the Job closes")
             .expect("wait for contained child");
-        drop(job);
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
         assert!(
             !directory.path().join("descendant-survived").exists(),
-            "a descendant survived Job termination"
+            "a descendant survived Job close"
         );
     }
 

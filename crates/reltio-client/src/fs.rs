@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 #[cfg(any(windows, not(any(unix, windows))))]
@@ -18,6 +18,38 @@ pub(crate) struct PrivateExecutableGuard {
 #[cfg(unix)]
 #[path = "unix_fs.rs"]
 mod unix;
+
+#[cfg(windows)]
+pub(crate) fn normalize_storage_path(path: &Path) -> Result<PathBuf> {
+    reltio_windows_security::normalize_local_path(path).map_err(|error| map_windows_error(&error))
+}
+
+#[cfg(unix)]
+pub(crate) fn normalize_storage_path(path: &Path) -> Result<PathBuf> {
+    unix::normalize_storage_path(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn normalize_storage_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .map_err(|error| ReltioError::io("failed to resolve a local storage path", &error))
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn storage_path_is_same_or_descendant(path: &Path, ancestor: &Path) -> Result<bool> {
+    reltio_windows_security::local_path_is_same_or_descendant(path, ancestor)
+        .map_err(|error| map_windows_error(&error))
+}
+
+#[cfg(unix)]
+pub(crate) fn storage_path_is_same_or_descendant(path: &Path, ancestor: &Path) -> Result<bool> {
+    unix::storage_path_is_same_or_descendant(path, ancestor)
+}
 
 #[cfg(windows)]
 pub fn ensure_private_parent(path: &Path) -> Result<()> {
@@ -151,6 +183,13 @@ pub fn open_private_lock(path: &Path) -> Result<File> {
     unix::open_private_lock(path)
 }
 
+/// Returns whether a non-blocking `fs2` lock attempt failed because the lock is held.
+pub fn is_lock_contended(error: &std::io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|actual| fs2::lock_contended_error().raw_os_error() == Some(actual))
+}
+
 #[cfg(not(any(unix, windows)))]
 pub fn open_private_lock(_path: &Path) -> Result<File> {
     Err(private_files_unsupported())
@@ -264,7 +303,13 @@ fn map_windows_error(error: &reltio_windows_security::Error) -> ReltioError {
             ErrorCategory::Safety,
             "refusing a multiply linked private Windows file",
         ),
-        ErrorKind::AlreadyExists | ErrorKind::Io => {
+        ErrorKind::AlreadyExists
+        | ErrorKind::Canceled
+        | ErrorKind::TimedOut
+        | ErrorKind::InvalidUnicode
+        | ErrorKind::ConsoleUnavailable
+        | ErrorKind::InputCleanup
+        | ErrorKind::Io => {
             let fallback;
             let source = if let Some(source) = error.io_error() {
                 source
@@ -289,5 +334,53 @@ fn map_windows_bounded_read_error(
         )
     } else {
         map_windows_error(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::is_lock_contended;
+    #[cfg(target_os = "macos")]
+    use super::storage_path_is_same_or_descendant;
+
+    #[test]
+    fn fs2_contention_sentinel_is_recognized() {
+        assert!(is_lock_contended(&fs2::lock_contended_error()));
+    }
+
+    #[test]
+    fn unrelated_would_block_error_is_not_lock_contention() {
+        let error = io::Error::new(io::ErrorKind::WouldBlock, "unrelated operation");
+
+        assert!(!is_lock_contended(&error));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_storage_comparison_is_conservatively_case_insensitive() {
+        assert!(
+            storage_path_is_same_or_descendant(
+                std::path::Path::new("/private/Cache/tokens"),
+                std::path::Path::new("/PRIVATE/cache"),
+            )
+            .expect("ASCII case comparison")
+        );
+        assert!(
+            !storage_path_is_same_or_descendant(
+                std::path::Path::new("/private/CacheOther/tokens"),
+                std::path::Path::new("/private/cache"),
+            )
+            .expect("component comparison does not use string prefixes")
+        );
+        let composed = std::path::PathBuf::from("/private/cach\u{e9}/tokens");
+        let decomposed = std::path::PathBuf::from(format!("/private/cache{}", '\u{301}'));
+        assert_eq!(
+            storage_path_is_same_or_descendant(&composed, &decomposed)
+                .expect_err("distinct Unicode spellings fail closed")
+                .code,
+            "storage_path_comparison_ambiguous"
+        );
     }
 }

@@ -27,8 +27,8 @@ endpoints:
       - AUTH-TOKEN-REISSUE-001
       - AUTH-OPAQUE-TOKEN-001
       - AUTH-TOKEN-RETRY-001
-    test_ids: [auth_client_credentials_request, auth_login_secret_source_conflict, auth_login_secret_read_order, auth_login_prior_credential_guard, auth_singleflight_cache, auth_cross_process_singleflight, auth_expired_cache_refresh, auth_provider_expiry_guard, auth_candidate_expiry_guard, auth_same_token_reissue_guard, auth_explicit_reissue_lifetime, auth_login_cache_transaction, auth_login_cache_reader_isolation, auth_login_profile_rollback, auth_login_malformed_displaced_cache, auth_login_commit_conflict, auth_login_output_preflight, auth_login_warning_preflight, auth_login_output_state, auth_login_broken_pipe_state, auth_refresh_token_validation, auth_refresh_token_no_commit, auth_logout_partial_commit, opaque_token_roundtrip, auth_token_raw_cumulative_guard, auth_prior_cache_disclosure_guard, auth_raw_broken_pipe_state, auth_output_newline_guard, auth_token_raw_newline_guard, auth_malformed_cache_guard, auth_malformed_cache_duplicate_guard, auth_global_cache_output_guard, auth_cached_help_output_guard, auth_orphan_cache_output_guard, auth_provider_preparse_guard, auth_credential_process_preparse_guard, auth_credential_process_descendant_cleanup, auth_windows_credential_process_job_cleanup, auth_config_lock_cancellation, auth_sigint_login_no_commit, auth_token_non_rate_limit_no_retry, auth_rate_limit_single_retry, auth_rate_limit_oversized_replay, auth_rate_limit_oversized_terminal]
-    verified_at: 2026-08-10
+    test_ids: [auth_client_credentials_request, auth_login_secret_source_conflict, auth_login_secret_read_order, auth_windows_hidden_input_parser_unicode_editing_limit, auth_windows_hidden_input_parser_surrogate_validation, auth_unix_hidden_input_cleanup, auth_login_prior_credential_guard, auth_environment_basic_guard, auth_mixed_source_basic_guard, auth_singleflight_cache, auth_cross_process_singleflight, auth_expired_cache_refresh, auth_provider_expiry_guard, auth_candidate_expiry_guard, auth_same_token_reissue_guard, auth_explicit_reissue_lifetime, auth_login_cache_transaction, auth_login_cache_reader_isolation, auth_login_profile_rollback, auth_login_malformed_displaced_cache, auth_login_commit_conflict, auth_login_output_preflight, auth_login_warning_preflight, auth_login_output_state, auth_login_broken_pipe_state, auth_bearer_generation_switch, auth_bearer_generation_crash_isolation, auth_bearer_generation_collision, auth_refresh_token_validation, auth_refresh_token_no_commit, auth_logout_partial_commit, auth_logout_cache_linearization, opaque_token_roundtrip, auth_token_raw_cumulative_guard, auth_token_disclosure_provenance, auth_prior_cache_disclosure_guard, auth_raw_broken_pipe_state, auth_output_newline_guard, auth_token_raw_newline_guard, auth_malformed_cache_guard, auth_malformed_cache_duplicate_guard, auth_global_cache_output_guard, auth_cached_help_output_guard, auth_orphan_cache_output_guard, auth_cache_output_guard_lease, auth_cache_output_guard_control, auth_cli_final_output_lease, auth_preparse_output_lease, auth_output_timeout_control, auth_output_sigint_control, auth_output_event_order, auth_control_source_order, auth_credential_process_timeout_arg_boundary, auth_profile_candidate_credential_guard, auth_profile_candidate_locked_guard, auth_profile_removal_recovery, auth_profile_removal_compensation, auth_profile_remove_without_bearer, auth_bearer_transition_cleanup, auth_bearer_cache_migration, auth_storage_path_isolation, auth_macos_storage_case_isolation, auth_unix_storage_physical_alias, auth_macos_storage_firmlink_isolation, auth_windows_storage_casefold_and_tilde_rejection, auth_credential_process_cache_identity, auth_unix_credential_process_environment_filter, auth_credential_process_timeout_metadata_unit, auth_cancellation_outcome, auth_provider_preparse_guard, auth_unix_credential_process_preparse_guard, auth_unix_credential_process_descendant_cleanup, auth_unix_credential_process_output_bound, auth_credential_process_cleanup_error_metadata_unit, auth_windows_job_close_kills_descendants, auth_config_lock_cancellation, auth_sigint_login_no_commit, auth_token_non_rate_limit_no_retry, auth_rate_limit_single_retry, auth_rate_limit_oversized_replay, auth_rate_limit_oversized_terminal]
+    verified_at: 2026-08-21
 
   - id: entity.get
     service: data
@@ -50,7 +50,7 @@ endpoints:
       - ENTITY-GET-REVERSE-TRANSCODE-001
       - ENTITY-LOSSLESS-001
     test_ids: [entity_uri_normalization, entity_get_contract, entity_get_consistency, entity_get_query_parameters, raw_entity_get_query_parameters, raw_entity_get_invalid_query, entity_get_parameter_validation, entity_get_preview_warning_outputs]
-    verified_at: 2026-08-09
+    verified_at: 2026-08-21
 
   - id: entity.by-crosswalk
     service: data
@@ -69,8 +69,8 @@ endpoints:
       - ENTITY-CROSSWALK-CONTRACT-001
       - ENTITY-CROSSWALK-CONSISTENCY-001
       - ENTITY-LOSSLESS-001
-    test_ids: [entity_crosswalk_contract, entity_crosswalk_validation, entity_crosswalk_id_fallback, raw_entity_crosswalk_preflight]
-    verified_at: 2026-08-11
+    test_ids: [entity_crosswalk_contract, entity_crosswalk_validation, entity_crosswalk_id_fallback, entity_crosswalk_source_normalization, raw_entity_crosswalk_preflight, raw_entity_crosswalk_fallback_warning]
+    verified_at: 2026-08-21
 
   - id: entity.search
     service: data
@@ -97,7 +97,7 @@ endpoints:
       - ENTITY-FILTER-QUERY-001
       - ENTITY-LOSSLESS-001
     test_ids: [entity_search_post_body, entity_search_boundary, entity_search_boundary_warning_outputs, raw_entity_search_boundary_warning_outputs, entity_search_consistency, entity_search_filter_guard, auth_check_reviewed_search, doctor_online_reviewed_search, doctor_unhealthy_error]
-    verified_at: 2026-08-08
+    verified_at: 2026-08-21
 
   - id: entity.search.get
     service: data
@@ -119,7 +119,7 @@ endpoints:
       - ENTITY-FILTER-QUERY-001
       - ENTITY-LOSSLESS-001
     test_ids: [raw_get_search_preflight, raw_query_filter_guard, raw_entity_search_boundary_warning_outputs, entity_search_boundary, entity_search_consistency]
-    verified_at: 2026-08-08
+    verified_at: 2026-08-21
 
   - id: entity.search.get_alias
     service: data
@@ -141,7 +141,7 @@ endpoints:
       - ENTITY-FILTER-QUERY-001
       - ENTITY-LOSSLESS-001
     test_ids: [raw_get_search_preflight, raw_query_filter_guard, raw_entity_search_boundary_warning_outputs, entity_search_boundary, entity_search_consistency]
-    verified_at: 2026-08-08
+    verified_at: 2026-08-21
 
   - id: entity.scan
     service: data
@@ -149,9 +149,10 @@ endpoints:
     path_pattern: /entities/_scan
     safety: read
     consistency: eventual
-    replay: safe
+    replay: conditional
     pagination: cursor
     max_body_bytes: 52428800
+    page_size_max: 200
     cursor_ttl_seconds: 3600
     command_links:
       - { command: entity.scan, role: typed_primary }
@@ -161,11 +162,13 @@ endpoints:
       - HTTP-RETRY-001
       - HTTP-POST-SIZE-001
       - ENTITY-SCAN-CURSOR-001
+      - ENTITY-SCAN-PAGE-LIMIT-001
+      - ENTITY-SCAN-OPTIONS-001
       - ENTITY-FILTER-QUERY-001
       - ENTITY-SEARCH-CONSISTENCY-001
       - ENTITY-LOSSLESS-001
-    test_ids: [entity_scan_pages, entity_scan_filter_guard, entity_scan_consistency, entity_scan_resume_validation, entity_scan_resume_cli_version, entity_scan_resume_expiry, entity_scan_active_cursor_expiry, entity_scan_cursor_deadline, entity_scan_resume_route]
-    verified_at: 2026-08-08
+    test_ids: [entity_scan_pages, entity_scan_page_limit, raw_entity_scan_prebody_page_limit, entity_scan_options_contract, raw_entity_scan_options_prebody, entity_scan_option_acknowledgement, entity_scan_continuation_replay, raw_entity_scan_continuation_replay, entity_scan_response_route_guard, entity_scan_progress_error, entity_scan_output_context, entity_scan_final_guard_context, entity_scan_flush_progress, entity_scan_artifact_reconciliation, entity_scan_guard_refusal_replay, entity_scan_response_outcome, entity_scan_sigint_no_summary, entity_scan_filter_guard, entity_scan_consistency, entity_scan_resume_validation, entity_scan_resume_cli_version, entity_scan_resume_expiry, entity_scan_active_cursor_expiry, entity_scan_cursor_deadline, entity_scan_cursor_request_start, entity_scan_resume_work_bound, entity_scan_resume_route, entity_scan_checkpoint_commit_metadata, entity_scan_resume_io_control, raw_entity_scan_v2_route_refused, raw_entity_scan_v2_alias_refused]
+    verified_at: 2026-08-21
 
   - id: entity.history
     service: data
@@ -187,7 +190,7 @@ endpoints:
       - ENTITY-HISTORY-CANONICAL-VALUES-001
       - ENTITY-HISTORY-BOUNDARY-001
     test_ids: [entity_history_contract, entity_history_boundary, entity_history_guidance, entity_history_canonical_values, raw_entity_history_preflight]
-    verified_at: 2026-08-11
+    verified_at: 2026-08-21
 
   - id: entity.matches
     service: data
@@ -205,6 +208,7 @@ endpoints:
       - HTTP-RETRY-001
       - ENTITY-MATCHES-CONTRACT-001
       - ENTITY-MATCHES-FRESHNESS-001
+      - ENTITY-MATCHES-RELEVANCE-PRECISION-001
       - ENTITY-LOSSLESS-001
-    test_ids: [entity_matches_contract, entity_matches_validation, raw_entity_matches_preflight]
-    verified_at: 2026-08-11
+    test_ids: [entity_matches_contract, entity_matches_validation, entity_matches_relevance_precision, raw_entity_matches_preflight]
+    verified_at: 2026-08-21

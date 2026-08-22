@@ -64,10 +64,12 @@ reltio --profile dev entity scan \
   --filter "equals(type,'configuration/entityTypes/Organization')" \
   --max-items 1000 \
   --resume-file organizations.resume.json \
-  > organizations.jsonl
+  > organizations.part-0001.jsonl
 ```
 
-Resume files are bound to the exact CLI version, selected target and service route, normalized query, and page size that created them. Paths must be valid UTF-8. A mismatch or cursor older than the registry TTL fails before another request is sent, including during a long-running active scan.
+Resume files are bound to the exact CLI version, selected target and service route, normalized query, and page size that created them. Paths must be valid UTF-8. A mismatch or cursor older than the registry TTL fails before another request is sent, including during a long-running active scan. Cursor-bearing continuation requests are state-advancing and are never retried automatically after a transport failure; resume and reconcile rather than blindly replaying the cursor. Resume a failed scan into a new part file, then reconcile complete `meta.sequence` values against the resume sequence. Reusing `>` destroys the earlier part before the CLI starts, while blind `>>` can duplicate a page if output flushed before its checkpoint committed.
+
+Repeated scan `--option` values are limited to the conservative locked-OpenAPI allowlist `sendHidden`, `searchByOv`, `ovOnly`, and `nonOvOnly`; `ovOnly` and `nonOvOnly` cannot be combined. The current English cursor documentation omits options, while OpenAPI and connector material use conflicting route and cursor contracts. The CLI refuses option transmission unless you explicitly add `--allow-unverified-scan-options`; verify behavior against a non-production tenant before using that acknowledgement.
 
 ## 5. Diagnose
 

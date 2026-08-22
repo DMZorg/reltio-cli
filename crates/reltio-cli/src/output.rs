@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use reltio_client::cancellation::{CancellationToken, EventStamp};
 use reltio_client::config::ResolvedTarget;
 use reltio_client::error::{ErrorCategory, ReltioError, Result};
-use reltio_client::redaction::OutputGuard;
+use reltio_client::redaction::{MAX_OUTPUT_GUARD_CONTEXT_BYTES, OutputGuard};
 use reltio_client::registry::{Consistency, PracticeCoverage};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -14,6 +17,7 @@ use crate::cli::OutputFormat;
 const MAX_TABLE_COLUMNS: usize = 256;
 const MAX_TABLE_CELLS: usize = 100_000;
 const MAX_TABLE_CELL_BYTES: usize = 80;
+const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RenderOptions {
@@ -25,18 +29,385 @@ pub struct PreparedOutput {
     bytes: Vec<u8>,
     newline: bool,
     guard: OutputGuard,
+    context: Option<OutputContext>,
 }
 
 impl PreparedOutput {
-    pub fn write_stdout(self) -> Result<()> {
-        write_stdout(&self.bytes, self.newline).map_err(|error| error.with_output_guard(self.guard))
+    pub fn with_additional_guard(mut self, guard: &OutputGuard) -> Result<Self> {
+        self.guard.merge(guard);
+        ensure_guarded_output_sequence(&self.bytes, self.newline, &self.guard)?;
+        Ok(self)
     }
 
-    pub fn write_stderr(self) -> Result<()> {
-        io::stderr()
+    pub fn with_context(mut self, context: &OutputContext) -> Self {
+        self.context = Some(context.clone());
+        self
+    }
+
+    pub async fn write_stdout_with_owner<Owner>(
+        self,
+        owner: Owner,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<()>
+    where
+        Owner: Send + 'static,
+    {
+        let failure_guard = self.guard.clone();
+        self.write_controlled(
+            OutputStream::Stdout,
+            owner,
+            deadline,
+            cancellation,
+            failure_guard,
+        )
+        .await
+    }
+
+    pub async fn write_stdout_disclosing_with_owner<Owner>(
+        self,
+        owner: Owner,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        failure_guard: OutputGuard,
+    ) -> Result<()>
+    where
+        Owner: Send + 'static,
+    {
+        self.write_controlled(
+            OutputStream::Stdout,
+            owner,
+            deadline,
+            cancellation,
+            failure_guard,
+        )
+        .await
+    }
+
+    pub async fn write_stderr_with_owner<Owner>(
+        self,
+        owner: Owner,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<()>
+    where
+        Owner: Send + 'static,
+    {
+        let failure_guard = self.guard.clone();
+        self.write_controlled(
+            OutputStream::Stderr,
+            owner,
+            deadline,
+            cancellation,
+            failure_guard,
+        )
+        .await
+    }
+
+    async fn write_controlled<Owner>(
+        self,
+        stream: OutputStream,
+        owner: Owner,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        failure_guard: OutputGuard,
+    ) -> Result<()>
+    where
+        Owner: Send + 'static,
+    {
+        if let Some(control) = active_output_control(cancellation, deadline) {
+            return Err(output_control_failure(control, true, &failure_guard));
+        }
+
+        let thread_cancellation = cancellation.clone();
+        let writer_guard = failure_guard.clone();
+        let timeline = OutputTimeline::default();
+        let thread_timeline = timeline.clone();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("reltio-output".to_owned())
+            .spawn(move || {
+                let result = write_stream_with_context(
+                    stream,
+                    &self.bytes,
+                    self.newline,
+                    deadline,
+                    &thread_cancellation,
+                    &self.guard,
+                    self.context.as_ref(),
+                )
+                .map_err(|error| error.with_output_guard(writer_guard));
+                let completed_at = thread_cancellation.event_stamp();
+                thread_timeline.record(completed_at);
+                // The cache/output owner is released only after the last physical
+                // write and flush attempt has completed.
+                drop(owner);
+                let _ = sender.send((completed_at, result));
+            })
+            .map_err(|error| {
+                ReltioError::io("failed to start the bounded output writer", &error)
+                    .with_output_guard(failure_guard.clone())
+            })?;
+
+        let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(timeout);
+        tokio::select! {
+            biased;
+            result = &mut receiver => resolve_output_result(
+                result,
+                cancellation,
+                deadline,
+                &failure_guard,
+            ),
+            () = cancellation.cancelled() => {
+                if timeline
+                    .completed_at()
+                    .is_some_and(|completed_at| {
+                        output_control_after(completed_at, cancellation, deadline).is_none()
+                    })
+                {
+                    return resolve_output_result(
+                        (&mut receiver).await,
+                        cancellation,
+                        deadline,
+                        &failure_guard,
+                    );
+                }
+                Err(output_control_failure(
+                    active_output_control(cancellation, deadline)
+                        .unwrap_or(OutputControl::Canceled),
+                    false,
+                    &failure_guard,
+                ))
+            },
+            () = &mut timeout => {
+                if timeline
+                    .completed_at()
+                    .is_some_and(|completed_at| {
+                        output_control_after(completed_at, cancellation, deadline).is_none()
+                    })
+                {
+                    return resolve_output_result(
+                        (&mut receiver).await,
+                        cancellation,
+                        deadline,
+                        &failure_guard,
+                    );
+                }
+                Err(output_control_failure(
+                    active_output_control(cancellation, deadline)
+                        .unwrap_or(OutputControl::TimedOut),
+                    false,
+                    &failure_guard,
+                ))
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputContext {
+    state: Arc<Mutex<OutputContextState>>,
+}
+
+impl Default for OutputContext {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(OutputContextState {
+                tail: Vec::new(),
+                retention_limit: MAX_OUTPUT_GUARD_CONTEXT_BYTES,
+                total_emitted: 0,
+                uncertain: false,
+            })),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OutputContextState {
+    tail: Vec<u8>,
+    retention_limit: usize,
+    total_emitted: usize,
+    uncertain: bool,
+}
+
+impl OutputContextState {
+    fn admit(&mut self, bytes: &[u8], newline: bool, guard: &OutputGuard) -> Result<()> {
+        if self.uncertain {
+            return Err(guarded_output_refusal(
+                guard,
+                Some("prior_output_state_uncertain"),
+            ));
+        }
+        let required = guard.required_stream_context_bytes();
+        if required > self.retention_limit && self.total_emitted > self.tail.len() {
+            return Err(guarded_output_refusal(
+                guard,
+                Some("prior_output_context_insufficient"),
+            ));
+        }
+        self.retention_limit = self.retention_limit.max(required);
+        if guard.permits_with_prefix(&self.tail, bytes, output_suffix(bytes, newline)) {
+            Ok(())
+        } else {
+            Err(guarded_output_refusal(guard, Some("cross_emission_match")))
+        }
+    }
+
+    fn record(&mut self, bytes: &[u8], newline: bool) {
+        let suffix = output_suffix(bytes, newline);
+        let appended = bytes.len().saturating_add(suffix.len());
+        self.total_emitted = self.total_emitted.saturating_add(appended);
+        if self.retention_limit == 0 {
+            self.tail.clear();
+            return;
+        }
+        if appended >= self.retention_limit {
+            self.tail.clear();
+            let suffix_bytes = suffix.len().min(self.retention_limit);
+            let body_bytes = self.retention_limit.saturating_sub(suffix_bytes);
+            self.tail
+                .extend_from_slice(&bytes[bytes.len().saturating_sub(body_bytes)..]);
+            self.tail
+                .extend_from_slice(&suffix[suffix.len().saturating_sub(suffix_bytes)..]);
+            return;
+        }
+        let retained = self.retention_limit - appended;
+        if self.tail.len() > retained {
+            let start = self.tail.len() - retained;
+            self.tail.copy_within(start.., 0);
+            self.tail.truncate(retained);
+        }
+        self.tail.extend_from_slice(bytes);
+        self.tail.extend_from_slice(suffix);
+    }
+
+    fn mark_uncertain(&mut self) {
+        self.uncertain = true;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OutputTimeline {
+    completed_at: Arc<Mutex<Option<EventStamp>>>,
+}
+
+impl OutputTimeline {
+    fn record(&self, completed_at: EventStamp) {
+        *self
+            .completed_at
             .lock()
-            .write_all(&self.bytes)
-            .map_err(|error| output_error(&error).with_output_guard(self.guard))
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(completed_at);
+    }
+
+    fn completed_at(&self) -> Option<EventStamp> {
+        *self
+            .completed_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputControl {
+    Canceled,
+    TimedOut,
+}
+
+fn active_output_control(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Option<OutputControl> {
+    let canceled_at = cancellation.cancelled_at();
+    if Instant::now() < deadline {
+        return canceled_at.map(|_| OutputControl::Canceled);
+    }
+    Some(
+        if canceled_at.is_some_and(|stamp| stamp.occurred_at_or_before(deadline)) {
+            OutputControl::Canceled
+        } else {
+            OutputControl::TimedOut
+        },
+    )
+}
+
+fn output_control_after(
+    completed_at: EventStamp,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Option<OutputControl> {
+    let canceled_at = cancellation.cancelled_at();
+    let canceled_first = canceled_at.is_some_and(|stamp| !completed_at.precedes(stamp));
+    let timed_out_first = !completed_at.occurred_before(deadline);
+    match (canceled_first, timed_out_first) {
+        (false, false) => None,
+        (true, false) => Some(OutputControl::Canceled),
+        (false, true) => Some(OutputControl::TimedOut),
+        (true, true) => Some(
+            if canceled_at.is_some_and(|stamp| stamp.occurred_at_or_before(deadline)) {
+                OutputControl::Canceled
+            } else {
+                OutputControl::TimedOut
+            },
+        ),
+    }
+}
+
+fn resolve_output_result(
+    result: std::result::Result<(EventStamp, Result<()>), tokio::sync::oneshot::error::RecvError>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    failure_guard: &OutputGuard,
+) -> Result<()> {
+    match result {
+        Ok((completed_at, result)) => output_control_after(completed_at, cancellation, deadline)
+            .map_or(result, |control| {
+                Err(output_control_failure(control, false, failure_guard))
+            }),
+        Err(_) => active_output_control(cancellation, deadline).map_or_else(
+            || {
+                Err(
+                    ReltioError::internal("the bounded output writer terminated without a result")
+                        .with_output_guard(failure_guard.clone()),
+                )
+            },
+            |control| Err(output_control_failure(control, false, failure_guard)),
+        ),
+    }
+}
+
+fn output_control_failure(
+    control: OutputControl,
+    before_emission: bool,
+    guard: &OutputGuard,
+) -> ReltioError {
+    match control {
+        OutputControl::Canceled => output_control_error(
+            "request_canceled",
+            ErrorCategory::Canceled,
+            if before_emission {
+                "output was canceled before emission"
+            } else {
+                "output was canceled during emission"
+            },
+            guard,
+        ),
+        OutputControl::TimedOut => output_control_error(
+            "request_timeout",
+            ErrorCategory::Timeout,
+            if before_emission {
+                "the command exceeded its overall timeout before output"
+            } else {
+                "the command exceeded its overall timeout during output"
+            },
+            guard,
+        ),
     }
 }
 
@@ -113,15 +484,6 @@ struct ErrorBody<'a> {
     docs_url: &'static str,
 }
 
-pub fn write_success_guarded(
-    data: &Value,
-    meta: &Meta,
-    options: RenderOptions,
-    guard: &OutputGuard,
-) -> Result<()> {
-    prepare_success_guarded(data, meta, options, guard)?.write_stdout()
-}
-
 pub fn prepare_success_guarded(
     data: &Value,
     meta: &Meta,
@@ -184,6 +546,7 @@ pub fn prepare_success_guarded(
         bytes,
         newline,
         guard: guard.clone(),
+        context: None,
     })
 }
 
@@ -195,9 +558,18 @@ fn yaml_document(value: &impl Serialize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub fn write_raw_guarded(bytes: &[u8], newline: bool, guard: &OutputGuard) -> Result<()> {
+pub fn prepare_raw_guarded(
+    bytes: &[u8],
+    newline: bool,
+    guard: &OutputGuard,
+) -> Result<PreparedOutput> {
     ensure_guarded_output_sequence(bytes, newline, guard)?;
-    write_stdout(bytes, newline).map_err(|error| error.with_output_guard(guard.clone()))
+    Ok(PreparedOutput {
+        bytes: bytes.to_vec(),
+        newline,
+        guard: guard.clone(),
+        context: None,
+    })
 }
 
 pub fn write_jsonl_event_guarded(
@@ -215,7 +587,15 @@ pub fn write_jsonl_event_guarded(
         .map_err(|error| output_error(&error).with_output_guard(guard.clone()))
 }
 
-pub fn write_error(error: &ReltioError, format: OutputFormat) {
+pub fn prepare_error_guarded(
+    error: &ReltioError,
+    format: OutputFormat,
+    final_guard: &OutputGuard,
+) -> Result<Option<PreparedOutput>> {
+    let mut guard = final_guard.clone();
+    if let Some(error_guard) = error.output_guard() {
+        guard.merge(error_guard);
+    }
     let envelope = ErrorEnvelope {
         schema_version: reltio_client::SCHEMA_VERSION,
         ok: false,
@@ -239,18 +619,52 @@ pub fn write_error(error: &ReltioError, format: OutputFormat) {
     } else {
         serde_json::to_vec(&envelope).unwrap_or_default()
     };
-    if let Some(guard) = error.output_guard() {
-        if !guard.permits_with_suffix(&bytes, output_suffix(&bytes, true)) {
-            bytes = guarded_error_fallback(error, guard);
-        }
+    if !guard.permits_with_suffix(&bytes, output_suffix(&bytes, true)) {
+        bytes = guarded_error_fallback(error, &guard);
     }
-    let mut stderr = io::stderr().lock();
-    if !bytes.is_empty() {
-        let _ = stderr.write_all(&bytes);
-        if !bytes.ends_with(b"\n") {
-            let _ = stderr.write_all(b"\n");
-        }
+    if bytes.is_empty() {
+        return Ok(None);
     }
+    ensure_guarded_output_sequence(&bytes, true, &guard)?;
+    Ok(Some(PreparedOutput {
+        bytes,
+        newline: true,
+        guard,
+        context: None,
+    }))
+}
+
+pub fn prepare_error_context_fallback_guarded(
+    error: &ReltioError,
+    final_guard: &OutputGuard,
+    context: &OutputContext,
+) -> Option<PreparedOutput> {
+    let mut guard = final_guard.clone();
+    if let Some(error_guard) = error.output_guard() {
+        guard.merge(error_guard);
+    }
+    let mut state = context
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.uncertain {
+        return None;
+    }
+    let positional = guarded_error_fallback(error, &guard);
+    let bytes = std::iter::once(positional)
+        .chain((0_u64..=1_024).map(|number| number.to_string().into_bytes()))
+        .find(|candidate| {
+            !candidate.is_empty()
+                && guard.permits_with_suffix(candidate, b"\n")
+                && state.admit(candidate, true, &guard).is_ok()
+        });
+    let bytes = bytes?;
+    Some(PreparedOutput {
+        bytes,
+        newline: true,
+        guard,
+        context: None,
+    })
 }
 
 fn ensure_guarded_output(bytes: &[u8], guard: &OutputGuard) -> Result<()> {
@@ -261,13 +675,21 @@ fn ensure_guarded_output_sequence(bytes: &[u8], newline: bool, guard: &OutputGua
     if guard.permits_with_suffix(bytes, output_suffix(bytes, newline)) {
         return Ok(());
     }
-    Err(ReltioError::new(
+    Err(guarded_output_refusal(guard, None))
+}
+
+fn guarded_output_refusal(guard: &OutputGuard, reason: Option<&'static str>) -> ReltioError {
+    ReltioError::new(
         "credential_output_refused",
         ErrorCategory::Safety,
         "refusing to emit output that would reproduce an active credential",
     )
-    .with_details(json!({"output_omitted": true, "safe_to_replay": false}))
-    .with_output_guard(guard.clone()))
+    .with_details(json!({
+        "output_omitted": true,
+        "safe_to_replay": false,
+        "reason": reason
+    }))
+    .with_output_guard(guard.clone())
 }
 
 fn guarded_error_fallback(error: &ReltioError, guard: &OutputGuard) -> Vec<u8> {
@@ -335,13 +757,6 @@ fn guarded_scalar(value: Value, guard: &OutputGuard) -> Value {
         .map_or(Value::Null, |_| value)
 }
 
-pub fn write_warning_guarded(message: &str, quiet: bool, guard: &OutputGuard) -> Result<()> {
-    if let Some(output) = prepare_warning_guarded(message, quiet, guard)? {
-        output.write_stderr()?;
-    }
-    Ok(())
-}
-
 pub fn prepare_warning_guarded(
     message: &str,
     quiet: bool,
@@ -356,20 +771,159 @@ pub fn prepare_warning_guarded(
         bytes,
         newline: false,
         guard: guard.clone(),
+        context: None,
     }))
 }
 
-fn write_stdout(bytes: &[u8], newline: bool) -> Result<()> {
-    let mut stdout = io::stdout().lock();
-    stdout
-        .write_all(bytes)
-        .map_err(|error| output_error(&error))?;
-    if newline && !bytes.ends_with(b"\n") {
-        stdout
-            .write_all(b"\n")
-            .map_err(|error| output_error(&error))?;
+fn write_stream_with_context(
+    stream: OutputStream,
+    bytes: &[u8],
+    newline: bool,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    guard: &OutputGuard,
+    context: Option<&OutputContext>,
+) -> Result<()> {
+    let mut context = context.map(|context| {
+        context
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    if let Some(context) = &mut context {
+        context.admit(bytes, newline, guard)?;
     }
-    stdout.flush().map_err(|error| output_error(&error))
+    write_stream_controlled(
+        stream,
+        bytes,
+        newline,
+        deadline,
+        cancellation,
+        context.as_deref_mut(),
+    )
+}
+
+fn write_stream_controlled(
+    stream: OutputStream,
+    bytes: &[u8],
+    newline: bool,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    context: Option<&mut OutputContextState>,
+) -> Result<()> {
+    match stream {
+        OutputStream::Stdout => {
+            let mut writer = io::stdout().lock();
+            write_to_writer(&mut writer, bytes, newline, deadline, cancellation, context)
+        }
+        OutputStream::Stderr => {
+            let mut writer = io::stderr().lock();
+            write_to_writer(&mut writer, bytes, newline, deadline, cancellation, context)
+        }
+    }
+}
+
+fn write_to_writer(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    newline: bool,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    mut context: Option<&mut OutputContextState>,
+) -> Result<()> {
+    let result = (|| {
+        write_chunks(
+            writer,
+            bytes,
+            deadline,
+            cancellation,
+            context.as_deref_mut(),
+        )?;
+        if newline && !bytes.ends_with(b"\n") {
+            write_chunks(
+                writer,
+                b"\n",
+                deadline,
+                cancellation,
+                context.as_deref_mut(),
+            )?;
+        }
+        writer.flush().map_err(|error| output_error(&error))
+    })();
+    if result.is_err() {
+        if let Some(context) = context {
+            context.mark_uncertain();
+        }
+    }
+    result
+}
+
+fn write_chunks(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    mut context: Option<&mut OutputContextState>,
+) -> Result<()> {
+    for chunk in bytes.chunks(OUTPUT_CHUNK_BYTES) {
+        let mut remaining = chunk;
+        while !remaining.is_empty() {
+            ensure_output_active(deadline, cancellation)?;
+            let written = writer
+                .write(remaining)
+                .map_err(|error| output_error(&error))?;
+            if written == 0 {
+                return Err(output_error(&io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "output sink accepted zero bytes",
+                )));
+            }
+            if let Some(context) = context.as_deref_mut() {
+                context.record(&remaining[..written], false);
+            }
+            remaining = &remaining[written..];
+        }
+    }
+    Ok(())
+}
+
+fn ensure_output_active(deadline: Instant, cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(output_control_error(
+            "request_canceled",
+            ErrorCategory::Canceled,
+            "output was canceled during emission",
+            &OutputGuard::default(),
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(output_control_error(
+            "request_timeout",
+            ErrorCategory::Timeout,
+            "the command exceeded its overall timeout during output",
+            &OutputGuard::default(),
+        ));
+    }
+    Ok(())
+}
+
+fn output_control_error(
+    code: &'static str,
+    category: ErrorCategory,
+    message: &'static str,
+    guard: &OutputGuard,
+) -> ReltioError {
+    ReltioError::new(code, category, message)
+        .with_details(json!({
+            "phase": "output",
+            "remote_response_received": Value::Null,
+            "remote_request_completed": Value::Null,
+            "remote_operation_completed": Value::Null,
+            "remote_operation_state": "unknown",
+            "local_state_committed": Value::Null,
+            "safe_to_replay": false
+        }))
+        .with_output_guard(guard.clone())
 }
 
 fn output_suffix(bytes: &[u8], newline: bool) -> &'static [u8] {
@@ -533,6 +1087,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_control_uses_chronological_event_order() {
+        let late_cancellation = CancellationToken::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let completed = late_cancellation.event_stamp();
+        late_cancellation.cancel();
+        assert_eq!(
+            output_control_after(completed, &late_cancellation, deadline),
+            None,
+            "physical completion before cancellation remains authoritative"
+        );
+
+        let early_cancellation = CancellationToken::new();
+        early_cancellation.cancel();
+        let completed = early_cancellation.event_stamp();
+        assert_eq!(
+            output_control_after(completed, &early_cancellation, deadline),
+            Some(OutputControl::Canceled)
+        );
+
+        let timeout = CancellationToken::new();
+        let expired = Instant::now();
+        let completed = timeout.event_stamp();
+        assert_eq!(
+            output_control_after(completed, &timeout, expired),
+            Some(OutputControl::TimedOut)
+        );
+    }
+
+    #[test]
     fn table_output_escapes_terminal_control_sequences() {
         let rendered = render_table(&json!([{
             "na\u{1b}]0;title\u{7}": "value\u{1b}]52;c;Y29weQ==\u{7}"
@@ -609,6 +1192,135 @@ mod tests {
         let guard = OutputGuard::from_known_secrets(&["a\n"]);
         assert!(guard.permits(b"%61"));
         assert!(ensure_guarded_output_sequence(b"%61", true, &guard).is_err());
+    }
+
+    #[test]
+    fn stream_context_catches_credentials_split_across_successful_emissions() {
+        let context = OutputContext::default();
+        let mut state = context
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.record(b"split-", false);
+
+        let guard = OutputGuard::from_known_secrets(&["split-secret"]);
+        let error = state
+            .admit(b"secret", false, &guard)
+            .expect_err("a raw cross-emission credential must be refused");
+
+        assert_eq!(error.code, "credential_output_refused");
+        assert_eq!(error.details["reason"], "cross_emission_match");
+    }
+
+    #[test]
+    fn stream_context_catches_two_layer_credentials_from_a_later_final_guard() {
+        let context = OutputContext::default();
+        let mut state = context
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.record(b"%2573%2570%256c%2569%2574%252", false);
+
+        let guard = OutputGuard::from_known_secrets(&["split-secret"]);
+        assert!(guard.permits(b"d%2573%2565%2563%2572%2565%2574"));
+        let error = state
+            .admit(b"d%2573%2565%2563%2572%2565%2574", false, &guard)
+            .expect_err("a canonical cross-emission credential must be refused");
+
+        assert_eq!(error.code, "credential_output_refused");
+        assert_eq!(error.details["reason"], "cross_emission_match");
+    }
+
+    #[test]
+    fn stream_context_tracks_partial_writes_and_fails_closed_after_sink_errors() {
+        #[derive(Default)]
+        struct PartialThenError {
+            writes: usize,
+        }
+
+        impl Write for PartialThenError {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.writes == 1 {
+                    Ok(bytes.len().min(6))
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "injected partial write failure",
+                    ))
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let context = OutputContext::default();
+        let mut state = context
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .admit(b"split-more", false, &OutputGuard::default())
+            .expect("the emission is safe before touching the sink");
+        let error = write_to_writer(
+            &mut PartialThenError::default(),
+            b"split-more",
+            false,
+            Instant::now() + std::time::Duration::from_secs(1),
+            &CancellationToken::new(),
+            Some(&mut state),
+        )
+        .expect_err("the second physical write fails");
+        assert_eq!(error.code, "output_write_failed");
+        assert_eq!(state.tail, b"split-");
+
+        let guard = OutputGuard::from_known_secrets(&["split-secret"]);
+        let error = state
+            .admit(b"secret", false, &guard)
+            .expect_err("uncertain physical output must poison later emissions");
+        assert_eq!(error.details["reason"], "prior_output_state_uncertain");
+    }
+
+    #[test]
+    fn stream_context_fails_closed_after_flush_errors() {
+        #[derive(Default)]
+        struct FlushError;
+
+        impl Write for FlushError {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected flush failure",
+                ))
+            }
+        }
+
+        let context = OutputContext::default();
+        let mut state = context
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let error = write_to_writer(
+            &mut FlushError,
+            b"flushed-prefix",
+            false,
+            Instant::now() + std::time::Duration::from_secs(1),
+            &CancellationToken::new(),
+            Some(&mut state),
+        )
+        .expect_err("flush failure is reported");
+        assert_eq!(error.code, "output_write_failed");
+        assert_eq!(state.tail, b"flushed-prefix");
+        let error = state
+            .admit(b"later", false, &OutputGuard::default())
+            .expect_err("flush uncertainty suppresses later records");
+        assert_eq!(error.details["reason"], "prior_output_state_uncertain");
     }
 
     #[test]
@@ -707,5 +1419,32 @@ mod tests {
             assert_eq!(fields[7], -1);
             assert_eq!(fields[11], -1);
         }
+    }
+
+    #[test]
+    fn contextual_error_fallback_advances_from_positional_json_to_a_safe_scalar() {
+        let context = OutputContext::default();
+        context
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(b"prefix", false);
+        let guard =
+            OutputGuard::from_known_secrets(&["error", "prefix[\"reltio_guarded_failure\""]);
+        let error = ReltioError::new(
+            "request_timeout",
+            ErrorCategory::Timeout,
+            "the request timed out",
+        )
+        .with_output_guard(guard.clone());
+        let ordinary = prepare_error_guarded(&error, OutputFormat::Json, &guard)
+            .expect("ordinary fallback prepares")
+            .expect("ordinary fallback exists");
+        assert!(ordinary.bytes.starts_with(b"[\"reltio_guarded_failure\""));
+
+        let contextual = prepare_error_context_fallback_guarded(&error, &guard, &context)
+            .expect("a scalar remains representable");
+
+        assert_eq!(contextual.bytes, b"0");
     }
 }

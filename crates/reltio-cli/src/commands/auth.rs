@@ -1,10 +1,15 @@
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+#[cfg(not(windows))]
+use std::time::Duration;
 use std::time::Instant;
 
 use chrono::{TimeDelta, Utc};
 use is_terminal::IsTerminal;
-use reltio_client::auth::{AccessToken, TokenManager, TokenManagerOptions};
+use reltio_client::auth::{
+    AccessToken, TokenManager, TokenManagerOptions, imported_bearer_cache_key,
+    new_imported_bearer_cache_generation, stored_imported_bearer_cache_key,
+};
 use reltio_client::config::{
     AuthMethod, AuthProfile, ConfigFile, Profile, ResolutionOverrides, resolve_target,
 };
@@ -18,9 +23,10 @@ use zeroize::Zeroizing;
 
 use crate::cli::{AuthLoginArgs, AuthSubcommand, OutputFormat};
 use crate::commands::Runtime;
-use crate::output::{Meta, prepare_success_guarded, write_raw_guarded, write_success_guarded};
+use crate::output::{Meta, prepare_raw_guarded, prepare_success_guarded};
 
 const SECRET_INPUT_LIMIT: u64 = 1024 * 1024;
+const LOGIN_EXPIRY_SKEW_SECONDS: i64 = 5;
 
 enum PendingLogin {
     Bearer {
@@ -33,13 +39,20 @@ enum PendingLogin {
     },
 }
 
+#[derive(Clone, Copy)]
+enum AuthRemoteOutcome {
+    NotSent,
+    Unknown,
+    Succeeded,
+}
+
 pub async fn run(runtime: &Runtime, command: AuthSubcommand) -> Result<()> {
     match command {
         AuthSubcommand::Login(arguments) => login(runtime, arguments).await,
-        AuthSubcommand::Status => status(runtime),
+        AuthSubcommand::Status => status(runtime).await,
         AuthSubcommand::Check => check(runtime).await,
         AuthSubcommand::Token { show } => reveal_token(runtime, show).await,
-        AuthSubcommand::Logout => logout(runtime),
+        AuthSubcommand::Logout => logout(runtime).await,
     }
 }
 
@@ -118,6 +131,9 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
         client_id: client_id.clone(),
         secret_file,
         credential_process: credential_process.clone(),
+        bearer_cache_key: None,
+        bearer_cache_generation: (arguments.method == AuthMethod::Bearer)
+            .then(new_imported_bearer_cache_generation),
     };
     let previous_profile = config
         .profiles
@@ -129,12 +145,12 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
             )
         })?
         .clone();
-    let previous_output_guard = TokenManager::profile_output_guard(
-        &previous_target,
-        &runtime.environment,
-        &runtime.paths.cache_dir,
-    )
-    .map_err(|error| error.with_output_guard(runtime.environment_output_guard()))?;
+    let retired_bearer_cache_key =
+        stored_imported_bearer_cache_key(&previous_profile.auth)?.map(ToOwned::to_owned);
+    let previous_output_guard = runtime
+        .profile_output_guard(&previous_target, deadline)
+        .await
+        .map_err(|error| error.with_output_guard(runtime.environment_output_guard()))?;
     let mut candidate = config.clone();
     candidate
         .profiles
@@ -146,16 +162,39 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
             )
         })?
         .auth = auth_profile.clone();
+    let mut target = resolve_target(&candidate, &runtime.environment, &resolution_overrides)?;
+    if arguments.method == AuthMethod::Bearer {
+        let cache_key = imported_bearer_cache_key(&runtime.paths.config_file, &target)?;
+        if retired_bearer_cache_key.as_deref() == Some(cache_key.as_str()) {
+            return Err(ReltioError::new(
+                "auth_login_cache_generation_conflict",
+                ErrorCategory::Conflict,
+                "the generated imported-bearer cache identity collided with the active generation",
+            )
+            .with_details(json!({
+                "network_request_sent": false,
+                "local_state_committed": false,
+                "safe_to_replay": true
+            })));
+        }
+        candidate
+            .profiles
+            .get_mut(&profile_name)
+            .expect("the candidate profile was resolved above")
+            .auth
+            .bearer_cache_key = Some(cache_key.clone());
+        target.auth.bearer_cache_key = Some(cache_key);
+    }
     let candidate_profile = candidate
         .profiles
         .get(&profile_name)
-        .unwrap_or_else(|| unreachable!("the candidate profile was resolved above"))
+        .expect("the candidate profile was resolved above")
         .clone();
-    let target = resolve_target(&candidate, &runtime.environment, &resolution_overrides)?;
     let mut input_output_guard = runtime.environment_output_guard();
     input_output_guard.merge(&previous_output_guard);
     let mut one_shot_secret = if arguments.secret_stdin {
-        let secret = read_secret_from_stdin("client secret")
+        let secret = read_secret_from_stdin("client secret", deadline, &runtime.cancellation)
+            .await
             .map_err(|error| error.with_output_guard(input_output_guard.clone()))?;
         input_output_guard.merge(&reltio_client::redaction::OutputGuard::from_known_secrets(
             &[secret.expose_secret()],
@@ -170,12 +209,17 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
         && arguments.secret_file.is_none()
         && io::stdin().is_terminal()
     {
-        let secret = rpassword::prompt_password("Reltio client secret: ")
-            .map_err(|error| ReltioError::io("failed to read hidden client secret", &error))?;
+        runtime
+            .emit_stderr_raw(b"Reltio client secret: ", deadline, &input_output_guard)
+            .await?;
+        let secret = read_hidden_secret(deadline, &runtime.cancellation).await?;
         let secret: SecretString = secret.into();
         input_output_guard.merge(&reltio_client::redaction::OutputGuard::from_known_secrets(
             &[secret.expose_secret()],
         ));
+        runtime
+            .emit_stderr_raw(b"\n", deadline, &input_output_guard)
+            .await?;
         one_shot_secret = Some(secret);
     }
     runtime
@@ -185,7 +229,8 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     {
         AuthMethod::Bearer => {
             let token = if arguments.token_stdin {
-                read_secret_from_stdin("access token")
+                read_secret_from_stdin("access token", deadline, &runtime.cancellation)
+                    .await
                     .map_err(|error| error.with_output_guard(input_output_guard.clone()))?
             } else {
                 runtime
@@ -237,8 +282,9 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
                 )
                 .map_err(|error| error.with_output_guard(input_output_guard.clone()))?;
             let mut output_guard = input_output_guard.clone();
-            let manager_guard = manager
-                .output_guard()
+            let manager_guard = runtime
+                .token_manager_output_guard(&manager, deadline)
+                .await
                 .map_err(|error| error.with_output_guard(output_guard.clone()))?;
             output_guard.merge(&manager_guard);
             let token = {
@@ -246,16 +292,17 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
                 tokio::pin!(acquisition);
                 tokio::select! {
                     biased;
-                    result = &mut acquisition => result
-                        .map_err(|error| error.with_output_guard(output_guard.clone()))?,
                     () = runtime.cancellation.cancelled() => {
                         return Err(auth_command_canceled(
                             "authentication",
                             false,
                             &output_guard,
                             true,
+                            AuthRemoteOutcome::Unknown,
                         ));
-                    }
+                    },
+                    result = &mut acquisition => result
+                        .map_err(|error| error.with_output_guard(output_guard.clone()))?,
                 }
             };
             output_guard.merge(token.output_guard());
@@ -271,11 +318,18 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
             )
         }
     };
+    let remote_outcome = match arguments.method {
+        AuthMethod::Bearer => AuthRemoteOutcome::NotSent,
+        AuthMethod::ClientCredentials if cache_hit => AuthRemoteOutcome::NotSent,
+        AuthMethod::ClientCredentials => AuthRemoteOutcome::Succeeded,
+        AuthMethod::CredentialProcess => AuthRemoteOutcome::Unknown,
+    };
     let mut cache_plan = match &pending_login {
         PendingLogin::Bearer { token, expires_at } => {
             let preparation = TokenManager::prepare_bearer_login_until(
                 &runtime.paths.cache_dir,
-                &profile_name,
+                &runtime.paths.config_file,
+                &target,
                 token.clone(),
                 *expires_at,
                 deadline,
@@ -290,6 +344,7 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
                         false,
                         &output_guard,
                         false,
+                        remote_outcome,
                     ));
                 }
             }
@@ -306,6 +361,7 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
                         false,
                         &output_guard,
                         false,
+                        remote_outcome,
                     ));
                 }
             }
@@ -314,12 +370,9 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     output_guard.merge(cache_plan.output_guard());
     output_guard.merge(
-        &TokenManager::profile_output_guard(
-            &previous_target,
-            &runtime.environment,
-            &runtime.paths.cache_dir,
-        )
-        .map_err(|error| error.with_output_guard(output_guard.clone()))?,
+        &cache_plan
+            .profile_output_guard(&previous_target, &runtime.environment)
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?,
     );
 
     let mut meta = Meta::new("auth.login").with_target(&target, Some("auth"));
@@ -369,15 +422,26 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     let success = prepare_success_guarded(&data, &meta, runtime.render, &output_guard)?;
     drop(pending_login);
 
-    runtime
-        .ensure_not_cancelled("before_token_cache_commit", false)
-        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    if runtime.cancellation.is_cancelled() {
+        return Err(auth_command_canceled(
+            "before_token_cache_commit",
+            false,
+            &output_guard,
+            false,
+            remote_outcome,
+        ));
+    }
     if let Err(error) = cache_plan.commit_with_cancellation(&runtime.cancellation) {
-        return Err(login_cache_error(error, output_guard));
+        return Err(login_cache_error(error, output_guard, remote_outcome));
     }
     if runtime.cancellation.is_cancelled() {
-        let cancellation =
-            auth_command_canceled("after_token_cache_commit", false, &output_guard, false);
+        let cancellation = auth_command_canceled(
+            "after_token_cache_commit",
+            false,
+            &output_guard,
+            false,
+            remote_outcome,
+        );
         let rollback = cache_plan.rollback();
         drop(cache_plan);
         if let Err(rollback_error) = rollback {
@@ -385,21 +449,33 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
                 &cancellation,
                 &rollback_error,
                 output_guard,
+                remote_outcome,
             ));
         }
-        return Err(login_profile_commit_error(cancellation, output_guard));
+        return Err(login_profile_commit_error(
+            cancellation,
+            output_guard,
+            remote_outcome,
+        ));
     }
     if let Err(error) = commit_auth_profile(
         runtime,
         &profile_name,
         &previous_profile,
         &candidate_profile,
+        retired_bearer_cache_key.as_deref(),
+        expires_at,
         deadline,
-        &output_guard,
-    ) {
+    )
+    .map_err(|error| error.with_output_guard(output_guard.clone()))
+    {
         if error.details["committed"] == true {
             drop(cache_plan);
-            return Err(login_commit_state_error(error, output_guard));
+            return Err(login_commit_state_error(
+                error,
+                output_guard,
+                remote_outcome,
+            ));
         }
         let rollback = cache_plan.rollback();
         drop(cache_plan);
@@ -408,19 +484,48 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
                 &error,
                 &rollback_error,
                 output_guard,
+                remote_outcome,
             ));
         }
-        return Err(login_profile_commit_error(error, output_guard));
+        return Err(login_profile_commit_error(
+            error,
+            output_guard,
+            remote_outcome,
+        ));
     }
-    drop(cache_plan);
+    if let Err(error) = validate_login_candidate_expiry(expires_at) {
+        return Err(login_post_commit_error(error, output_guard, remote_outcome));
+    }
+    if runtime.cancellation.is_cancelled() {
+        return Err(auth_command_canceled(
+            "before_auth_login_output",
+            true,
+            &output_guard,
+            false,
+            remote_outcome,
+        ));
+    }
 
+    if retired_bearer_cache_key.is_some() {
+        drop(cache_plan);
+        if let Some((_, cleanup_guard)) = runtime
+            .recover_pending_imported_bearer_cleanups()
+            .await
+            .map_err(|error| {
+            login_post_commit_error(error, output_guard.clone(), remote_outcome)
+        })? {
+            output_guard.merge(&cleanup_guard);
+        }
+        return runtime
+            .emit_prepared(success, deadline)
+            .await
+            .map_err(|error| login_output_error(error, output_guard, remote_outcome));
+    }
+    let plan_guard = cache_plan.output_guard().clone();
     runtime
-        .ensure_not_cancelled("before_auth_login_output", true)
-        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-
-    success
-        .write_stdout()
-        .map_err(|error| login_output_error(error, output_guard))
+        .emit_prepared_with_owner(success, cache_plan, &plan_guard, deadline)
+        .await
+        .map_err(|error| login_output_error(error, output_guard, remote_outcome))
 }
 
 fn commit_auth_profile(
@@ -428,8 +533,9 @@ fn commit_auth_profile(
     profile_name: &str,
     previous: &Profile,
     candidate: &Profile,
+    retired_bearer_cache_key: Option<&str>,
+    expires_at: Option<chrono::DateTime<Utc>>,
     deadline: Instant,
-    output_guard: &reltio_client::redaction::OutputGuard,
 ) -> Result<()> {
     let mut winning_config = None;
     let result = runtime.store.modify_until(
@@ -450,6 +556,14 @@ fn commit_auth_profile(
                     "the selected profile changed concurrently; refusing to commit authentication",
                 ));
             }
+            validate_login_candidate_expiry(expires_at)?;
+            if let Some(cache_key) = retired_bearer_cache_key {
+                config
+                    .pending_imported_bearer_cleanups
+                    .entry(profile_name.to_owned())
+                    .or_default()
+                    .insert(cache_key.to_owned());
+            }
             config
                 .profiles
                 .get_mut(profile_name)
@@ -461,7 +575,6 @@ fn commit_auth_profile(
     match result {
         Ok(()) => Ok(()),
         Err(error) if error.code == "auth_login_commit_conflict" => {
-            let mut guard = output_guard.clone();
             let winner_guard = winning_config
                 .as_ref()
                 .and_then(|config| {
@@ -477,27 +590,43 @@ fn commit_auth_profile(
                     .ok()
                 })
                 .map(|target| {
-                    TokenManager::profile_output_guard(
-                        &target,
-                        &runtime.environment,
-                        &runtime.paths.cache_dir,
-                    )
+                    TokenManager::profile_credential_output_guard(&target, &runtime.environment)
                 });
-            match winner_guard {
-                Some(Ok(winner_guard)) => guard.merge(&winner_guard),
-                Some(Err(guard_error)) => {
-                    if let Some(error_guard) = guard_error.output_guard() {
-                        guard.merge(error_guard);
-                    } else {
-                        guard.merge(&reltio_client::redaction::OutputGuard::deny_all());
-                    }
-                }
-                None => guard.merge(&reltio_client::redaction::OutputGuard::deny_all()),
-            }
+            let guard = match winner_guard {
+                Some(Ok(winner_guard)) => winner_guard,
+                Some(Err(guard_error)) => guard_error
+                    .output_guard()
+                    .cloned()
+                    .unwrap_or_else(reltio_client::redaction::OutputGuard::deny_all),
+                None => reltio_client::redaction::OutputGuard::deny_all(),
+            };
             Err(error.with_output_guard(guard))
         }
-        Err(error) => Err(error.with_output_guard(output_guard.clone())),
+        Err(error) => Err(error),
     }
+}
+
+fn validate_login_candidate_expiry(expires_at: Option<chrono::DateTime<Utc>>) -> Result<()> {
+    let Some(expires_at) = expires_at else {
+        return Err(ReltioError::auth(
+            "auth_token_expiry_missing",
+            "persisted access tokens require a declared expiry",
+        ));
+    };
+    if expires_at <= Utc::now() + TimeDelta::seconds(LOGIN_EXPIRY_SKEW_SECONDS) {
+        return Err(ReltioError::auth(
+            "auth_token_expiry_too_soon",
+            "the acquired token became unusable before login could commit",
+        )
+        .with_details(json!({
+            "expires_at": expires_at,
+            "minimum_remaining_seconds": LOGIN_EXPIRY_SKEW_SECONDS
+        }))
+        .with_hint(
+            "Acquire a token with more remaining lifetime before retrying authentication.",
+        ));
+    }
+    Ok(())
 }
 
 fn auth_command_canceled(
@@ -505,11 +634,14 @@ fn auth_command_canceled(
     local_state_committed: bool,
     output_guard: &reltio_client::redaction::OutputGuard,
     uninspected_provider_output: bool,
+    remote_outcome: AuthRemoteOutcome,
 ) -> ReltioError {
     let mut guard = output_guard.clone();
     if uninspected_provider_output {
         guard.merge(&reltio_client::redaction::OutputGuard::deny_all());
     }
+    let (remote_response_received, remote_request_completed, remote_operation_completed, state) =
+        auth_remote_outcome(remote_outcome);
     ReltioError::new(
         "request_canceled",
         ErrorCategory::Canceled,
@@ -517,27 +649,60 @@ fn auth_command_canceled(
     )
     .with_details(json!({
         "phase": phase,
-        "remote_response_received": false,
-        "remote_request_completed": Value::Null,
-        "remote_operation_completed": Value::Null,
-        "remote_operation_state": "authentication_completion_unknown",
+        "remote_response_received": remote_response_received,
+        "remote_request_completed": remote_request_completed,
+        "remote_operation_completed": remote_operation_completed,
+        "remote_operation_state": state,
         "local_state_committed": local_state_committed,
         "safe_to_replay": false
     }))
     .with_output_guard(guard)
 }
 
+fn auth_remote_outcome(remote_outcome: AuthRemoteOutcome) -> (Value, Value, Value, &'static str) {
+    match remote_outcome {
+        AuthRemoteOutcome::NotSent => (
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            "request_not_sent",
+        ),
+        AuthRemoteOutcome::Unknown => (
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            "authentication_completion_unknown",
+        ),
+        AuthRemoteOutcome::Succeeded => (
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            "authentication_succeeded",
+        ),
+    }
+}
+
 fn login_cache_error(
     mut error: ReltioError,
     output_guard: reltio_client::redaction::OutputGuard,
+    remote_outcome: AuthRemoteOutcome,
 ) -> ReltioError {
     let local_cache_restored = error.details["local_cache_restored"] == true;
+    let local_cache_committed = local_cache_restored.then_some(false);
+    let local_state_committed = local_cache_restored.then_some(false);
     let cache_details = std::mem::take(&mut error.details);
+    let (response_received, request_completed, operation_completed, operation_state) =
+        auth_remote_outcome(remote_outcome);
     error.details = json!({
         "cache_error": cache_details,
+        "remote_response_received": response_received,
+        "remote_request_completed": request_completed,
+        "remote_operation_completed": operation_completed,
+        "remote_operation_state": operation_state,
         "local_profile_changed": false,
         "local_cache_restored": local_cache_restored,
-        "local_state_committed": false,
+        "local_cache_committed": local_cache_committed,
+        "local_state_committed": local_state_committed,
         "safe_to_replay": false
     });
     error.hint = Some(
@@ -550,10 +715,17 @@ fn login_cache_error(
 fn login_profile_commit_error(
     mut error: ReltioError,
     output_guard: reltio_client::redaction::OutputGuard,
+    remote_outcome: AuthRemoteOutcome,
 ) -> ReltioError {
     let profile_details = std::mem::take(&mut error.details);
+    let (response_received, request_completed, operation_completed, operation_state) =
+        auth_remote_outcome(remote_outcome);
     error.details = json!({
         "profile_error": profile_details,
+        "remote_response_received": response_received,
+        "remote_request_completed": request_completed,
+        "remote_operation_completed": operation_completed,
+        "remote_operation_state": operation_state,
         "local_profile_committed": false,
         "local_cache_restored": true,
         "local_state_committed": false,
@@ -570,7 +742,10 @@ fn login_cache_rollback_error(
     profile_error: &ReltioError,
     rollback_error: &ReltioError,
     output_guard: reltio_client::redaction::OutputGuard,
+    remote_outcome: AuthRemoteOutcome,
 ) -> ReltioError {
+    let (response_received, request_completed, operation_completed, operation_state) =
+        auth_remote_outcome(remote_outcome);
     ReltioError::new(
         "auth_login_rollback_failed",
         ErrorCategory::Internal,
@@ -579,9 +754,14 @@ fn login_cache_rollback_error(
     .with_details(json!({
         "profile_error": profile_error.code,
         "rollback_error": rollback_error.code,
+        "remote_response_received": response_received,
+        "remote_request_completed": request_completed,
+        "remote_operation_completed": operation_completed,
+        "remote_operation_state": operation_state,
         "local_profile_committed": false,
         "local_cache_restored": false,
-        "local_state_committed": false,
+        "local_cache_committed": Value::Null,
+        "local_state_committed": Value::Null,
         "local_state_uncertain": true,
         "safe_to_replay": false
     }))
@@ -594,10 +774,17 @@ fn login_cache_rollback_error(
 fn login_commit_state_error(
     mut error: ReltioError,
     output_guard: reltio_client::redaction::OutputGuard,
+    remote_outcome: AuthRemoteOutcome,
 ) -> ReltioError {
     let commit_details = std::mem::take(&mut error.details);
+    let (response_received, request_completed, operation_completed, operation_state) =
+        auth_remote_outcome(remote_outcome);
     error.details = json!({
         "config_commit_error": commit_details,
+        "remote_response_received": response_received,
+        "remote_request_completed": request_completed,
+        "remote_operation_completed": operation_completed,
+        "remote_operation_state": operation_state,
         "local_profile_committed": true,
         "local_cache_committed": true,
         "local_state_committed": true,
@@ -613,10 +800,17 @@ fn login_commit_state_error(
 fn login_output_error(
     mut error: ReltioError,
     output_guard: reltio_client::redaction::OutputGuard,
+    remote_outcome: AuthRemoteOutcome,
 ) -> ReltioError {
     let output_details = std::mem::take(&mut error.details);
+    let (response_received, request_completed, operation_completed, operation_state) =
+        auth_remote_outcome(remote_outcome);
     error.details = json!({
         "output_error": output_details,
+        "remote_response_received": response_received,
+        "remote_request_completed": request_completed,
+        "remote_operation_completed": operation_completed,
+        "remote_operation_state": operation_state,
         "local_profile_committed": true,
         "local_cache_committed": true,
         "local_state_committed": true,
@@ -629,7 +823,33 @@ fn login_output_error(
     error.with_output_guard(output_guard)
 }
 
-fn status(runtime: &Runtime) -> Result<()> {
+fn login_post_commit_error(
+    mut error: ReltioError,
+    output_guard: reltio_client::redaction::OutputGuard,
+    remote_outcome: AuthRemoteOutcome,
+) -> ReltioError {
+    let post_commit_details = std::mem::take(&mut error.details);
+    let (response_received, request_completed, operation_completed, operation_state) =
+        auth_remote_outcome(remote_outcome);
+    error.details = json!({
+        "post_commit_error": post_commit_details,
+        "remote_response_received": response_received,
+        "remote_request_completed": request_completed,
+        "remote_operation_completed": operation_completed,
+        "remote_operation_state": operation_state,
+        "local_profile_committed": true,
+        "local_cache_committed": true,
+        "local_state_committed": true,
+        "safe_to_replay": false
+    });
+    error.hint = Some(
+        "Authentication committed locally; inspect `reltio auth status` and pending cleanup state instead of replaying login."
+            .to_owned(),
+    );
+    error.with_output_guard(output_guard)
+}
+
+async fn status(runtime: &Runtime) -> Result<()> {
     let started = Instant::now();
     let deadline = runtime.deadline_from(started)?;
     runtime.ensure_not_cancelled("before_auth_status", false)?;
@@ -637,26 +857,27 @@ fn status(runtime: &Runtime) -> Result<()> {
     let (status, output_guard) =
         match runtime.token_manager(&target, TokenManagerOptions::default()) {
             Ok(manager) => {
-                let output_guard = manager.output_guard()?;
-                let status = manager
-                    .status_until(deadline)
+                let output_guard = runtime
+                    .token_manager_output_guard(&manager, deadline)
+                    .await?;
+                let status = runtime
+                    .token_manager_status(&manager, deadline)
+                    .await
                     .map_err(|error| error.with_output_guard(output_guard.clone()))?;
                 (status, output_guard)
             }
             Err(error) if error.code == "auth_unconfigured" => {
                 let mut meta = Meta::new("auth.status").with_target(&target, Some("auth"));
                 meta.elapsed_ms = started.elapsed().as_millis();
-                return write_success_guarded(
-                    &json!({
-                        "configured": false,
-                        "provider": null,
-                        "cache_state": "not_applicable",
-                        "configuration_sources": target.sources
-                    }),
-                    &meta,
-                    runtime.render,
-                    &runtime.local_output_guard(),
-                );
+                let data = json!({
+                    "configured": false,
+                    "provider": null,
+                    "cache_state": "not_applicable",
+                    "configuration_sources": target.sources
+                });
+                return runtime
+                    .emit_success(&data, &meta, deadline, &runtime.environment_output_guard())
+                    .await;
             }
             Err(error) => return Err(error),
         };
@@ -672,20 +893,18 @@ fn status(runtime: &Runtime) -> Result<()> {
     runtime
         .ensure_not_cancelled("before_auth_status_output", false)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-    write_success_guarded(
-        &json!({
-            "configured": status.configured,
-            "provider": status.provider,
-            "source": status.source,
-            "cache_state": status.cache_state,
-            "expires_at": status.expires_at,
-            "environment_override": status.environment_override,
-            "configuration_sources": target.sources
-        }),
-        &meta,
-        runtime.render,
-        &output_guard,
-    )
+    let data = json!({
+        "configured": status.configured,
+        "provider": status.provider,
+        "source": status.source,
+        "cache_state": status.cache_state,
+        "expires_at": status.expires_at,
+        "environment_override": status.environment_override,
+        "configuration_sources": target.sources
+    });
+    runtime
+        .emit_success(&data, &meta, deadline, &output_guard)
+        .await
 }
 
 async fn check(runtime: &Runtime) -> Result<()> {
@@ -693,9 +912,12 @@ async fn check(runtime: &Runtime) -> Result<()> {
     let deadline = runtime.deadline_from(started)?;
     let (_, target) = runtime.config_and_target()?;
     let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
-    let mut output_guard = manager.output_guard()?;
-    let auth_status = manager
-        .status_until(deadline)
+    let mut output_guard = runtime
+        .token_manager_output_guard(&manager, deadline)
+        .await?;
+    let auth_status = runtime
+        .token_manager_status(&manager, deadline)
+        .await
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let entities = runtime
         .entities_client_until(&target, manager, deadline)
@@ -719,17 +941,15 @@ async fn check(runtime: &Runtime) -> Result<()> {
     meta.practice_coverage = Some(PracticeCoverage::Reviewed);
     meta.practice_ids
         .clone_from(&page.response.applied_practice_ids);
-    write_success_guarded(
-        &json!({
-            "valid": true,
-            "tenant_access": true,
-            "provider": auth_status.provider,
-            "sample_entities_returned": page.entities.len()
-        }),
-        &meta,
-        runtime.render,
-        &output_guard,
-    )
+    let data = json!({
+        "valid": true,
+        "tenant_access": true,
+        "provider": auth_status.provider,
+        "sample_entities_returned": page.entities.len()
+    });
+    runtime
+        .emit_success(&data, &meta, deadline, &output_guard)
+        .await
 }
 
 async fn reveal_token(runtime: &Runtime, show: bool) -> Result<()> {
@@ -752,7 +972,9 @@ async fn reveal_token(runtime: &Runtime, show: bool) -> Result<()> {
     let deadline = runtime.deadline_from(started)?;
     let (_, target) = runtime.config_and_target()?;
     let manager = runtime.token_manager(&target, TokenManagerOptions::default())?;
-    let manager_guard = manager.output_guard()?;
+    let manager_guard = runtime
+        .token_manager_output_guard(&manager, deadline)
+        .await?;
     let acquisition = manager.token_until(false, deadline);
     tokio::pin!(acquisition);
     let token = tokio::select! {
@@ -764,6 +986,7 @@ async fn reveal_token(runtime: &Runtime, show: bool) -> Result<()> {
                 false,
                 &manager_guard,
                 manager.can_reacquire(),
+                AuthRemoteOutcome::Unknown,
             ));
         }
     };
@@ -773,38 +996,117 @@ async fn reveal_token(runtime: &Runtime, show: bool) -> Result<()> {
             false,
             token.output_guard(),
             false,
+            token_remote_outcome(&token),
         ));
     }
-    let disclosure_guard = token.output_guard().excluding_secret(token.expose_secret());
-    if runtime.render.format == OutputFormat::Raw {
-        return write_raw_guarded(token.expose_secret().as_bytes(), true, &disclosure_guard);
-    }
-    let mut meta = Meta::new("auth.token").with_target(&target, Some("auth"));
-    meta.elapsed_ms = started.elapsed().as_millis();
-    meta.auth_source = Some(token.provider.clone());
-    meta.warnings
-        .push("stdout intentionally contains access-token material".to_owned());
-    write_success_guarded(
-        &json!({
+    let output_lease = runtime
+        .token_disclosure_output_guard_lease(&manager, &token, deadline)
+        .await?;
+    runtime
+        .ensure_not_cancelled("before_token_output", false)
+        .map_err(|error| error.with_output_guard(output_lease.output_guard().clone()))?;
+    let lease_disclosure_guard = output_lease.output_guard().clone();
+    let mut disclosure_guard = token.disclosure_output_guard().clone();
+    disclosure_guard.merge(&lease_disclosure_guard);
+    disclosure_guard.merge(&manager.non_disclosable_credential_output_guard()?);
+    let mut failure_guard = token.output_guard().clone();
+    failure_guard.merge(output_lease.output_guard());
+    failure_guard.merge(&manager.non_disclosable_credential_output_guard()?);
+    let prepared = if runtime.render.format == OutputFormat::Raw {
+        prepare_raw_guarded(token.expose_secret().as_bytes(), true, &disclosure_guard)?
+    } else {
+        let mut meta = Meta::new("auth.token").with_target(&target, Some("auth"));
+        meta.elapsed_ms = started.elapsed().as_millis();
+        meta.auth_source = Some(token.provider.clone());
+        meta.warnings
+            .push("stdout intentionally contains access-token material".to_owned());
+        prepare_success_guarded(
+            &json!({
             "access_token": token.expose_secret(),
             "token_type": "Bearer",
             "expires_at": token.expires_at
-        }),
-        &meta,
-        runtime.render,
-        &disclosure_guard,
-    )
+            }),
+            &meta,
+            runtime.render,
+            &disclosure_guard,
+        )?
+    };
+    runtime
+        .emit_prepared_disclosing_with_owner(
+            prepared,
+            output_lease,
+            &lease_disclosure_guard,
+            deadline,
+            failure_guard,
+        )
+        .await
 }
 
-fn logout(runtime: &Runtime) -> Result<()> {
+async fn logout(runtime: &Runtime) -> Result<()> {
     let started = Instant::now();
     let deadline = runtime.deadline_from(started)?;
-    let (removed, mut output_guard) = TokenManager::clear_local_cache_until(
+    let cache_lease = TokenManager::clear_local_cache_until(
         &runtime.paths.cache_dir,
         deadline,
         &runtime.cancellation,
     )?;
+    let removed = cache_lease.removed();
+    let mut output_guard = cache_lease.output_guard().clone();
     let cleared = removed > 0;
+    let mut imported_bearer_profiles_cleared = 0_usize;
+    let mut pending_bearer_cleanups_cleared = false;
+    if runtime.store.load().is_ok_and(|config| {
+        !config.pending_imported_bearer_cleanups.is_empty()
+            || config
+                .profiles
+                .values()
+                .any(|profile| profile.auth.method == Some(AuthMethod::Bearer))
+    }) {
+        let cleared_configuration = runtime
+            .store
+            .modify_until(
+                deadline,
+                || runtime.cancellation.is_cancelled(),
+                |config| {
+                    let had_pending = !config.pending_imported_bearer_cleanups.is_empty();
+                    let mut count = 0_usize;
+                    for profile in config.profiles.values_mut() {
+                        if profile.auth.method == Some(AuthMethod::Bearer) {
+                            profile.auth = AuthProfile::default();
+                            count = count.saturating_add(1);
+                        }
+                    }
+                    config.pending_imported_bearer_cleanups.clear();
+                    Ok((count, had_pending))
+                },
+            )
+            .map_err(|mut error| {
+                let config_committed = error.details["committed"].as_bool();
+                let config_error = std::mem::take(&mut error.details);
+                error.details = json!({
+                    "config_error": config_error,
+                    "local_cache_cleared": cleared,
+                    "local_config_committed": config_committed,
+                    "local_state_committed": if cleared { Value::Bool(true) } else { config_committed.map_or(Value::Null, Value::Bool) },
+                    "safe_to_replay": true
+                });
+                error.with_output_guard(output_guard.clone())
+            })?;
+        imported_bearer_profiles_cleared = cleared_configuration.0;
+        pending_bearer_cleanups_cleared = cleared_configuration.1;
+    }
+    cache_lease.release().map_err(|mut error| {
+        let cache_error = std::mem::take(&mut error.details);
+        error.details = json!({
+            "cache_error": cache_error,
+            "local_cache_cleared": cleared,
+            "imported_bearer_profiles_cleared": imported_bearer_profiles_cleared,
+            "pending_bearer_cleanups_cleared": pending_bearer_cleanups_cleared,
+            "local_state_committed": cleared || imported_bearer_profiles_cleared > 0 || pending_bearer_cleanups_cleared,
+            "safe_to_replay": true
+        });
+        error.with_output_guard(output_guard.clone())
+    })?;
     let mut meta = Meta::new("auth.logout");
     match runtime.config_and_target() {
         Ok((_, target)) => meta = meta.with_target(&target, Some("auth")),
@@ -820,35 +1122,44 @@ fn logout(runtime: &Runtime) -> Result<()> {
                 .to_owned(),
         );
     }
-    output_guard.merge(&reltio_client::redaction::OutputGuard::from_known_secrets(
-        &["RELTIO_ACCESS_TOKEN", "RELTIO_CLIENT_SECRET"]
-            .into_iter()
-            .filter_map(|name| runtime.environment.get(name))
-            .collect::<Vec<_>>(),
-    ));
+    output_guard.merge(&runtime.environment_output_guard());
     runtime
         .ensure_not_cancelled("before_auth_logout_output", cleared)
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-    write_success_guarded(
-        &json!({
-            "local_cache_cleared": cleared,
-            "remote_revocation_attempted": false,
-            "environment_token_cleared": false
-        }),
-        &meta,
-        runtime.render,
-        &output_guard,
-    )
-    .map_err(|mut error| {
-        error.details = json!({
-            "local_cache_cleared": cleared,
-            "remote_revocation_attempted": false,
-            "output_omitted": true,
-            "safe_to_replay": false,
-            "local_state_committed": cleared
-        });
-        error
-    })
+    let data = json!({
+        "local_cache_cleared": cleared,
+        "imported_bearer_profiles_cleared": imported_bearer_profiles_cleared,
+        "pending_bearer_cleanups_cleared": pending_bearer_cleanups_cleared,
+        "remote_revocation_attempted": false,
+        "environment_token_cleared": false
+    });
+    runtime
+        .emit_success(&data, &meta, deadline, &output_guard)
+        .await
+        .map_err(|mut error| {
+            let output_error = std::mem::take(&mut error.details);
+            error.details = json!({
+                "output_error": output_error,
+                "local_cache_cleared": cleared,
+                "imported_bearer_profiles_cleared": imported_bearer_profiles_cleared,
+                "pending_bearer_cleanups_cleared": pending_bearer_cleanups_cleared,
+                "remote_revocation_attempted": false,
+                "output_omitted": true,
+                "safe_to_replay": true,
+                "local_state_committed": cleared || imported_bearer_profiles_cleared > 0 || pending_bearer_cleanups_cleared
+            });
+            error
+        })
+}
+
+fn token_remote_outcome(token: &AccessToken) -> AuthRemoteOutcome {
+    if token.cache_hit || matches!(token.provider.as_str(), "environment" | "bearer") {
+        AuthRemoteOutcome::NotSent
+    } else if token.provider == "client_credentials" {
+        AuthRemoteOutcome::Succeeded
+    } else {
+        AuthRemoteOutcome::Unknown
+    }
 }
 
 fn selected_profile(runtime: &Runtime, config: &ConfigFile) -> Result<String> {
@@ -926,7 +1237,11 @@ fn validate_login_arguments(arguments: &AuthLoginArgs) -> Result<()> {
     Ok(())
 }
 
-fn read_secret_from_stdin(label: &str) -> Result<SecretString> {
+async fn read_secret_from_stdin(
+    label: &'static str,
+    deadline: Instant,
+    cancellation: &reltio_client::cancellation::CancellationToken,
+) -> Result<SecretString> {
     if io::stdin().is_terminal() {
         return Err(ReltioError::usage(
             "secret_stdin_is_tty",
@@ -934,6 +1249,38 @@ fn read_secret_from_stdin(label: &str) -> Result<SecretString> {
         )
         .with_hint("Pipe the secret or omit the stdin flag to use a hidden prompt."));
     }
+    let (sender, mut read) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("reltio-secret-input".to_owned())
+        .spawn(move || {
+            let _ = sender.send(read_secret_from_stdin_blocking(label));
+        })
+        .map_err(|error| {
+            ReltioError::io("failed to start the secret-input reader", &error)
+                .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+        })?;
+    let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(timeout);
+    tokio::select! {
+        biased;
+        result = &mut read => result.map_err(|_| {
+            ReltioError::internal("the secret-input thread terminated without a result")
+                .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+        })?,
+        () = cancellation.cancelled() => Err(secret_input_control_error(
+            "request_canceled",
+            ErrorCategory::Canceled,
+            "credential input was canceled",
+        )),
+        () = &mut timeout => Err(secret_input_control_error(
+            "request_timeout",
+            ErrorCategory::Timeout,
+            "credential input exceeded the overall timeout",
+        )),
+    }
+}
+
+fn read_secret_from_stdin_blocking(label: &str) -> Result<SecretString> {
     let mut bytes = Vec::new();
     io::stdin()
         .take(SECRET_INPUT_LIMIT + 1)
@@ -964,6 +1311,349 @@ fn read_secret_from_stdin(label: &str) -> Result<SecretString> {
     Ok(secret.into())
 }
 
+#[cfg(not(any(unix, windows)))]
+async fn read_hidden_secret(
+    deadline: Instant,
+    cancellation: &reltio_client::cancellation::CancellationToken,
+) -> Result<String> {
+    let (sender, mut read) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("reltio-hidden-input".to_owned())
+        .spawn(move || {
+            let _ = sender.send(rpassword::read_password());
+        })
+        .map_err(|error| {
+            ReltioError::io("failed to start the hidden-input reader", &error)
+                .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+        })?;
+    let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(timeout);
+    tokio::select! {
+        biased;
+        result = &mut read => result
+            .map_err(|_| {
+                ReltioError::internal("the hidden-input thread terminated without a result")
+                    .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+            })?
+            .map_err(|error| {
+                ReltioError::io("failed to read hidden client secret", &error)
+                    .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+            }),
+        () = cancellation.cancelled() => Err(secret_input_control_error(
+            "request_canceled",
+            ErrorCategory::Canceled,
+            "hidden credential input was canceled",
+        )),
+        () = &mut timeout => Err(secret_input_control_error(
+            "request_timeout",
+            ErrorCategory::Timeout,
+            "hidden credential input exceeded the overall timeout",
+        )),
+    }
+}
+
+#[cfg(windows)]
+async fn read_hidden_secret(
+    deadline: Instant,
+    cancellation: &reltio_client::cancellation::CancellationToken,
+) -> Result<String> {
+    let cancellation = cancellation.clone();
+    let (sender, read) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("reltio-hidden-input".to_owned())
+        .spawn(move || {
+            let result = reltio_windows_security::read_hidden_console_line_until(
+                deadline,
+                SECRET_INPUT_LIMIT,
+                || cancellation.is_cancelled(),
+            )
+            .map_err(|error| map_windows_hidden_input_error(&error));
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            ReltioError::io("failed to start the hidden-input reader", &error)
+                .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+        })?;
+    read.await.map_err(|_| {
+        ReltioError::internal("the hidden-input thread terminated without a result")
+            .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+    })?
+}
+
+#[cfg(windows)]
+fn map_windows_hidden_input_error(error: &reltio_windows_security::Error) -> ReltioError {
+    use reltio_windows_security::ErrorKind;
+
+    let mapped = match error.kind() {
+        ErrorKind::Canceled => secret_input_control_error(
+            "request_canceled",
+            ErrorCategory::Canceled,
+            "hidden credential input was canceled",
+        ),
+        ErrorKind::TimedOut => secret_input_control_error(
+            "request_timeout",
+            ErrorCategory::Timeout,
+            "hidden credential input exceeded the overall timeout",
+        ),
+        ErrorKind::TooLarge => ReltioError::usage(
+            "secret_input_too_large",
+            "hidden client secret exceeds the 1 MB local safety limit",
+        ),
+        ErrorKind::InvalidUnicode => ReltioError::usage(
+            "secret_input_not_utf8",
+            "hidden client secret contains invalid Unicode input",
+        ),
+        ErrorKind::ConsoleUnavailable => ReltioError::usage(
+            "hidden_input_unavailable",
+            "a native Windows console is required for hidden credential input",
+        )
+        .with_hint("Use --secret-stdin or --secret-file outside a native Windows console."),
+        ErrorKind::InputCleanup => ReltioError::new(
+            "hidden_input_cleanup_failed",
+            ErrorCategory::Safety,
+            "abandoned Windows credential input could not be cleared safely",
+        ),
+        _ => {
+            if let Some(source) = error.io_error() {
+                ReltioError::io("failed to read hidden client secret", source)
+            } else {
+                ReltioError::new(
+                    "hidden_input_failed",
+                    ErrorCategory::Internal,
+                    "failed to read hidden client secret",
+                )
+            }
+        }
+    };
+    mapped.with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+}
+
+#[cfg(unix)]
+async fn read_hidden_secret(
+    deadline: Instant,
+    cancellation: &reltio_client::cancellation::CancellationToken,
+) -> Result<String> {
+    let cancellation = cancellation.clone();
+    let (sender, read) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("reltio-hidden-input".to_owned())
+        .spawn(move || {
+            let _ = sender.send(read_hidden_secret_unix_from(
+                Path::new("/dev/tty"),
+                deadline,
+                &cancellation,
+            ));
+        })
+        .map_err(|error| {
+            ReltioError::io("failed to start the hidden-input reader", &error)
+                .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+        })?;
+    read.await.map_err(|_| {
+        ReltioError::internal("the hidden-input thread terminated without a result")
+            .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+    })?
+}
+
+#[cfg(unix)]
+fn read_hidden_secret_unix_from(
+    terminal_path: &Path,
+    deadline: Instant,
+    cancellation: &reltio_client::cancellation::CancellationToken,
+) -> Result<String> {
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::AsFd as _;
+
+    use rustix::fs::OFlags;
+    use rustix::termios::{LocalModes, OptionalActions, Termios};
+
+    struct TerminalRestore {
+        terminal: File,
+        original: Termios,
+        restored: bool,
+    }
+
+    impl TerminalRestore {
+        fn restore_with(&mut self, action: OptionalActions) -> io::Result<()> {
+            if !self.restored {
+                rustix::termios::tcsetattr(&self.terminal, action, &self.original)
+                    .map_err(io::Error::from)?;
+                self.restored = true;
+            }
+            Ok(())
+        }
+
+        fn restore(&mut self) -> io::Result<()> {
+            self.restore_with(OptionalActions::Now)
+        }
+    }
+
+    impl Drop for TerminalRestore {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+
+    let mut terminal = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(terminal_path)
+        .map_err(|error| {
+            hidden_input_io_error("failed to open the controlling terminal", &error)
+        })?;
+    let original = rustix::termios::tcgetattr(&terminal).map_err(|error| {
+        hidden_input_io_error(
+            "failed to inspect terminal input settings",
+            &io::Error::from(error),
+        )
+    })?;
+    let mut restore = TerminalRestore {
+        terminal: terminal.try_clone().map_err(|error| {
+            hidden_input_io_error("failed to retain terminal restoration state", &error)
+        })?,
+        original: original.clone(),
+        restored: false,
+    };
+    let mut hidden = original.clone();
+    hidden
+        .local_modes
+        .remove(LocalModes::ECHO | LocalModes::ECHONL);
+    rustix::termios::tcsetattr(&terminal, OptionalActions::Now, &hidden).map_err(|error| {
+        hidden_input_io_error(
+            "failed to hide terminal credential input",
+            &io::Error::from(error),
+        )
+    })?;
+    let read_result = (|| -> Result<String> {
+        let flags = rustix::fs::fcntl_getfl(terminal.as_fd()).map_err(|error| {
+            hidden_input_io_error(
+                "failed to inspect terminal input flags",
+                &io::Error::from(error),
+            )
+        })?;
+        rustix::fs::fcntl_setfl(terminal.as_fd(), flags | OFlags::NONBLOCK).map_err(|error| {
+            hidden_input_io_error(
+                "failed to bound terminal credential input",
+                &io::Error::from(error),
+            )
+        })?;
+
+        let mut bytes = Zeroizing::new(Vec::new());
+        let mut buffer = [0_u8; 256];
+        loop {
+            if cancellation.is_cancelled() {
+                break Err(secret_input_control_error(
+                    "request_canceled",
+                    ErrorCategory::Canceled,
+                    "hidden credential input was canceled",
+                ));
+            }
+            if Instant::now() >= deadline {
+                break Err(secret_input_control_error(
+                    "request_timeout",
+                    ErrorCategory::Timeout,
+                    "hidden credential input exceeded the overall timeout",
+                ));
+            }
+            match terminal.read(&mut buffer) {
+                Ok(0) => {
+                    break Err(hidden_input_io_error(
+                        "failed to read hidden client secret",
+                        &io::Error::new(io::ErrorKind::UnexpectedEof, "terminal input ended"),
+                    ));
+                }
+                Ok(read) => {
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if bytes.len() as u64 > SECRET_INPUT_LIMIT {
+                        break Err(ReltioError::usage(
+                            "secret_input_too_large",
+                            "hidden client secret exceeds the 1 MB local safety limit",
+                        )
+                        .with_output_guard(reltio_client::redaction::OutputGuard::deny_all()));
+                    }
+                    if let Some(line_end) =
+                        bytes.iter().position(|byte| matches!(byte, b'\r' | b'\n'))
+                    {
+                        bytes.truncate(line_end);
+                        break String::from_utf8(bytes.to_vec()).map_err(|_| {
+                            ReltioError::usage(
+                                "secret_input_not_utf8",
+                                "hidden client secret must be UTF-8",
+                            )
+                            .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+                        });
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => {
+                    break Err(hidden_input_io_error(
+                        "failed to read hidden client secret",
+                        &error,
+                    ));
+                }
+            }
+        }
+    })();
+    let restore_result = if read_result.is_err() {
+        restore
+            .restore_with(OptionalActions::Flush)
+            .map_err(|error| {
+                hidden_input_cleanup_error(
+                    "terminal input could not be atomically flushed and restored",
+                    &error,
+                )
+            })
+    } else {
+        restore.restore().map_err(|error| {
+            hidden_input_cleanup_error("terminal input settings could not be restored", &error)
+        })
+    };
+    match (read_result, restore_result) {
+        (_, Err(error)) => Err(error),
+        (result, Ok(())) => result,
+    }
+}
+
+#[cfg(unix)]
+fn hidden_input_io_error(message: &'static str, error: &io::Error) -> ReltioError {
+    ReltioError::io(message, error)
+        .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+}
+
+#[cfg(unix)]
+fn hidden_input_cleanup_error(message: &'static str, error: &io::Error) -> ReltioError {
+    ReltioError::new(
+        "hidden_input_cleanup_failed",
+        ErrorCategory::Safety,
+        message,
+    )
+    .with_details(json!({ "reason": format!("{:?}", error.kind()) }))
+    .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+}
+
+fn secret_input_control_error(
+    code: &'static str,
+    category: ErrorCategory,
+    message: &'static str,
+) -> ReltioError {
+    ReltioError::new(code, category, message)
+        .with_details(json!({
+            "phase": "credential_input",
+            "remote_response_received": false,
+            "remote_request_completed": false,
+            "remote_operation_completed": false,
+            "remote_operation_state": "request_not_sent",
+            "local_state_committed": false,
+            "safe_to_replay": true
+        }))
+        .with_output_guard(reltio_client::redaction::OutputGuard::deny_all())
+}
+
 fn absolute_local_path(path: &Path, require_absolute: bool, label: &str) -> Result<PathBuf> {
     if require_absolute && !path.is_absolute() {
         return Err(ReltioError::usage(
@@ -986,5 +1676,139 @@ fn absolute_local_path(path: &Path, require_absolute: bool, label: &str) -> Resu
         std::env::current_dir()
             .map(|current| current.join(path))
             .map_err(|error| ReltioError::io("failed to resolve a local path", &error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_metadata_preserves_known_authentication_completion() {
+        let error = auth_command_canceled(
+            "before_auth_login_output",
+            true,
+            &reltio_client::redaction::OutputGuard::default(),
+            false,
+            AuthRemoteOutcome::Succeeded,
+        );
+
+        assert_eq!(error.details["remote_response_received"], true);
+        assert_eq!(error.details["remote_request_completed"], true);
+        assert_eq!(error.details["remote_operation_completed"], true);
+        assert_eq!(
+            error.details["remote_operation_state"],
+            "authentication_succeeded"
+        );
+        assert_eq!(error.details["local_state_committed"], true);
+        assert_eq!(error.details["safe_to_replay"], false);
+    }
+
+    #[test]
+    fn local_auth_cancellation_does_not_claim_a_remote_request() {
+        let error = auth_command_canceled(
+            "token_cache_snapshot",
+            false,
+            &reltio_client::redaction::OutputGuard::default(),
+            false,
+            AuthRemoteOutcome::NotSent,
+        );
+
+        assert_eq!(error.details["remote_response_received"], false);
+        assert_eq!(error.details["remote_request_completed"], false);
+        assert_eq!(error.details["remote_operation_completed"], false);
+        assert_eq!(error.details["remote_operation_state"], "request_not_sent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_input_timeout_flushes_pending_input_and_restores_terminal_settings() {
+        use std::ffi::OsStr;
+        use std::fs::OpenOptions;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+        let master =
+            openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("open pseudoterminal master");
+        grantpt(&master).expect("grant pseudoterminal");
+        unlockpt(&master).expect("unlock pseudoterminal");
+        let slave_name = ptsname(&master, Vec::new()).expect("pseudoterminal slave path");
+        let slave_path = Path::new(OsStr::from_bytes(slave_name.as_bytes()));
+        let mut slave = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(slave_path)
+            .expect("open pseudoterminal slave");
+        let before = rustix::termios::tcgetattr(&slave).expect("initial terminal settings");
+        assert!(
+            before
+                .local_modes
+                .contains(rustix::termios::LocalModes::ICANON),
+            "the flush regression requires canonical input"
+        );
+        let reader_path = slave_path.to_path_buf();
+        let reader = std::thread::spawn(move || {
+            read_hidden_secret_unix_from(
+                &reader_path,
+                Instant::now() + Duration::from_millis(250),
+                &reltio_client::cancellation::CancellationToken::new(),
+            )
+        });
+
+        let mut echo_disabled = false;
+        for _ in 0..100 {
+            let current = rustix::termios::tcgetattr(&slave).expect("inspect hidden settings");
+            if !current
+                .local_modes
+                .contains(rustix::termios::LocalModes::ECHO)
+            {
+                echo_disabled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(echo_disabled, "hidden-input reader did not disable echo");
+        assert_eq!(
+            rustix::io::write(&master, b"abandoned-secret").expect("write pending input"),
+            b"abandoned-secret".len()
+        );
+
+        let error = reader
+            .join()
+            .expect("hidden-input reader thread completes")
+            .expect_err("partial hidden input reaches its deadline");
+
+        assert_eq!(error.code, "request_timeout");
+        let after = rustix::termios::tcgetattr(&slave).expect("restored terminal settings");
+        assert_eq!(format!("{after:?}"), format!("{before:?}"));
+
+        assert_eq!(
+            rustix::io::write(&master, b"\n").expect("finish the post-timeout line"),
+            1
+        );
+        let mut line = [0_u8; 64];
+        let read = slave.read(&mut line).expect("read post-timeout line");
+        assert_eq!(
+            &line[..read],
+            b"\n",
+            "partial credential input remained queued after echo restoration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_input_cleanup_failures_are_safety_errors() {
+        let source = io::Error::other("synthetic terminal cleanup failure");
+        let error = hidden_input_cleanup_error("terminal cleanup failed", &source);
+
+        assert_eq!(error.code, "hidden_input_cleanup_failed");
+        assert_eq!(error.category, ErrorCategory::Safety);
+        assert!(
+            !error
+                .output_guard()
+                .expect("cleanup failure denies output")
+                .permits(b"unrelated-output")
+        );
     }
 }

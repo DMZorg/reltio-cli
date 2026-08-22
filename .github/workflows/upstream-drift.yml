@@ -4,6 +4,7 @@ on:
   schedule:
     - cron: "17 21 * * 3,5"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -12,6 +13,13 @@ jobs:
   compare:
     runs-on: ubuntu-latest
     steps:
+      - name: Initialize drift evidence
+        run: |
+          {
+            echo '# Reltio documentation drift report'
+            echo
+            echo 'Status: the live drift comparison did not start. Release readiness is blocked.'
+          } > "$RUNNER_TEMP/reltio-documentation-drift.md"
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -21,30 +29,420 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          reviewed="$(awk '/^  commit:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_release="$(awk '/^  release_notes_through:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_release_family="$(awk '/^  family:/ { print $2; exit }' docs/upstream.lock.yaml | tr -d '"')"
-          reviewed_release_page_count="$(awk '/^  page_count:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_release_urls="$(awk '/^  page_url_set_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_release_state="$(awk '/^  page_state_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_deprecation_count="$(awk '/^  notice_count:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_deprecations="$(awk '/^  notice_url_set_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_deprecation_state="$(awk '/^  notice_state_sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_openapi_url="$(awk '/^    url: https:\/\/developer\.reltio\.com\/swagger\// { print $2; exit }' docs/upstream.lock.yaml)"
-          reviewed_openapi_sha="$(awk '/^    sha256:/ { print $2; exit }' docs/upstream.lock.yaml)"
-          latest="$(curl --fail --silent --show-error \
+          report="$RUNNER_TEMP/reltio-documentation-drift.md"
+          report_complete=0
+          record_early_failure() {
+            local status="$?"
+            if (( status != 0 && report_complete == 0 )); then
+              {
+                echo '# Reltio documentation drift report'
+                echo
+                echo 'Status: the live drift comparison failed before completion. Release readiness is blocked.'
+                echo
+                echo 'Inspect the workflow log for the failed source, transport, parse, or locked-operation check.'
+              } > "${report}"
+              cat "${report}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          trap record_early_failure EXIT
+          lock_state="$(ruby -ryaml -rjson -rdate -rtime -e '
+          data = YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [Date, Time], aliases: false)
+          openapi = data.fetch("openapi")
+          abort "exactly one OpenAPI source is required" unless openapi.length == 1
+           source = openapi.fetch(0)
+           puts JSON.generate({
+             content_fingerprint_version: data.fetch("content_fingerprint_version"),
+             corpus_repository: data.dig("corpus", "repository"),
+             reviewed: data.dig("corpus", "commit"),
+             corpus_generated_at: data.dig("corpus", "generated_at").iso8601,
+             reviewed_release: data.dig("review", "release_notes_through"),
+             review_language: data.dig("review", "language"),
+             release_family: data.dig("release_notes", "family"),
+             release_sitemap_url: data.dig("release_notes", "sitemap_url"),
+            release_page_count: data.dig("release_notes", "page_count"),
+            release_urls: data.dig("release_notes", "page_url_set_sha256"),
+            release_state: data.dig("release_notes", "page_state_sha256"),
+            release_content: data.dig("release_notes", "page_content_sha256"),
+            release_content_sources: data.dig("release_notes", "page_content_sources"),
+             deprecation_count: data.dig("deprecations", "notice_count"),
+             deprecation_index_url: data.dig("deprecations", "index_url"),
+             deprecation_sitemap_url: data.dig("deprecations", "sitemap_url"),
+            deprecation_index_content: data.dig("deprecations", "index_content_sha256"),
+            deprecation_index_link_count: data.dig("deprecations", "index_link_count"),
+            deprecation_index_links: data.dig("deprecations", "index_link_url_set_sha256"),
+            deprecation_index_link_urls: data.dig("deprecations", "index_links"),
+            deprecations: data.dig("deprecations", "notice_url_set_sha256"),
+            deprecation_state: data.dig("deprecations", "notice_state_sha256"),
+            deprecation_content: data.dig("deprecations", "notice_content_sha256"),
+            deprecation_content_sources: data.dig("deprecations", "notice_content_sources"),
+            practice_source_count: data.dig("review", "practice_source_count"),
+            practice_source_urls: data.dig("review", "practice_source_url_set_sha256"),
+            practice_source_content: data.dig("review", "practice_source_content_sha256"),
+            practice_content_sources: data.dig("review", "practice_content_sources"),
+            openapi_url: source.fetch("url"),
+             openapi_sha: source.fetch("sha256"),
+             openapi_retrieved_at: source.fetch("retrieved_at").iso8601,
+             openapi_info_version: source.fetch("info_version"),
+             openapi_operations: source.fetch("operations")
+          })
+          ' docs/upstream.lock.yaml)"
+          practice_state="$(ruby -ryaml -rjson -rdate -e '
+          data = YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [Date, Time], aliases: false)
+          practices = data.fetch("practices")
+          puts JSON.generate({
+            source_urls: practices.map { |practice| practice.dig("source", "url") }.compact.uniq.sort,
+            claims: practices.map { |practice| {
+              source_url: practice.dig("source", "url"),
+              practice_id: practice.fetch("id"),
+              commands: practice.fetch("commands")
+            } }
+           })
+           ' docs/reltio-api-practices.yaml)"
+          reviewed_content_fingerprint_version="$(jq -r '.content_fingerprint_version' <<< "${lock_state}")"
+          if [[ "${reviewed_content_fingerprint_version}" != 2 ]]; then
+            echo "unsupported documentation content fingerprint version: ${reviewed_content_fingerprint_version}" >&2
+            exit 1
+          fi
+          reviewed_corpus_repository="$(jq -r '.corpus_repository' <<< "${lock_state}")"
+          reviewed="$(jq -r '.reviewed' <<< "${lock_state}")"
+          reviewed_corpus_generated_at="$(jq -r '.corpus_generated_at' <<< "${lock_state}")"
+          reviewed_release="$(jq -r '.reviewed_release' <<< "${lock_state}")"
+          reviewed_language="$(jq -r '.review_language' <<< "${lock_state}")"
+          reviewed_release_family="$(jq -r '.release_family' <<< "${lock_state}")"
+          reviewed_release_sitemap_url="$(jq -r '.release_sitemap_url' <<< "${lock_state}")"
+          reviewed_release_page_count="$(jq -r '.release_page_count' <<< "${lock_state}")"
+          reviewed_release_urls="$(jq -r '.release_urls' <<< "${lock_state}")"
+          reviewed_release_state="$(jq -r '.release_state' <<< "${lock_state}")"
+          reviewed_release_content="$(jq -r '.release_content' <<< "${lock_state}")"
+          reviewed_deprecation_count="$(jq -r '.deprecation_count' <<< "${lock_state}")"
+          reviewed_deprecation_index_url="$(jq -r '.deprecation_index_url' <<< "${lock_state}")"
+          reviewed_deprecation_sitemap_url="$(jq -r '.deprecation_sitemap_url' <<< "${lock_state}")"
+          reviewed_deprecation_index_content="$(jq -r '.deprecation_index_content' <<< "${lock_state}")"
+          reviewed_deprecation_index_link_count="$(jq -r '.deprecation_index_link_count' <<< "${lock_state}")"
+          reviewed_deprecation_index_links="$(jq -r '.deprecation_index_links' <<< "${lock_state}")"
+          reviewed_deprecations="$(jq -r '.deprecations' <<< "${lock_state}")"
+          reviewed_deprecation_state="$(jq -r '.deprecation_state' <<< "${lock_state}")"
+          reviewed_deprecation_content="$(jq -r '.deprecation_content' <<< "${lock_state}")"
+          reviewed_practice_source_count="$(jq -r '.practice_source_count' <<< "${lock_state}")"
+          reviewed_practice_source_urls="$(jq -r '.practice_source_urls' <<< "${lock_state}")"
+          reviewed_practice_source_content="$(jq -r '.practice_source_content' <<< "${lock_state}")"
+          reviewed_openapi_url="$(jq -r '.openapi_url' <<< "${lock_state}")"
+          reviewed_openapi_sha="$(jq -r '.openapi_sha' <<< "${lock_state}")"
+          reviewed_openapi_retrieved_at="$(jq -r '.openapi_retrieved_at' <<< "${lock_state}")"
+          reviewed_openapi_info_version="$(jq -r '.openapi_info_version' <<< "${lock_state}")"
+          reviewed_openapi_operations="$(jq -c '.openapi_operations' <<< "${lock_state}")"
+          if [[ "${reviewed_corpus_repository}" != 'https://github.com/reltio-ai/reltio-ai-ready-docs' || "${reviewed_language}" != 'en' || "${reviewed_deprecation_sitemap_url}" != "${reviewed_release_sitemap_url}" ]]; then
+            echo 'upstream lock uses an unapproved repository, language, or sitemap' >&2
+            exit 1
+          fi
+          ruby -rtime -e '
+          now = Time.now
+          ARGV.each do |value|
+            parsed = Time.iso8601(value)
+            abort "future provenance timestamp: #{value}" if parsed > now
+          end
+          ' "${reviewed_corpus_generated_at}" "${reviewed_openapi_retrieved_at}"
+          jq -r '.deprecation_content_sources | sort_by(.url)[] | [.url, .sha256] | @tsv' <<< "${lock_state}" > "$RUNNER_TEMP/reltio-locked-deprecations-content.tsv"
+          jq -r '.release_content_sources | sort_by(.url)[] | [.url, .sha256] | @tsv' <<< "${lock_state}" > "$RUNNER_TEMP/reltio-locked-release-notes-content.tsv"
+          jq -r '.practice_content_sources | sort_by(.url)[] | [.url, .sha256] | @tsv' <<< "${lock_state}" > "$RUNNER_TEMP/reltio-locked-practice-sources-content.tsv"
+          jq -r '.deprecation_index_link_urls | sort[]' <<< "${lock_state}" > "$RUNNER_TEMP/reltio-locked-deprecation-index-links.txt"
+          source_diff="$RUNNER_TEMP/reltio-content-source-diff.txt"
+          changed_urls="$RUNNER_TEMP/reltio-changed-source-urls.txt"
+          : > "${source_diff}"
+          : > "${changed_urls}"
+          content_manifest_drift=0
+          index_link_drift=0
+          index_reconciliation_drift=0
+          mapfile -t practice_source_urls < <(jq -r '.source_urls[]' <<< "${practice_state}")
+          secure_curl=(--fail --location --silent --show-error --connect-timeout 15 --max-time 120 --proto '=https' --proto-redir '=https')
+          browser_curl=(
+            "${secure_curl[@]}"
+            --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+            --header 'Accept-Language: en-US,en;q=0.9'
+            --header 'Sec-Fetch-Dest: document'
+            --header 'Sec-Fetch-Mode: navigate'
+            --header 'Sec-Fetch-Site: none'
+            --header 'Upgrade-Insecure-Requests: 1'
+            --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
+          )
+          content_fingerprint() {
+            local label="$1"
+            shift
+            local manifest="${RUNNER_TEMP}/reltio-${label}-content.tsv"
+            local index=0
+            : > "${manifest}"
+            for source_url in "$@"; do
+              index=$((index + 1))
+              local page_path="${RUNNER_TEMP}/reltio-${label}-${index}.source"
+              local effective_url
+              effective_url="$(curl "${browser_curl[@]}" --output "${page_path}" --write-out '%{url_effective}' "${source_url}")"
+              if [[ "${effective_url}" == */upgrade_browser* || ( "${effective_url}" != https://docs.reltio.com/* && "${effective_url}" != https://developer.reltio.com/* ) ]]; then
+                echo "official documentation resolved to an unapproved location: ${source_url} -> ${effective_url}" >&2
+                return 1
+              fi
+              python3 -c '
+          import hashlib
+          import sys
+          from html.parser import HTMLParser
+          from urllib.parse import urljoin, urlsplit, urlunsplit
+
+          def first_href(attrs):
+              return next(
+                  ((value or "") for name, value in attrs if name.lower() == "href"),
+                  None,
+              )
+
+          class SemanticContent(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.base_url = effective_url
+                  self.base_seen = False
+                  self.hidden = 0
+                  self.parts = []
+                  self.links = set()
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() in {"script", "style", "noscript", "svg"}:
+                      self.hidden += 1
+                  if not self.hidden and tag.lower() == "base" and not self.base_seen:
+                      href = first_href(attrs)
+                      if href is not None:
+                          self.base_url = urljoin(effective_url, href)
+                          self.base_seen = True
+                      return
+                  if self.hidden or tag.lower() not in {"a", "area"}:
+                      return
+                  href = first_href(attrs)
+                  if href is None:
+                      return
+                  parsed = urlsplit(urljoin(self.base_url, href))
+                  if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                      return
+                  self.links.add(urlunsplit((
+                      parsed.scheme.lower(),
+                      parsed.netloc.lower(),
+                      parsed.path or "/",
+                      parsed.query,
+                      parsed.fragment,
+                  )))
+
+              def handle_endtag(self, tag):
+                  if tag.lower() in {"script", "style", "noscript", "svg"} and self.hidden:
+                      self.hidden -= 1
+
+              def handle_data(self, data):
+                  if not self.hidden:
+                      self.parts.append(data)
+
+          source_url, effective_url, source_path = sys.argv[1:]
+          source = open(source_path, encoding="utf-8").read()
+          parser = SemanticContent()
+          parser.feed(source)
+          normalized = " ".join(" ".join(parser.parts).split())
+          if not normalized:
+              raise SystemExit(f"official source has no normalized document text: {source_url}")
+          material = "\n".join([
+              f"effective-url:{effective_url}",
+              f"visible-text:{normalized}",
+              "link-targets:",
+              *sorted(parser.links),
+          ])
+          print(f"{source_url}\t{hashlib.sha256(material.encode()).hexdigest()}")
+          ' "${source_url}" "${effective_url}" "${page_path}" >> "${manifest}"
+            done
+            if [[ ! -s "${manifest}" ]]; then
+              echo "no official ${label} sources were fingerprinted" >&2
+              return 1
+            fi
+            sha256sum "${manifest}" | awk '{ print $1 }'
+          }
+          compare_content_manifest() {
+            local label="$1"
+            local locked="$2"
+            local current="$3"
+            if ! cmp -s "${locked}" "${current}"; then
+              content_manifest_drift=1
+              {
+                echo "## ${label}"
+                diff -u "${locked}" "${current}" || true
+                echo
+              } >> "${source_diff}"
+              python3 -c '
+          import sys
+
+          def load(path):
+              rows = {}
+              with open(path, encoding="utf-8") as source:
+                  for line in source:
+                      url, digest = line.rstrip("\n").split("\t", 1)
+                      rows[url] = digest
+              return rows
+
+          locked, current = map(load, sys.argv[1:])
+          for url in sorted(set(locked) | set(current)):
+              if locked.get(url) != current.get(url):
+                  print(url)
+          ' "${locked}" "${current}" >> "${changed_urls}"
+            fi
+          }
+          corpus_slug="${reviewed_corpus_repository#https://github.com/}"
+          latest="$(curl "${secure_curl[@]}" \
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/reltio-ai/reltio-ai-ready-docs/commits/main | jq -r .sha)"
+            "https://api.github.com/repos/${corpus_slug}/commits/main" | jq -r .sha)"
           release_url="https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/release-notes-at-a-glance/${reviewed_release_family}-release-notes/${reviewed_release_family}-bi-weekly-release-notes-rn"
-          deprecation_url='https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance'
-          deprecation_sitemap_url='https://docs.reltio.com/en/reltio/sitemap.xml'
-          release_page="$(curl --fail --location --silent --show-error "${release_url}")"
-          curl --fail --location --silent --show-error --output /dev/null "${deprecation_url}"
-          sitemap="$(curl --fail --location --silent --show-error "${deprecation_sitemap_url}")"
-          current_openapi_sha="$(curl --fail --location --silent --show-error "${reviewed_openapi_url}" | sha256sum | awk '{ print $1 }')"
+          deprecation_url="${reviewed_deprecation_index_url}"
+          deprecation_sitemap_url="${reviewed_deprecation_sitemap_url}"
+          release_page_path="${RUNNER_TEMP}/reltio-release-notes.html"
+          release_effective_url="$(curl "${browser_curl[@]}" --output "${release_page_path}" --write-out '%{url_effective}' "${release_url}")"
+          if [[ "${release_effective_url}" != https://docs.reltio.com/* || "${release_effective_url}" == */upgrade_browser* ]]; then
+            echo "official release notes resolved to an unapproved location: ${release_effective_url}" >&2
+            exit 1
+          fi
+          release_page="$(< "${release_page_path}")"
+          current_deprecation_index_content="$(content_fingerprint deprecation-index "${deprecation_url}")"
+          if [[ "${reviewed_deprecation_index_content}" != "${current_deprecation_index_content}" ]]; then
+            printf '%s\n' "${deprecation_url}" >> "${changed_urls}"
+          fi
+          index_link_state="$(python3 -c '
+          import hashlib
+          import json
+          import sys
+          from html.parser import HTMLParser
+          from urllib.parse import urljoin, urlsplit, urlunsplit
+
+          base_url, source_path, links_path, notice_path = sys.argv[1:]
+
+          def first_href(attrs):
+              return next(
+                  ((value or "") for name, value in attrs if name.lower() == "href"),
+                  None,
+              )
+
+          class Links(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.base_url = base_url
+                  self.base_seen = False
+                  self.urls = set()
+                  self.notice_urls = set()
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "base" and not self.base_seen:
+                      href = first_href(attrs)
+                      if href is not None:
+                          self.base_url = urljoin(base_url, href)
+                          self.base_seen = True
+                      return
+                  if tag.lower() not in {"a", "area"}:
+                      return
+                  href = first_href(attrs)
+                  if href is None:
+                      return
+                  parsed = urlsplit(urljoin(self.base_url, href))
+                  if (parsed.scheme == "https"
+                          and parsed.netloc == "docs.reltio.com"
+                          and (parsed.path == "/en" or parsed.path.startswith("/en/"))):
+                      target = urlunsplit((
+                          parsed.scheme,
+                          parsed.netloc,
+                          parsed.path,
+                          parsed.query,
+                          parsed.fragment,
+                      ))
+                      self.urls.add(target)
+                      canonical_page = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+                      if canonical_page.startswith(base_url.rstrip("/") + "/"):
+                          self.notice_urls.add(canonical_page)
+
+          parser = Links()
+          parser.feed(open(source_path, encoding="utf-8").read())
+          urls = sorted(parser.urls)
+          if not urls:
+              raise SystemExit("deprecation index contains no canonical documentation links")
+          with open(links_path, "w", encoding="utf-8") as links:
+              for url in urls:
+                  links.write(url + "\n")
+          with open(notice_path, "w", encoding="utf-8") as notices:
+              for url in sorted(parser.notice_urls):
+                  notices.write(url + "\n")
+          manifest = "\n".join(urls)
+          print(json.dumps({
+              "count": len(urls),
+              "sha256": hashlib.sha256(manifest.encode()).hexdigest(),
+          }))
+          ' "${deprecation_url}" "$RUNNER_TEMP/reltio-deprecation-index-1.source" "$RUNNER_TEMP/reltio-current-deprecation-index-links.txt" "$RUNNER_TEMP/reltio-deprecation-index-notices.txt")"
+          current_deprecation_index_link_count="$(jq -r '.count' <<< "${index_link_state}")"
+          current_deprecation_index_links="$(jq -r '.sha256' <<< "${index_link_state}")"
+          if ! cmp -s "$RUNNER_TEMP/reltio-locked-deprecation-index-links.txt" "$RUNNER_TEMP/reltio-current-deprecation-index-links.txt"; then
+            index_link_drift=1
+            {
+              echo '## deprecation-index-links'
+              diff -u "$RUNNER_TEMP/reltio-locked-deprecation-index-links.txt" "$RUNNER_TEMP/reltio-current-deprecation-index-links.txt" || true
+              echo
+            } >> "${source_diff}"
+            python3 -c '
+          import sys
+          locked = set(open(sys.argv[1], encoding="utf-8").read().splitlines())
+          current = set(open(sys.argv[2], encoding="utf-8").read().splitlines())
+          print("\n".join(sorted(locked ^ current)))
+          ' "$RUNNER_TEMP/reltio-locked-deprecation-index-links.txt" "$RUNNER_TEMP/reltio-current-deprecation-index-links.txt" >> "${changed_urls}"
+          fi
+          sitemap_path="${RUNNER_TEMP}/reltio-sitemap.xml"
+          sitemap_effective_url="$(curl "${secure_curl[@]}" --output "${sitemap_path}" --write-out '%{url_effective}' "${deprecation_sitemap_url}")"
+          if [[ "${sitemap_effective_url}" != https://docs.reltio.com/* ]]; then
+            echo "documentation sitemap resolved to an unapproved location: ${sitemap_effective_url}" >&2
+            exit 1
+          fi
+          sitemap="$(< "${sitemap_path}")"
+          current_openapi_path="${RUNNER_TEMP}/reltio-data-operation-openapi.yaml"
+          current_openapi_effective_url="$(curl "${secure_curl[@]}" --output "${current_openapi_path}" --write-out '%{url_effective}' "${reviewed_openapi_url}")"
+          if [[ "${current_openapi_effective_url}" != https://developer.reltio.com/* ]]; then
+            echo "OpenAPI source resolved to an unapproved location: ${current_openapi_effective_url}" >&2
+            exit 1
+          fi
+          current_openapi_sha="$(sha256sum "${current_openapi_path}" | awk '{ print $1 }')"
+          openapi_state="$(ruby -ryaml -rjson -rdate -e '
+          document = YAML.safe_load(
+            File.read(ARGV.fetch(0)),
+            permitted_classes: [Date, Time],
+            aliases: false
+          )
+          expected = JSON.parse(ARGV.fetch(1))
+          operations = document.fetch("paths").flat_map do |path, methods|
+            next [] unless methods.is_a?(Hash)
+            methods.each_with_object([]) do |(method, operation), found|
+              next unless operation.is_a?(Hash) && operation["operationId"]
+              found << {
+                "method" => method.upcase,
+                "path" => path,
+                "operation_id" => operation.fetch("operationId")
+              }
+            end
+          end
+          expected.each do |binding|
+            exact = operations.count do |operation|
+              operation == binding.slice("method", "path", "operation_id")
+            end
+            owned = operations.count do |operation|
+              operation.fetch("operation_id") == binding.fetch("operation_id")
+            end
+            abort "OpenAPI binding is absent or duplicated: #{binding}" unless exact == 1 && owned == 1
+          end
+          puts JSON.generate({
+            info_version: document.fetch("info").fetch("version").to_s,
+            operation_count: expected.length
+          })
+          ' "${current_openapi_path}" "${reviewed_openapi_operations}")"
+          current_openapi_info_version="$(jq -r '.info_version' <<< "${openapi_state}")"
+          operation_count="$(jq -r '.operation_count' <<< "${openapi_state}")"
+          if (( operation_count == 0 )); then
+            echo 'no locked OpenAPI operation bindings were parsed' >&2
+            exit 1
+          fi
           fingerprints="$(RELEASE_FAMILY="${reviewed_release_family}" python3 -c '
           import hashlib
+          import json
           import os
           import re
           import sys
@@ -62,7 +460,12 @@ jobs:
               selected = sorted(set(selected))
               urls = "\n".join(url for url, _ in selected)
               state = "\n".join(f"{url}\t{modified}" for url, modified in selected)
-              return len(selected), hashlib.sha256(urls.encode()).hexdigest(), hashlib.sha256(state.encode()).hexdigest()
+              return {
+                  "count": len(selected),
+                  "url_sha256": hashlib.sha256(urls.encode()).hexdigest(),
+                  "state_sha256": hashlib.sha256(state.encode()).hexdigest(),
+                  "urls": [url for url, _ in selected],
+              }
 
           family = os.environ["RELEASE_FAMILY"]
           families = {
@@ -78,21 +481,66 @@ jobs:
           )
           deprecated = fingerprint(row for row in rows if "/deprecation-notices-at-a-glance/" in row[0])
           releases = fingerprint(row for row in rows if f"/{family}-release-notes/" in row[0])
-          print(*deprecated, *releases, latest_family)
+          print(json.dumps({
+              "deprecations": deprecated,
+              "releases": releases,
+              "latest_family": latest_family,
+          }))
           ' <<< "${sitemap}")"
-          read -r current_deprecation_count current_deprecations current_deprecation_state current_release_page_count current_release_urls current_release_state current_release_family <<< "${fingerprints}"
+          current_deprecation_count="$(jq -r '.deprecations.count' <<< "${fingerprints}")"
+          current_deprecations="$(jq -r '.deprecations.url_sha256' <<< "${fingerprints}")"
+          current_deprecation_state="$(jq -r '.deprecations.state_sha256' <<< "${fingerprints}")"
+          current_release_page_count="$(jq -r '.releases.count' <<< "${fingerprints}")"
+          current_release_urls="$(jq -r '.releases.url_sha256' <<< "${fingerprints}")"
+          current_release_state="$(jq -r '.releases.state_sha256' <<< "${fingerprints}")"
+          current_release_family="$(jq -r '.latest_family' <<< "${fingerprints}")"
+          mapfile -t current_deprecation_urls < <(jq -r '.deprecations.urls[]' <<< "${fingerprints}")
+          mapfile -t current_release_urls_list < <(jq -r '.releases.urls[]' <<< "${fingerprints}")
+          printf '%s\n' "${current_deprecation_urls[@]}" > "$RUNNER_TEMP/reltio-sitemap-deprecation-notices.txt"
+          if [[ ! -s "$RUNNER_TEMP/reltio-deprecation-index-notices.txt" ]]; then
+            index_reconciliation_drift=1
+            {
+              echo '## deprecation-index-reconciliation'
+              echo 'The deprecation index contains no canonical notice links to reconcile.'
+              echo
+            } >> "${source_diff}"
+          fi
+          missing_index_notices="$(comm -23 "$RUNNER_TEMP/reltio-deprecation-index-notices.txt" "$RUNNER_TEMP/reltio-sitemap-deprecation-notices.txt")"
+          if [[ -n "${missing_index_notices}" ]]; then
+            index_reconciliation_drift=1
+            {
+              echo '## deprecation-index-reconciliation'
+              echo 'Index notice links absent from the current sitemap:'
+              printf '%s\n' "${missing_index_notices}"
+              echo
+            } >> "${source_diff}"
+            printf '%s\n' "${missing_index_notices}" >> "${changed_urls}"
+          fi
+          current_deprecation_content="$(content_fingerprint deprecations "${current_deprecation_urls[@]}")"
+          current_release_content="$(content_fingerprint release-notes "${current_release_urls_list[@]}")"
           latest_release="$(printf '%s' "${release_page}" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+\.0 RN' | sed 's/ RN$//' | sort -V | awk 'END { print }' || true)"
           if [[ -z "${latest_release}" ]]; then
-            release_page="$(curl --fail --location --silent --show-error "https://r.jina.ai/http://${release_url#https://}")"
-            latest_release="$(printf '%s' "${release_page}" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+\.0 RN' | sed 's/ RN$//' | sort -V | awk 'END { print }' || true)"
+            echo 'official release-notes content contains no semantic release marker' >&2
+            exit 1
           fi
-          source_count=0
-          while IFS= read -r source_url; do
-            curl --fail --location --silent --show-error --output /dev/null "${source_url}"
-            source_count=$((source_count + 1))
-          done < <(awk '/^      url: https:\/\// { print $2 }' docs/reltio-api-practices.yaml | sort -u)
-          practice_ids="$(awk '/^  - id:/ { printf "%s%s", separator, $3; separator=", " }' docs/reltio-api-practices.yaml)"
-          commands="$(awk '/^    commands: \[/ { line=$0; sub(/^    commands: \[/, "", line); sub(/\]$/, "", line); print line }' docs/reltio-api-practices.yaml | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sort -u | awk 'NF { printf "%s%s", separator, $0; separator=", " }')"
+          source_count="${#practice_source_urls[@]}"
+          if (( source_count == 0 )); then
+            echo 'no official practice source URLs were parsed' >&2
+            exit 1
+          fi
+          current_practice_source_urls="$(printf '%s\n' "${practice_source_urls[@]}" | python3 -c '
+          import hashlib
+          import sys
+          urls = sorted(set(sys.stdin.read().splitlines()))
+          print(hashlib.sha256("\n".join(urls).encode()).hexdigest())
+          ')"
+          current_practice_source_content="$(content_fingerprint practice-sources "${practice_source_urls[@]}")"
+          compare_content_manifest deprecations "$RUNNER_TEMP/reltio-locked-deprecations-content.tsv" "$RUNNER_TEMP/reltio-deprecations-content.tsv"
+          compare_content_manifest release-notes "$RUNNER_TEMP/reltio-locked-release-notes-content.tsv" "$RUNNER_TEMP/reltio-release-notes-content.tsv"
+          compare_content_manifest practice-sources "$RUNNER_TEMP/reltio-locked-practice-sources-content.tsv" "$RUNNER_TEMP/reltio-practice-sources-content.tsv"
+          sort -u "${changed_urls}" > "$RUNNER_TEMP/reltio-changed-source-urls.next.txt"
+          mv "$RUNNER_TEMP/reltio-changed-source-urls.next.txt" "${changed_urls}"
+          drift_detected=0
           {
             echo '# Reltio documentation drift report'
             echo
@@ -104,31 +552,73 @@ jobs:
             echo "Current newest release-note family: \`${current_release_family}\`"
             echo "Reviewed release-note pages: \`${reviewed_release_page_count}\` (URL hash \`${reviewed_release_urls}\`, state hash \`${reviewed_release_state}\`)"
             echo "Current release-note pages: \`${current_release_page_count}\` (URL hash \`${current_release_urls}\`, state hash \`${current_release_state}\`)"
-            echo "Current official practice source URLs checked: \`${source_count}\`"
+            echo "Reviewed release-note content hash: \`${reviewed_release_content}\`"
+            echo "Current release-note content hash: \`${current_release_content}\`"
+            echo "Reviewed official practice sources: \`${reviewed_practice_source_count}\` (URL-set hash \`${reviewed_practice_source_urls}\`, content hash \`${reviewed_practice_source_content}\`)"
+            echo "Current official practice sources: \`${source_count}\` (URL-set hash \`${current_practice_source_urls}\`, content hash \`${current_practice_source_content}\`)"
             echo "Reviewed deprecation notices: \`${reviewed_deprecation_count}\` (URL-set hash \`${reviewed_deprecations}\`)"
             echo "Current deprecation notices: \`${current_deprecation_count}\` (URL-set hash \`${current_deprecations}\`)"
+            echo "Reviewed deprecation index content hash: \`${reviewed_deprecation_index_content}\`"
+            echo "Current deprecation index content hash: \`${current_deprecation_index_content}\`"
+            echo "Reviewed deprecation index links: \`${reviewed_deprecation_index_link_count}\` (URL-set hash \`${reviewed_deprecation_index_links}\`)"
+            echo "Current deprecation index links: \`${current_deprecation_index_link_count}\` (URL-set hash \`${current_deprecation_index_links}\`)"
             echo "Reviewed deprecation state hash: \`${reviewed_deprecation_state}\`"
             echo "Current deprecation state hash: \`${current_deprecation_state}\`"
+            echo "Reviewed deprecation content hash: \`${reviewed_deprecation_content}\`"
+            echo "Current deprecation content hash: \`${current_deprecation_content}\`"
             echo "Reviewed OpenAPI digest: \`${reviewed_openapi_sha}\`"
             echo "Current OpenAPI digest: \`${current_openapi_sha}\`"
+            echo "Reviewed OpenAPI info version: \`${reviewed_openapi_info_version}\`"
+            echo "Current OpenAPI info version: \`${current_openapi_info_version}\`"
+            if [[ -s "${source_diff}" ]]; then
+              echo
+              echo 'Changed normalized source fingerprints:'
+              echo
+              cat "${source_diff}"
+            fi
             echo
-            if [[ "${reviewed}" == "${latest}" && "${reviewed_release}" == "${latest_release}" && "${reviewed_release_family}" == "${current_release_family}" && "${reviewed_release_page_count}" == "${current_release_page_count}" && "${reviewed_release_urls}" == "${current_release_urls}" && "${reviewed_release_state}" == "${current_release_state}" && "${reviewed_deprecation_count}" == "${current_deprecation_count}" && "${reviewed_deprecations}" == "${current_deprecations}" && "${reviewed_deprecation_state}" == "${current_deprecation_state}" && "${reviewed_openapi_sha}" == "${current_openapi_sha}" ]]; then
-              echo 'Status: no corpus, release-position, deprecation-index, or OpenAPI drift detected.'
+            if [[ "${reviewed}" == "${latest}" && "${reviewed_release}" == "${latest_release}" && "${reviewed_release_family}" == "${current_release_family}" && "${reviewed_release_page_count}" == "${current_release_page_count}" && "${reviewed_release_urls}" == "${current_release_urls}" && "${reviewed_release_state}" == "${current_release_state}" && "${reviewed_release_content}" == "${current_release_content}" && "${reviewed_deprecation_count}" == "${current_deprecation_count}" && "${reviewed_deprecation_index_content}" == "${current_deprecation_index_content}" && "${reviewed_deprecation_index_link_count}" == "${current_deprecation_index_link_count}" && "${reviewed_deprecation_index_links}" == "${current_deprecation_index_links}" && "${reviewed_deprecations}" == "${current_deprecations}" && "${reviewed_deprecation_state}" == "${current_deprecation_state}" && "${reviewed_deprecation_content}" == "${current_deprecation_content}" && "${reviewed_practice_source_count}" == "${source_count}" && "${reviewed_practice_source_urls}" == "${current_practice_source_urls}" && "${reviewed_practice_source_content}" == "${current_practice_source_content}" && "${reviewed_openapi_sha}" == "${current_openapi_sha}" && "${reviewed_openapi_info_version}" == "${current_openapi_info_version}" && "${content_manifest_drift}" == 0 && "${index_link_drift}" == 0 && "${index_reconciliation_drift}" == 0 ]]; then
+              echo 'Status: no corpus, release-note content, deprecation content, practice-source content, or OpenAPI drift detected.'
             else
+              drift_detected=1
               echo 'Status: review required. Runtime policy has not changed automatically.'
               echo
               echo "Compare: https://github.com/reltio-ai/reltio-ai-ready-docs/compare/${reviewed}...${latest}"
-              echo
-              echo "Conservative triage practice IDs: ${practice_ids}"
-              echo
-              echo "Potentially affected commands: ${commands}"
+              if [[ -s "${changed_urls}" ]]; then
+                echo
+                echo 'Exact catalog claims for changed source content:'
+                while IFS= read -r source_url; do
+                  affected_practices="$(jq -r --arg url "${source_url}" '[.claims[] | select(.source_url == $url) | .practice_id] | unique | join(", ")' <<< "${practice_state}")"
+                  affected_commands="$(jq -r --arg url "${source_url}" '[.claims[] | select(.source_url == $url) | .commands[]] | unique | sort | join(", ")' <<< "${practice_state}")"
+                  echo
+                  echo "- Source: \`${source_url}\`"
+                  echo "  Practice IDs: ${affected_practices:-none}"
+                  echo "  Commands: ${affected_commands:-none}"
+                done < "${changed_urls}"
+              else
+                echo
+                echo 'No per-source content fingerprint changed; inspect the corpus, index, sitemap, release position, or OpenAPI aggregate reported above.'
+              fi
             fi
-          } > reltio-documentation-drift.md
-          cat reltio-documentation-drift.md >> "$GITHUB_STEP_SUMMARY"
+          } > "${report}"
+          cat "${report}" >> "$GITHUB_STEP_SUMMARY"
+          report_complete=1
+          if (( drift_detected != 0 )); then
+            exit 1
+          fi
       - name: Upload review artifact
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: reltio-documentation-drift
-          path: reltio-documentation-drift.md
+          path: |
+            ${{ runner.temp }}/reltio-documentation-drift.md
+            ${{ runner.temp }}/reltio-*-content.tsv
+            ${{ runner.temp }}/reltio-content-source-diff.txt
+            ${{ runner.temp }}/reltio-changed-source-urls.txt
+            ${{ runner.temp }}/reltio-locked-deprecation-index-links.txt
+            ${{ runner.temp }}/reltio-current-deprecation-index-links.txt
+            ${{ runner.temp }}/reltio-deprecation-index-notices.txt
+            ${{ runner.temp }}/reltio-sitemap-deprecation-notices.txt
           if-no-files-found: error
           retention-days: 30

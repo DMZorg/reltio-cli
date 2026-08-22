@@ -22,13 +22,37 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  EXPECTED_RELEASE: ${{ inputs.target_release || github.ref_name }}
   RUSTUP_TOOLCHAIN: 1.85.0
 
 jobs:
+  ref-validation:
+    name: Stable tag and release binding
+    runs-on: ubuntu-latest
+    outputs:
+      expected_release: ${{ steps.validate.outputs.expected_release }}
+    steps:
+      - name: Validate trigger and release
+        id: validate
+        env:
+          INPUT_RELEASE: ${{ inputs.target_release }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          [[ "${REF_TYPE}" == 'tag' && "${REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          target="${INPUT_RELEASE:-${REF_NAME#v}}"
+          [[ "${target}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${REF_NAME}" == "v${target}" ]]
+          printf 'expected_release=%s\n' "${target}" >> "$GITHUB_OUTPUT"
+
+  upstream-current:
+    name: Current upstream guidance
+    needs: ref-validation
+    uses: ./.github/workflows/upstream-drift.yml
+
   evidence-tests:
     name: Evidence tests (${{ matrix.os }})
-    if: ${{ github.event_name != 'push' || !contains(github.ref_name, '-') }}
+    needs: ref-validation
     strategy:
       fail-fast: false
       matrix:
@@ -44,15 +68,269 @@ jobs:
       - name: Install Linux ACL development library
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libacl1-dev
-      - name: Execute attributed tests
-        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Verify release test execution controls
+        shell: bash
+        run: |
+          if command -v python3 >/dev/null 2>&1; then
+            python_executable=python3
+          else
+            python_executable=python
+          fi
+          "${python_executable}" - <<'PY'
+          import os
+          import pathlib
+          import json
+          import subprocess
+          import tomllib
+
+          manifest_path = pathlib.Path("crates/reltio-client/Cargo.toml")
+          manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+          if manifest.get("package", {}).get("build") != "build.rs":
+              raise SystemExit("reltio-client must execute the reviewed build.rs validator")
+
+          dependency_tables = {"dependencies", "dev-dependencies", "build-dependencies"}
+
+          def shadowed_standard_crates(value, path=()):
+              if not isinstance(value, dict):
+                  return
+              for key, child in value.items():
+                  child_path = (*path, key)
+                  if key in dependency_tables and isinstance(child, dict):
+                      for crate_name in ("core", "std"):
+                          if crate_name in child:
+                              yield ".".join((*child_path, crate_name))
+                  yield from shadowed_standard_crates(child, child_path)
+
+          for cargo_manifest in sorted(pathlib.Path(".").glob("**/Cargo.toml")):
+              parsed = tomllib.loads(cargo_manifest.read_text(encoding="utf-8"))
+              shadows = list(shadowed_standard_crates(parsed))
+              package_name = parsed.get("package", {}).get("name", "").replace("-", "_")
+              library_name = parsed.get("lib", {}).get("name")
+              target_shadows = sorted(
+                  name for name in (package_name, library_name) if name in {"core", "std"}
+              )
+              if shadows or target_shadows:
+                  raise SystemExit(
+                      f"standard-library dependency aliases or targets can replace built-in tests: "
+                      f"{cargo_manifest}: {shadows + target_shadows}"
+                  )
+
+          for config_path in (pathlib.Path(".cargo/config"), pathlib.Path(".cargo/config.toml")):
+              if config_path.exists():
+                  raise SystemExit(f"repository Cargo config is forbidden for release tests: {config_path}")
+
+          forbidden_environment = {
+              "CARGO_BUILD_RUSTC",
+              "CARGO_BUILD_RUSTC_WRAPPER",
+              "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+              "CARGO_BUILD_RUSTFLAGS",
+              "CARGO_BUILD_RUSTDOC",
+              "CARGO_BUILD_RUSTDOCFLAGS",
+              "CARGO_BUILD_TARGET",
+              "CARGO_ENCODED_RUSTFLAGS",
+              "CARGO_ENCODED_RUSTDOCFLAGS",
+              "RUSTC",
+              "RUSTC_BOOTSTRAP",
+              "RUSTC_WRAPPER",
+              "RUSTC_WORKSPACE_WRAPPER",
+              "RUSTDOC",
+              "RUSTDOCFLAGS",
+              "RUSTFLAGS",
+          }
+          configured_environment = sorted(
+              key for key in forbidden_environment if os.environ.get(key)
+          )
+          configured_environment.extend(sorted(
+              key for key, value in os.environ.items()
+              if key.startswith("CARGO_TARGET_")
+              and key.endswith(("_LINKER", "_RUNNER", "_RUSTFLAGS", "_RUSTDOCFLAGS"))
+              and value
+          ))
+          if configured_environment:
+              raise SystemExit(
+                  f"compiler, linker, or runner overrides can bypass release tests: {configured_environment}"
+              )
+
+          metadata = json.loads(subprocess.run(
+              ["cargo", "metadata", "--locked", "--format-version", "1"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout)
+          target_shadows = sorted(
+              f"{package['id']}::{target['name']}"
+              for package in metadata["packages"]
+              for target in package["targets"]
+              if target["name"] in {"core", "std"}
+          )
+          if target_shadows:
+              raise SystemExit(
+                  f"resolved Cargo targets can replace standard-library test attributes: {target_shadows}"
+              )
+
+          root = pathlib.Path.cwd().resolve()
+          if pathlib.Path(metadata["workspace_root"]).resolve() != root:
+              raise SystemExit("Cargo metadata resolved a different workspace root")
+          expected_members = {
+              (root / "crates/reltio-client/Cargo.toml").resolve(): "reltio-client",
+              (root / "crates/reltio-cli/Cargo.toml").resolve(): "reltio-cli",
+              (root / "crates/reltio-windows-security/Cargo.toml").resolve(): "reltio-windows-security",
+          }
+          packages_by_id = {package["id"]: package for package in metadata["packages"]}
+          workspace_packages = {
+              pathlib.Path(packages_by_id[package_id]["manifest_path"]).resolve(): packages_by_id[package_id]
+              for package_id in metadata["workspace_members"]
+          }
+          if set(workspace_packages) != set(expected_members):
+              raise SystemExit(
+                  f"release workspace members differ from the reviewed manifests: {sorted(map(str, workspace_packages))}"
+              )
+          workspace_manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+          workspace_version = workspace_manifest["workspace"]["package"]["version"]
+          for manifest_path, package_name in expected_members.items():
+              package = workspace_packages[manifest_path]
+              if package["name"] != package_name or package["version"] != workspace_version:
+                  raise SystemExit(
+                      f"release package identity mismatch: {manifest_path}: "
+                      f"{package['name']} {package['version']}"
+                  )
+
+          def require_target(package, name, kind, source):
+              expected_source = (root / source).resolve()
+              matches = [
+                  target for target in package["targets"]
+                  if (name is None or target["name"] == name)
+                  and kind in target["kind"]
+                  and pathlib.Path(target["src_path"]).resolve() == expected_source
+              ]
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"release target identity mismatch: {package['name']}::{name or kind}: {source}"
+                  )
+
+          client = workspace_packages[(root / "crates/reltio-client/Cargo.toml").resolve()]
+          cli = workspace_packages[(root / "crates/reltio-cli/Cargo.toml").resolve()]
+          windows = workspace_packages[(root / "crates/reltio-windows-security/Cargo.toml").resolve()]
+          require_target(client, "reltio_client", "lib", "crates/reltio-client/src/lib.rs")
+          require_target(client, None, "custom-build", "crates/reltio-client/build.rs")
+          require_target(cli, "reltio", "bin", "crates/reltio-cli/src/main.rs")
+          require_target(cli, "cli", "test", "crates/reltio-cli/tests/cli.rs")
+          require_target(
+              windows,
+              "reltio_windows_security",
+              "lib",
+              "crates/reltio-windows-security/src/lib.rs",
+          )
+          client_manifest = (root / "crates/reltio-client/Cargo.toml").resolve()
+          client_dependencies = [
+              dependency
+              for dependency in cli["dependencies"]
+              if dependency["name"] == "reltio-client"
+              and dependency.get("path")
+              and pathlib.Path(dependency["path"]).resolve() == client_manifest.parent
+              and dependency.get("rename") is None
+              and dependency.get("kind") is None
+              and not dependency.get("optional", False)
+          ]
+          if len(client_dependencies) != 1:
+              raise SystemExit("reltio-cli lacks one normal, required, unrenamed reviewed client dependency")
+          resolve = metadata.get("resolve")
+          if not resolve:
+              raise SystemExit("Cargo metadata omitted the resolved dependency graph")
+          cli_nodes = [node for node in resolve["nodes"] if node["id"] == cli["id"]]
+          if len(cli_nodes) != 1:
+              raise SystemExit("Cargo metadata omitted the unique reltio-cli resolve node")
+          client_edges = [
+              edge
+              for edge in cli_nodes[0]["deps"]
+              if edge["name"] == "reltio_client"
+          ]
+          if len(client_edges) != 1 or client_edges[0]["pkg"] != client["id"] or not any(
+              kind.get("kind") is None and kind.get("target") is None
+              for kind in client_edges[0]["dep_kinds"]
+          ):
+              raise SystemExit("reltio-cli does not resolve its normal client edge to the reviewed package")
+          PY
+      - name: Run Windows security native tests
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p reltio-windows-security --all-targets --release
+      - name: Run release workspace tests
+        run: cargo test --workspace --exclude reltio-windows-security --all-targets --release --locked
+      - name: Verify client release-evidence harness
+        run: cargo test --release --locked -p reltio-client --lib registry::tests::release_evidence_functions_are_discoverable_in_client_unit_harness -- --exact
+      - name: Verify CLI unit release-evidence harness
+        run: cargo test --release --locked -p reltio-cli --bin reltio release::tests::release_evidence_functions_are_discoverable_in_cli_unit_harness -- --exact
+      - name: Verify CLI integration release-evidence harness
+        run: cargo test --release --locked -p reltio-cli --test cli release_evidence_functions_are_discoverable_in_cli_integration_harness -- --exact
+
+  dependency-policy:
+    name: Dependency policy
+    needs: ref-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Initialize dependency evidence
+        run: printf '%s\n' 'dependency policy did not reach tool execution' > "$RUNNER_TEMP/dependency-policy.txt"
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install dependency-tool Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install cargo-audit
+        run: cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
+      - name: Install cargo-deny
+        run: cargo +1.88.0 install cargo-deny --version 0.20.2 --locked
+      - name: Record dependency tool versions
+        run: |
+          candidate="$RUNNER_TEMP/dependency-policy.next.txt"
+          {
+            cargo audit --version
+            cargo deny --version
+          } > "${candidate}"
+          mv "${candidate}" "$RUNNER_TEMP/dependency-policy.txt"
+      - name: Fetch and identify advisory database
+        shell: bash
+        run: |
+          set -o pipefail
+          git clone --depth 1 https://github.com/RustSec/advisory-db.git "$RUNNER_TEMP/advisory-db" 2>&1 | tee -a "$RUNNER_TEMP/dependency-policy.txt"
+          printf 'advisory-db ' >> "$RUNNER_TEMP/dependency-policy.txt"
+          git -C "$RUNNER_TEMP/advisory-db" rev-parse HEAD >> "$RUNNER_TEMP/dependency-policy.txt"
+      - name: Audit advisories
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo audit --db "$RUNNER_TEMP/advisory-db" --no-fetch --deny warnings 2>&1 | tee -a "$RUNNER_TEMP/dependency-policy.txt"
+      - name: Check licenses, bans, and sources
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo deny check 2>&1 | tee -a "$RUNNER_TEMP/dependency-policy.txt"
+      - name: Upload dependency evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-dependency-policy
+          path: ${{ runner.temp }}/dependency-policy.txt
+          if-no-files-found: error
+          retention-days: 90
 
   product-contract:
     name: Product contract gate
-    if: ${{ github.event_name != 'push' || !contains(github.ref_name, '-') }}
-    needs: evidence-tests
+    if: ${{ always() }}
+    needs: [ref-validation, upstream-current, evidence-tests, dependency-policy]
     runs-on: ubuntu-latest
     steps:
+      - name: Initialize release evidence
+        run: |
+          : > "$RUNNER_TEMP/release-readiness.json"
+          printf '%s\n' 'release readiness did not reach the product-contract command' > "$RUNNER_TEMP/release-readiness.stderr"
+      - name: Record prerequisite blockers
+        if: ${{ needs.ref-validation.result != 'success' || needs.upstream-current.result != 'success' || needs.evidence-tests.result != 'success' || needs.dependency-policy.result != 'success' }}
+        run: |
+          printf '{"schema_version":1,"type":"release_readiness_prerequisite_failure","ref_validation":"%s","upstream_current":"%s","evidence_tests":"%s","dependency_policy":"%s"}\n' \
+            '${{ needs.ref-validation.result }}' '${{ needs.upstream-current.result }}' '${{ needs.evidence-tests.result }}' '${{ needs.dependency-policy.result }}' > "$RUNNER_TEMP/release-readiness.stderr"
+          : > "$RUNNER_TEMP/release-readiness.json"
+          exit 1
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -64,13 +342,74 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build release gate binary
+        run: cargo build --release --locked -p reltio-cli
       - name: Enforce version-bound product contract
-        run: cargo run --locked -p reltio-cli -- --compact api practices check --strict --release-ready --expected-release "$EXPECTED_RELEASE" > release-readiness.json
+        env:
+          EXPECTED_RELEASE: ${{ needs.ref-validation.outputs.expected_release }}
+        run: |
+          approved_inventory="$(ruby -ryaml -rjson -e '
+          requirements = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: false)
+          puts JSON.generate({
+            target_release: requirements.fetch("target_release"),
+            product_contract: requirements.fetch("product_contract"),
+            inventory_test_ids: requirements.fetch("inventory_test_ids"),
+            operation_ids: requirements.fetch("operations").map { |entry| entry.fetch("id") },
+            capability_ids: requirements.fetch("capabilities").map { |entry| entry.fetch("id") },
+            acceptance_ids: requirements.fetch("acceptance_scenarios").map { |entry| entry.fetch("id") },
+            contract_ids: requirements.fetch("contracts").map { |entry| entry.fetch("id") }
+          })
+          ' docs/release-requirements.yaml)"
+          candidate="$RUNNER_TEMP/release-readiness.next.json"
+          if ./target/release/reltio --compact api practices check --strict --release-ready --expected-release "$EXPECTED_RELEASE" > "${candidate}" 2> "$RUNNER_TEMP/release-readiness.stderr"; then
+            if ! jq -e --arg expected "$EXPECTED_RELEASE" --argjson approved "$approved_inventory" '
+              .schema_version == 1
+              and .ok == true
+              and .data.valid == true
+              and .data.release_fresh == true
+              and .data.release_requirements.schema_version == 1
+              and .data.release_requirements.scope == "v0.1.0_product_mvp"
+              and .data.release_requirements.target_release == $expected
+              and $approved.target_release == $expected
+              and .data.release_requirements.product_contract == $approved.product_contract
+              and ((.data.release_requirements.inventory_test_ids | sort) == ($approved.inventory_test_ids | sort))
+              and (([.data.release_requirements.operations[].id] | sort) == ($approved.operation_ids | sort))
+              and (([.data.release_requirements.capabilities[].id] | sort) == ($approved.capability_ids | sort))
+              and (([.data.release_requirements.acceptance_scenarios[].id] | sort) == ($approved.acceptance_ids | sort))
+              and (([.data.release_requirements.contracts[].id] | sort) == ($approved.contract_ids | sort))
+              and .data.release_requirements.release_ready == true
+              and .data.release_requirements.missing_command_count == 0
+              and (.data.release_requirements.required_operation_count == ($approved.operation_ids | length))
+              and (.data.release_requirements.command_present_count == ($approved.operation_ids | length))
+              and (.data.release_requirements.operation_complete_count == ($approved.operation_ids | length))
+              and all(.data.release_requirements.operations[]; .complete == true)
+              and (.data.release_requirements.blockers | length == 0)
+              and all(.data.release_requirements.capabilities[]; .supported == true)
+              and all(.data.release_requirements.acceptance_scenarios[]; .demonstrated == true)
+              and all(.data.release_requirements.contracts[]; .implemented == true)
+            ' "${candidate}" >/dev/null; then
+              printf '%s\n' 'release command returned success without a complete product-contract record' >> "$RUNNER_TEMP/release-readiness.stderr"
+              rm -f "${candidate}"
+              exit 1
+            fi
+            mv "${candidate}" "$RUNNER_TEMP/release-readiness.json"
+          else
+            status="$?"
+            if [[ -s "${candidate}" ]]; then
+              mv "${candidate}" "$RUNNER_TEMP/release-readiness.json"
+            else
+              rm -f "${candidate}"
+            fi
+            exit "${status}"
+          fi
       - name: Upload release-readiness evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-readiness
-          path: release-readiness.json
+          path: |
+            ${{ runner.temp }}/release-readiness.json
+            ${{ runner.temp }}/release-readiness.stderr
           if-no-files-found: error
           retention-days: 90

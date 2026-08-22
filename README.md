@@ -8,13 +8,13 @@
 ## What Works
 
 - Deterministic profile, environment, tenant, and service URL resolution.
-- Supplied bearer, client-credentials, and strict credential-process authentication.
-- Owner-only token cache with cross-process locking and single-flight acquisition.
+- Supplied bearer, client-credentials, and strict credential-process authentication; complete Windows broker lifecycle validation remains pilot-gated.
+- Owner-only token cache with cross-process locking and single-flight acquisition; Windows DACL/owner enforcement remains native-runtime and pilot-gated.
 - Opaque multi-kilobyte token support and unconditional secret redaction.
 - Typed consistent entity get and crosswalk lookup, bounded history and stored potential matches, POST-body entity search, and resumable cursor scan.
 - Controlled raw reads with protected headers, no credential-forwarding redirects, mutation dry runs, and a fail-closed audit-contract gate.
 - Stable JSON success/error envelopes, JSONL scan events, YAML, table, and raw output.
-- Source-linked API-practice and endpoint registries validated against real test evidence at build time.
+- Source-linked API-practice and endpoint registries validated against statically attributed test functions at build time; CI execution is a separate gate.
 - Embedded agent skills, command schemas, shell completions, and offline/online diagnostics.
 
 ## Build
@@ -34,7 +34,7 @@ cargo build --release --locked
 # Profiles never contain a raw secret by default.
 reltio profile add dev --environment dev --tenant ExampleTenant
 
-# Interactive terminals receive a hidden secret prompt.
+# The Unix hidden prompt has a pseudo-terminal runtime test source. The Windows native-console path remains pilot-gated.
 reltio --profile dev auth login \
   --method client-credentials \
   --client-id "$RELTIO_CLIENT_ID"
@@ -60,10 +60,10 @@ reltio --profile dev entity scan \
   --filter "equals(type,'configuration/entityTypes/Organization')" \
   --page-size 100 \
   --resume-file organizations.resume.json \
-  > organizations.jsonl
+  > organizations.part-0001.jsonl
 ```
 
-Resume state is accepted only by the exact CLI version, target, route, query, and page size that created it.
+Resume state is accepted only by the exact CLI version, target, route, query, and page size that created it. After a failed scan, resume into a new part file. Do not redirect a resumed command over an earlier part or blindly append: reconcile complete `meta.sequence` values with the resume-file sequence first because a crash between output flush and checkpoint commit can duplicate a page.
 
 ## Agent Discovery
 
@@ -102,7 +102,7 @@ cargo run -p reltio-cli -- api practices check --strict
 cargo run -p reltio-cli -- api practices check --release-ready
 ```
 
-The second check is expected to fail during this incomplete alpha and is one mandatory product-MVP gate before a stable `v0.1.0` release. It does not replace platform tests, signing, provenance, packaging, or pilot approval. Stable tags rerun formatting, Clippy, and all attributed tests, then bind the tag, manifest target, and package version through `--expected-release`. Every Reltio API operation must update `docs/endpoints.yaml`, `docs/reltio-api-practices.yaml`, `docs/test-evidence.yaml`, `docs/release-requirements.yaml`, command metadata, tests, and user/agent guidance together. Read the [product contract](docs/PRD.md) and [repository agent instructions](AGENTS.md) before implementation work.
+The second check is expected to fail during this incomplete alpha and is one mandatory product-MVP gate before a stable `v0.1.0` release. It does not replace platform tests, signing, provenance, packaging, or pilot approval. Stable readiness accepts only an exact `vMAJOR.MINOR.PATCH` tag, runs the default shipped feature set across the platform suites, requires current upstream and dependency-policy evidence, and binds the tag, manifest target, and package version through `--expected-release`. Every required operation also needs independently approved, Cargo-discoverable implementation evidence; a command leaf or endpoint binding alone is insufficient. Every Reltio API operation must update `docs/endpoints.yaml`, `docs/reltio-api-practices.yaml`, `docs/test-evidence.yaml`, `docs/release-requirements.yaml`, command metadata, tests, and user/agent guidance together. Read the [product contract](docs/PRD.md) and [repository agent instructions](AGENTS.md) before implementation work.
 
 ## Documentation
 

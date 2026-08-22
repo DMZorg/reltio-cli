@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::cli::DoctorArgs;
 use crate::commands::Runtime;
-use crate::output::{Meta, write_success_guarded};
+use crate::output::Meta;
 
 #[derive(Debug, Serialize)]
 struct Check {
@@ -24,10 +24,11 @@ struct Check {
 
 pub async fn run(runtime: &Runtime, arguments: DoctorArgs) -> Result<()> {
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     let mut checks = Vec::new();
     let mut online_response = None;
     let mut diagnostic_failure = None;
-    let mut output_guard = runtime.local_output_guard();
+    let mut output_guard = runtime.local_output_guard_snapshot();
     let config = match runtime.store.load() {
         Ok(config) => config,
         Err(error) => {
@@ -161,7 +162,7 @@ pub async fn run(runtime: &Runtime, arguments: DoctorArgs) -> Result<()> {
     }
 
     let manager = match runtime.token_manager(&target, TokenManagerOptions::default()) {
-        Ok(manager) => match manager.output_guard() {
+        Ok(manager) => match runtime.token_manager_output_guard(&manager, deadline).await {
             Ok(manager_guard) => {
                 output_guard.merge(&manager_guard);
                 Ok(manager)
@@ -181,7 +182,7 @@ pub async fn run(runtime: &Runtime, arguments: DoctorArgs) -> Result<()> {
         }
     };
     let auth_data = match &manager {
-        Ok(manager) => match manager.status() {
+        Ok(manager) => match runtime.token_manager_status(manager, deadline).await {
             Ok(status) => {
                 let check_status = if status.cache_state == "expired" {
                     "warn"
@@ -251,33 +252,52 @@ pub async fn run(runtime: &Runtime, arguments: DoctorArgs) -> Result<()> {
 
     if arguments.online {
         match &manager {
-            Ok(manager) => match runtime.entities_client(&target, manager.clone()) {
-                Ok(client) => match client
-                    .search(&EntitySearchRequest {
-                        select: Some("URI".to_owned()),
-                        max: 1,
-                        ..EntitySearchRequest::default()
-                    })
-                    .await
-                {
-                    Ok(page) => {
-                        output_guard.merge(&page.response.output_guard());
-                        online_response = Some((
-                            page.response.request_id.clone(),
-                            page.response.status,
-                            page.response.attempts,
-                            page.response.applied_practice_ids.clone(),
-                        ));
-                        checks.push(Check {
-                            name: "tenant.read".to_owned(),
-                            status: "pass",
-                            message: "authenticated tenant read succeeded".to_owned(),
-                            details: Some(json!({
-                                "request_id": page.response.request_id,
-                                "attempts": page.response.attempts
-                            })),
-                        });
-                    }
+            Ok(manager) => {
+                match runtime.entities_client_until(&target, manager.clone(), deadline) {
+                    Ok(client) => match client
+                        .search(&EntitySearchRequest {
+                            select: Some("URI".to_owned()),
+                            max: 1,
+                            ..EntitySearchRequest::default()
+                        })
+                        .await
+                    {
+                        Ok(page) => {
+                            output_guard.merge(&page.response.output_guard());
+                            online_response = Some((
+                                page.response.request_id.clone(),
+                                page.response.status,
+                                page.response.attempts,
+                                page.response.applied_practice_ids.clone(),
+                            ));
+                            checks.push(Check {
+                                name: "tenant.read".to_owned(),
+                                status: "pass",
+                                message: "authenticated tenant read succeeded".to_owned(),
+                                details: Some(json!({
+                                    "request_id": page.response.request_id,
+                                    "attempts": page.response.attempts
+                                })),
+                            });
+                        }
+                        Err(error) => {
+                            diagnostic_failure.get_or_insert_with(|| error.clone());
+                            if let Some(guard) = error.output_guard() {
+                                output_guard.merge(guard);
+                            }
+                            checks.push(Check {
+                                name: "tenant.read".to_owned(),
+                                status: "fail",
+                                message: error.message.clone(),
+                                details: Some(json!({
+                                    "code": error.code,
+                                    "http_status": error.http_status,
+                                    "request_id": error.request_id,
+                                    "hint": error.hint
+                                })),
+                            });
+                        }
+                    },
                     Err(error) => {
                         diagnostic_failure.get_or_insert_with(|| error.clone());
                         if let Some(guard) = error.output_guard() {
@@ -287,28 +307,11 @@ pub async fn run(runtime: &Runtime, arguments: DoctorArgs) -> Result<()> {
                             name: "tenant.read".to_owned(),
                             status: "fail",
                             message: error.message.clone(),
-                            details: Some(json!({
-                                "code": error.code,
-                                "http_status": error.http_status,
-                                "request_id": error.request_id,
-                                "hint": error.hint
-                            })),
+                            details: Some(json!({ "code": error.code, "hint": error.hint })),
                         });
                     }
-                },
-                Err(error) => {
-                    diagnostic_failure.get_or_insert_with(|| error.clone());
-                    if let Some(guard) = error.output_guard() {
-                        output_guard.merge(guard);
-                    }
-                    checks.push(Check {
-                        name: "tenant.read".to_owned(),
-                        status: "fail",
-                        message: error.message.clone(),
-                        details: Some(json!({ "code": error.code, "hint": error.hint })),
-                    });
                 }
-            },
+            }
             Err(_) => checks.push(Check {
                 name: "tenant.read".to_owned(),
                 status: "fail",
@@ -347,7 +350,9 @@ pub async fn run(runtime: &Runtime, arguments: DoctorArgs) -> Result<()> {
     if !healthy {
         return Err(doctor_unhealthy(data, diagnostic_failure, output_guard));
     }
-    write_success_guarded(&data, &meta, runtime.render, &output_guard)
+    runtime
+        .emit_success(&data, &meta, deadline, &output_guard)
+        .await
 }
 
 fn doctor_report(

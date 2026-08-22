@@ -1,13 +1,90 @@
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use reltio_client::config::{
+    AuthMethod, AuthProfile, ConfigStore, Environment, ResolutionOverrides, resolve_target,
+};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use wiremock::matchers::{body_bytes, body_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+#[derive(Default)]
+struct ResponseGateState {
+    observed: bool,
+    released: bool,
+}
+
+struct ResponseGate {
+    state: Arc<(Mutex<ResponseGateState>, Condvar)>,
+}
+
+impl ResponseGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(ResponseGateState::default()), Condvar::new())),
+        }
+    }
+
+    fn responder(&self, response: ResponseTemplate) -> GatedResponse {
+        GatedResponse {
+            state: Arc::clone(&self.state),
+            response,
+        }
+    }
+
+    async fn wait_observed(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if self.state.0.lock().expect("response gate lock").observed {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mock response is observed");
+    }
+
+    fn release(&self) {
+        let (lock, condition) = &*self.state;
+        lock.lock().expect("response gate lock").released = true;
+        condition.notify_all();
+    }
+}
+
+impl Drop for ResponseGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct GatedResponse {
+    state: Arc<(Mutex<ResponseGateState>, Condvar)>,
+    response: ResponseTemplate,
+}
+
+impl Respond for GatedResponse {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let (lock, condition) = &*self.state;
+        let mut state = lock.lock().expect("response gate lock");
+        state.observed = true;
+        condition.notify_all();
+        let (state, timeout) = condition
+            .wait_timeout_while(state, Duration::from_secs(30), |state| !state.released)
+            .expect("response gate wait");
+        assert!(
+            !timeout.timed_out() || state.released,
+            "response gate timed out"
+        );
+        self.response.clone()
+    }
+}
 
 struct Harness {
     directory: TempDir,
@@ -100,6 +177,19 @@ fn profile_lifecycle_and_private_permissions() {
             .mode();
         assert_eq!(mode & 0o077, 0, "config must be owner-only");
     }
+
+    let output = harness
+        .command()
+        .args(["profile", "remove", "test"])
+        .output()
+        .expect("profile remove executes");
+    assert_success(&output);
+    let config = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("removed profile config loads");
+    assert!(!config.profiles.contains_key("test"));
+    assert!(config.current_profile.is_none());
+    assert!(config.pending_imported_bearer_cleanups.is_empty());
 }
 
 #[test]
@@ -230,8 +320,7 @@ fn profile_update_explicit_clear_and_service_removal_controls_return_committed_s
             "--clear-environment",
             "--clear-base-url",
             "--clear-tenant",
-            "--clear-client-id",
-            "--clear-secret-file",
+            "--clear-auth",
             "--remove-service-url",
             "physical_config",
         ])
@@ -242,7 +331,7 @@ fn profile_update_explicit_clear_and_service_removal_controls_return_committed_s
     assert!(profile["environment"].is_null());
     assert!(profile["base_url"].is_null());
     assert!(profile["tenant"].is_null());
-    assert_eq!(profile["auth"]["method"], "client_credentials");
+    assert!(profile["auth"]["method"].is_null());
     assert!(profile["auth"]["client_id"].is_null());
     assert!(profile["auth"]["secret_file"].is_null());
     assert!(profile["services"].get("physical-config").is_none());
@@ -251,13 +340,7 @@ fn profile_update_explicit_clear_and_service_removal_controls_return_committed_s
 
     let output = harness
         .command()
-        .args([
-            "profile",
-            "update",
-            "managed",
-            "--clear-auth",
-            "--clear-service-urls",
-        ])
+        .args(["profile", "update", "managed", "--clear-service-urls"])
         .output()
         .expect("profile clear-all update executes");
     assert_success(&output);
@@ -274,6 +357,84 @@ fn profile_update_explicit_clear_and_service_removal_controls_return_committed_s
         .expect("profile show executes");
     assert_success(&shown);
     assert_eq!(stdout_json(&shown)["data"], profile);
+}
+
+#[test]
+fn profile_update_guards_the_exact_config_loaded_under_the_commit_lock() {
+    use fs2::FileExt;
+
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let first_secret = harness.directory.path().join("first-profile-secret");
+    reltio_client::fs::atomic_write_private(&first_secret, b"first-secret")
+        .expect("first secret file");
+    let second_secret = harness.directory.path().join("second-profile-secret");
+    reltio_client::fs::atomic_write_private(&second_secret, b"LeakedTenant")
+        .expect("second secret file");
+    let output = harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--auth-method",
+            "client-credentials",
+            "--client-id",
+            "client-id",
+            "--secret-file",
+            first_secret.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("initial profile update executes");
+    assert_success(&output);
+
+    let mut lock_name = harness.config_path().into_os_string();
+    lock_name.push(".lock");
+    let config_lock =
+        reltio_client::fs::open_private_lock(&PathBuf::from(lock_name)).expect("open config lock");
+    FileExt::try_lock_exclusive(&config_lock).expect("hold config lock");
+    let mut victim = harness.command();
+    victim.stdout(Stdio::piped()).stderr(Stdio::piped()).args([
+        "profile",
+        "update",
+        "test",
+        "--client-id",
+        "LeakedTenant",
+    ]);
+    let mut victim = victim.spawn().expect("profile update starts");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        victim.try_wait().expect("inspect profile update").is_none(),
+        "profile update did not wait for the config lock"
+    );
+
+    let config = fs::read_to_string(harness.config_path()).expect("read config");
+    let first = first_secret.to_string_lossy();
+    let second = second_secret.to_string_lossy();
+    assert!(config.contains(first.as_ref()), "{config}");
+    let winning_config = config.replace(first.as_ref(), second.as_ref());
+    reltio_client::fs::atomic_write_private(&harness.config_path(), winning_config.as_bytes())
+        .expect("install concurrent winning config");
+    FileExt::unlock(&config_lock).expect("release config lock");
+    let output = victim.wait_with_output().expect("profile update completes");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("LeakedTenant"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("guarded error")["error"]["code"],
+        "credential_output_refused"
+    );
+    let committed = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load committed profile");
+    let profile = committed.profiles.get("test").expect("test profile");
+    assert_eq!(profile.tenant.as_deref(), Some("TestTenant"));
+    assert_eq!(profile.auth.client_id.as_deref(), Some("client-id"));
+    assert_eq!(
+        profile.auth.secret_file.as_deref(),
+        Some(second_secret.as_path())
+    );
 }
 
 #[test]
@@ -308,7 +469,13 @@ fn profile_service_set_remove_conflict_and_output_guard_refusal_preserve_exact_c
     let before = fs::read(harness.config_path()).expect("guarded config preimage");
     let output = harness
         .command()
-        .args(["profile", "update", "test", "--tenant", "NewTenant"])
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--client-id",
+            "replacement-client",
+        ])
         .output()
         .expect("guarded profile update executes");
     assert_eq!(output.status.code(), Some(5));
@@ -320,6 +487,312 @@ fn profile_service_set_remove_conflict_and_output_guard_refusal_preserve_exact_c
         fs::read(harness.config_path()).expect("guard-refused config"),
         before
     );
+}
+
+#[test]
+fn profile_mutations_guard_candidate_secret_file_material_before_commit() {
+    for (command, protected) in [
+        ("profile.add", "profile.add"),
+        ("profile.update", "profile.update"),
+        ("profile.use", "profile.use"),
+    ] {
+        let harness = Harness::new();
+        let secret_file = harness.directory.path().join("candidate-secret");
+        reltio_client::fs::atomic_write_private(&secret_file, protected.as_bytes())
+            .expect("private candidate secret file");
+        let output = harness
+            .command()
+            .args([
+                "profile",
+                "add",
+                "candidate",
+                "--environment",
+                "test",
+                "--tenant",
+                "TestTenant",
+                "--auth-method",
+                "client-credentials",
+                "--client-id",
+                "candidate-client",
+                "--secret-file",
+                secret_file.to_str().expect("UTF-8 path"),
+            ])
+            .output()
+            .expect("candidate profile add executes");
+
+        if command == "profile.add" {
+            assert_eq!(output.status.code(), Some(5));
+            assert!(output.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(protected));
+            assert!(!harness.config_path().exists());
+            continue;
+        }
+        assert_success(&output);
+        let before = fs::read(harness.config_path()).expect("profile preimage");
+
+        let output = if command == "profile.update" {
+            let replacement_secret = harness.directory.path().join("replacement-secret");
+            reltio_client::fs::atomic_write_private(&replacement_secret, protected.as_bytes())
+                .expect("private replacement secret file");
+            harness
+                .command()
+                .args([
+                    "profile",
+                    "update",
+                    "candidate",
+                    "--secret-file",
+                    replacement_secret.to_str().expect("UTF-8 path"),
+                ])
+                .output()
+                .expect("candidate profile update executes")
+        } else {
+            let other = harness
+                .command()
+                .args([
+                    "profile",
+                    "add",
+                    "other",
+                    "--environment",
+                    "test",
+                    "--tenant",
+                    "TestTenant",
+                ])
+                .output()
+                .expect("other profile add executes");
+            assert_success(&other);
+            let original_secret = harness.directory.path().join("candidate-secret");
+            reltio_client::fs::atomic_write_private(&original_secret, b"ordinary-secret")
+                .expect("replace inactive profile secret");
+            let selected_secret = harness.directory.path().join("selected-secret");
+            reltio_client::fs::atomic_write_private(&selected_secret, protected.as_bytes())
+                .expect("selected profile secret");
+            let configured = harness
+                .command()
+                .args([
+                    "profile",
+                    "update",
+                    "candidate",
+                    "--secret-file",
+                    selected_secret.to_str().expect("UTF-8 path"),
+                ])
+                .output()
+                .expect("selected profile config executes");
+            assert_success(&configured);
+            let before_use = fs::read(harness.config_path()).expect("use preimage");
+            let output = harness
+                .command()
+                .args(["profile", "use", "candidate"])
+                .output()
+                .expect("candidate profile use executes");
+            assert_eq!(
+                fs::read(harness.config_path()).expect("use result"),
+                before_use
+            );
+            output
+        };
+
+        assert_eq!(output.status.code(), Some(5));
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(protected));
+        if command == "profile.update" {
+            assert_eq!(
+                fs::read(harness.config_path()).expect("update result"),
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn profile_update_and_remove_guard_displaced_secret_file_material_before_commit() {
+    let update_harness = Harness::new();
+    update_harness.add_profile(None);
+    let update_secret = update_harness.directory.path().join("update-credential");
+    reltio_client::fs::atomic_write_private(&update_secret, b"ordinary-secret")
+        .expect("private update secret file");
+    let configured = update_harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--auth-method",
+            "client-credentials",
+            "--client-id",
+            "client-id",
+            "--secret-file",
+            update_secret.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("profile credential setup executes");
+    assert_success(&configured);
+    reltio_client::fs::atomic_write_private(&update_secret, b"LeakedTenant")
+        .expect("replace update secret fixture");
+    let update_before = fs::read(update_harness.config_path()).expect("update config preimage");
+
+    let output = update_harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--tenant",
+            "LeakedTenant",
+            "--clear-auth",
+        ])
+        .output()
+        .expect("guarded clear-auth update executes");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("LeakedTenant"));
+    assert_eq!(
+        fs::read(update_harness.config_path()).expect("guarded update config"),
+        update_before
+    );
+
+    let remove_harness = Harness::new();
+    remove_harness.add_profile(None);
+    let remove_secret = remove_harness.directory.path().join("remove-credential");
+    reltio_client::fs::atomic_write_private(&remove_secret, b"ordinary-secret")
+        .expect("private remove secret file");
+    let configured = remove_harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--auth-method",
+            "client-credentials",
+            "--client-id",
+            "client-id",
+            "--secret-file",
+            remove_secret.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("profile removal credential setup executes");
+    assert_success(&configured);
+    reltio_client::fs::atomic_write_private(&remove_secret, b"profile.remove")
+        .expect("replace removal secret fixture");
+    let remove_before = fs::read(remove_harness.config_path()).expect("remove config preimage");
+
+    let output = remove_harness
+        .command()
+        .args(["profile", "remove", "test"])
+        .output()
+        .expect("guarded profile remove executes");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("profile.remove"));
+    assert_eq!(
+        fs::read(remove_harness.config_path()).expect("guarded remove config"),
+        remove_before
+    );
+}
+
+#[test]
+fn profile_route_changes_require_explicit_reauthentication() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    login_bearer(&harness, "test", "route-bound-bearer-token");
+    let before = fs::read(harness.config_path()).expect("route config preimage");
+
+    let output = harness
+        .command()
+        .args(["profile", "update", "test", "--tenant", "NewTenant"])
+        .output()
+        .expect("unsafe route update executes");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("route safety error")["error"]["code"],
+        "profile_reauthentication_required"
+    );
+    assert_eq!(
+        fs::read(harness.config_path()).expect("refused route config"),
+        before
+    );
+
+    let output = harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--tenant",
+            "NewTenant",
+            "--clear-auth",
+        ])
+        .output()
+        .expect("explicit auth-clearing route update executes");
+    assert_success(&output);
+    assert_eq!(stdout_json(&output)["data"]["auth"]["method"], Value::Null);
+    assert!(
+        cached_token_files(&harness.directory.path().join("cache")).is_empty(),
+        "clearing route-bound authentication must remove its exact bearer cache"
+    );
+
+    let output = harness
+        .command()
+        .args(["--output", "raw", "auth", "token", "--show"])
+        .output()
+        .expect("orphaned bearer lookup executes");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+
+    let before = fs::read(harness.config_path()).expect("cleared-auth config");
+    let output = harness
+        .command()
+        .args(["profile", "update", "test", "--auth-method", "bearer"])
+        .output()
+        .expect("manual bearer reactivation executes");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("bearer setup error")["error"]["code"],
+        "bearer_configuration_requires_login"
+    );
+    assert_eq!(
+        fs::read(harness.config_path()).expect("bearer reactivation config"),
+        before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_mutation_rejects_an_insecure_candidate_secret_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let secret_file = harness.directory.path().join("insecure-candidate");
+    fs::write(&secret_file, b"profile.add").expect("write candidate secret");
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o644))
+        .expect("make candidate secret insecure");
+
+    let output = harness
+        .command()
+        .args([
+            "profile",
+            "add",
+            "candidate",
+            "--environment",
+            "test",
+            "--tenant",
+            "TestTenant",
+            "--auth-method",
+            "client-credentials",
+            "--client-id",
+            "candidate-client",
+            "--secret-file",
+            secret_file.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("insecure candidate profile add executes");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("profile.add"));
+    assert!(!harness.config_path().exists());
 }
 
 #[cfg(unix)]
@@ -490,6 +963,274 @@ fn bearer_login_and_profile_edits_preserve_unrelated_profile_tokens() {
     );
 }
 
+#[test]
+fn imported_bearer_cache_is_scoped_to_the_configuration_file() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    login_bearer(&harness, "test", "config-a-bearer-token");
+
+    let config_b = harness.directory.path().join("config-b.toml");
+    ConfigStore::new(config_b.clone())
+        .modify_until(
+            Instant::now() + Duration::from_secs(5),
+            || false,
+            |config| {
+                config.current_profile = Some("test".to_owned());
+                config.profiles.insert(
+                    "test".to_owned(),
+                    reltio_client::config::Profile {
+                        environment: Some("test".to_owned()),
+                        tenant: Some("TestTenant".to_owned()),
+                        auth: AuthProfile {
+                            method: Some(AuthMethod::Bearer),
+                            ..AuthProfile::default()
+                        },
+                        ..reltio_client::config::Profile::default()
+                    },
+                );
+                Ok(())
+            },
+        )
+        .expect("create second configuration");
+    let second_config = ConfigStore::new(config_b.clone())
+        .load()
+        .expect("load second configuration");
+    let second_target = resolve_target(
+        &second_config,
+        &Environment::default(),
+        &ResolutionOverrides {
+            profile: Some("test".to_owned()),
+            ..ResolutionOverrides::default()
+        },
+    )
+    .expect("resolve second configuration");
+    let second_cache_key =
+        reltio_client::auth::imported_bearer_cache_key(&config_b, &second_target)
+            .expect("derive second configuration cache key");
+    ConfigStore::new(config_b.clone())
+        .modify_until(
+            Instant::now() + Duration::from_secs(5),
+            || false,
+            |config| {
+                config
+                    .profiles
+                    .get_mut("test")
+                    .expect("second profile")
+                    .auth
+                    .bearer_cache_key = Some(second_cache_key.clone());
+                Ok(())
+            },
+        )
+        .expect("bind second configuration bearer identity");
+
+    let output = harness
+        .command()
+        .env("RELTIO_CONFIG", &config_b)
+        .args(["--output", "raw", "auth", "token", "--show"])
+        .output()
+        .expect("second configuration token lookup executes");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("config-a-bearer-token"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("missing bearer error")["error"]["code"],
+        "bearer_token_missing"
+    );
+    assert_profile_and_token(&harness, "test", "config-a-bearer-token");
+}
+
+#[test]
+fn bearer_relogin_switches_generation_and_removes_retired_cache() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    login_bearer(&harness, "test", "first-generation-token");
+    let first = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load first bearer generation")
+        .profiles
+        .get("test")
+        .expect("test profile")
+        .auth
+        .clone();
+
+    login_bearer(&harness, "test", "second-generation-token");
+    let second = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load second bearer generation")
+        .profiles
+        .get("test")
+        .expect("test profile")
+        .auth
+        .clone();
+
+    assert_ne!(first.bearer_cache_key, second.bearer_cache_key);
+    assert_ne!(
+        first.bearer_cache_generation,
+        second.bearer_cache_generation
+    );
+    assert!(second.bearer_cache_generation.is_some());
+    assert_eq!(
+        cached_token_files(&harness.directory.path().join("cache")).len(),
+        1
+    );
+    assert_profile_and_token(&harness, "test", "second-generation-token");
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_bearer_relogin_preserves_the_active_generation() {
+    use fs2::FileExt;
+
+    let harness = Harness::new();
+    harness.add_profile(None);
+    login_bearer(&harness, "test", "active-generation-token");
+    let before = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load active bearer generation");
+    let mut lock_name = harness.config_path().into_os_string();
+    lock_name.push(".lock");
+    let config_lock =
+        reltio_client::fs::open_private_lock(&PathBuf::from(lock_name)).expect("open config lock");
+    FileExt::try_lock_exclusive(&config_lock).expect("hold config lock");
+
+    let staged_token = "staged-generation-token";
+    let mut login = harness.command();
+    login
+        .env("RELTIO_ACCESS_TOKEN", staged_token)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args([
+            "--timeout",
+            "20s",
+            "--quiet",
+            "auth",
+            "login",
+            "--method",
+            "bearer",
+            "--expires-in",
+            "1h",
+        ]);
+    let mut login = login.spawn().expect("replacement login starts");
+    let mut candidate_observed = false;
+    for _ in 0..1_000 {
+        let files = cached_token_files(&harness.directory.path().join("cache"));
+        if files.len() == 2
+            && files.iter().any(|path| {
+                fs::read(path)
+                    .expect("read staged cache generation")
+                    .windows(staged_token.len())
+                    .any(|window| window == staged_token.as_bytes())
+            })
+        {
+            candidate_observed = true;
+            break;
+        }
+        assert!(
+            login
+                .try_wait()
+                .expect("inspect replacement login")
+                .is_none(),
+            "replacement login exited before staging its candidate"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(candidate_observed, "replacement bearer was not staged");
+
+    login.kill().expect("kill replacement login");
+    assert!(!login.wait().expect("reap replacement login").success());
+    FileExt::unlock(&config_lock).expect("release config lock");
+
+    let after = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load profile after killed login");
+    assert_eq!(after, before);
+    assert_profile_and_token(&harness, "test", "active-generation-token");
+    assert_eq!(
+        cached_token_files(&harness.directory.path().join("cache")).len(),
+        2,
+        "the killed login leaves only an unreferenced candidate"
+    );
+
+    let logout = harness
+        .command()
+        .args(["auth", "logout"])
+        .output()
+        .expect("logout removes active and orphaned generations");
+    assert_success(&logout);
+    assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
+}
+
+#[test]
+fn legacy_bearer_profiles_require_global_cleanup_before_target_scoped_login() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    ConfigStore::new(harness.config_path())
+        .modify_until(
+            Instant::now() + Duration::from_secs(5),
+            || false,
+            |config| {
+                config
+                    .profiles
+                    .get_mut("test")
+                    .expect("test profile")
+                    .auth
+                    .method = Some(AuthMethod::Bearer);
+                Ok(())
+            },
+        )
+        .expect("legacy bearer profile");
+
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "replacement-token")
+        .args(["auth", "login", "--method", "bearer", "--expires-in", "1h"])
+        .output()
+        .expect("legacy bearer login executes");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("migration error")["error"]["code"],
+        "bearer_cache_migration_required"
+    );
+    assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
+
+    let logout = harness
+        .command()
+        .args(["auth", "logout"])
+        .output()
+        .expect("migration logout executes");
+    assert_success(&logout);
+    login_bearer(&harness, "test", "replacement-token");
+    assert_profile_and_token(&harness, "test", "replacement-token");
+}
+
+#[test]
+fn profile_add_rejects_unbound_bearer_configuration() {
+    let harness = Harness::new();
+    let output = harness
+        .command()
+        .args([
+            "profile",
+            "add",
+            "test",
+            "--environment",
+            "test",
+            "--tenant",
+            "TestTenant",
+            "--auth-method",
+            "bearer",
+        ])
+        .output()
+        .expect("profile add executes");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("bearer setup error")["error"]["code"],
+        "bearer_configuration_requires_login"
+    );
+    assert!(!harness.config_path().exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn profile_remove_cache_failure_preserves_profile_and_bearer() {
@@ -567,6 +1308,82 @@ fn profile_remove_config_failure_restores_exact_bearer_preimage() {
 }
 
 #[test]
+fn interrupted_profile_removal_recovers_from_the_durable_cleanup_marker() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    login_bearer(&harness, "test", "crash-recovery-bearer");
+    assert_eq!(
+        cached_token_files(&harness.directory.path().join("cache")).len(),
+        1
+    );
+    let config = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load profile before simulated crash");
+    let target = resolve_target(
+        &config,
+        &Environment::default(),
+        &ResolutionOverrides {
+            profile: Some("test".to_owned()),
+            ..ResolutionOverrides::default()
+        },
+    )
+    .expect("resolve profile before simulated crash");
+    let bearer_cache_key =
+        reltio_client::auth::imported_bearer_cache_key(&harness.config_path(), &target)
+            .expect("derive bearer cache key");
+
+    ConfigStore::new(harness.config_path())
+        .modify_until(
+            Instant::now() + Duration::from_secs(5),
+            || false,
+            |config| {
+                config
+                    .profiles
+                    .remove("test")
+                    .expect("profile preimage exists");
+                config.current_profile = None;
+                config.pending_imported_bearer_cleanups.insert(
+                    "test".to_owned(),
+                    [bearer_cache_key.clone()].into_iter().collect(),
+                );
+                Ok(())
+            },
+        )
+        .expect("persist simulated post-crash cleanup state");
+
+    let output = harness
+        .command()
+        .args(["profile", "list"])
+        .output()
+        .expect("recovery invocation executes");
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("crash-recovery-bearer"));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("recovery error");
+    assert_eq!(error["error"]["code"], "imported_bearer_cleanup_recovered");
+    assert_eq!(
+        error["error"]["details"]["requested_command_started"],
+        false
+    );
+    assert_eq!(error["error"]["details"]["safe_to_replay"], true);
+    assert_eq!(error["error"]["details"]["recovered_profiles"][0], "test");
+    assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
+    let recovered = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load recovered config");
+    assert!(recovered.profiles.is_empty());
+    assert!(recovered.pending_imported_bearer_cleanups.is_empty());
+
+    let output = harness
+        .command()
+        .args(["profile", "list"])
+        .output()
+        .expect("replayed profile list executes");
+    assert_success(&output);
+    assert_eq!(stdout_json(&output)["data"], json!([]));
+}
+
+#[test]
 fn profile_remove_output_preflight_changes_no_local_state() {
     let harness = Harness::new();
     harness.add_profile(None);
@@ -591,8 +1408,6 @@ fn profile_remove_output_preflight_changes_no_local_state() {
 #[cfg(unix)]
 #[test]
 fn profile_remove_and_auth_logout_honor_the_global_cache_timeout() {
-    use std::time::{Duration, Instant};
-
     use fs2::FileExt;
 
     let harness = Harness::new();
@@ -613,14 +1428,10 @@ fn profile_remove_and_auth_logout_honor_the_global_cache_timeout() {
     .expect("maintenance lock");
     FileExt::try_lock_exclusive(&maintenance).expect("hold maintenance lock");
 
-    let started = Instant::now();
-    let output = harness
-        .command()
-        .args(["--timeout", "50ms", "profile", "remove", "test"])
-        .output()
-        .expect("timed profile remove executes");
+    let mut command = harness.command();
+    command.args(["--timeout", "50ms", "profile", "remove", "test"]);
+    let output = run_process_with_watchdog(command, Duration::from_secs(5));
     assert_eq!(output.status.code(), Some(7));
-    assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(
         fs::read(harness.config_path()).expect("unchanged config"),
         config_before
@@ -632,19 +1443,144 @@ fn profile_remove_and_auth_logout_honor_the_global_cache_timeout() {
 
     FileExt::unlock(&maintenance).expect("release maintenance lock");
     FileExt::try_lock_exclusive(&maintenance).expect("reacquire maintenance lock");
-    let started = Instant::now();
-    let output = harness
-        .command()
-        .args(["--timeout", "50ms", "auth", "logout"])
-        .output()
-        .expect("timed logout executes");
+    let mut command = harness.command();
+    command.args(["--timeout", "50ms", "auth", "logout"]);
+    let output = run_process_with_watchdog(command, Duration::from_secs(5));
     assert_eq!(output.status.code(), Some(7));
-    assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(
         fs::read(&cache_path).expect("unchanged cache"),
         cache_before
     );
     FileExt::unlock(&maintenance).expect("release maintenance lock");
+}
+
+#[test]
+fn auth_logout_holds_the_cache_lease_through_bearer_deconfiguration() {
+    use fs2::FileExt;
+
+    let harness = Harness::new();
+    harness.add_profile(None);
+    login_bearer(&harness, "test", "pre-logout-token");
+    let mut config_lock_path = harness.config_path().as_os_str().to_os_string();
+    config_lock_path.push(".lock");
+    let config_lock = reltio_client::fs::open_private_lock(&PathBuf::from(config_lock_path))
+        .expect("open config lock");
+    FileExt::try_lock_exclusive(&config_lock).expect("hold config lock");
+
+    let mut logout = harness.command();
+    logout.stdout(Stdio::piped()).stderr(Stdio::piped()).args([
+        "--timeout",
+        "30s",
+        "auth",
+        "logout",
+    ]);
+    let mut logout = logout.spawn().expect("logout starts");
+    let mut cache_cleared = false;
+    for _ in 0..1_000 {
+        if cached_token_files(&harness.directory.path().join("cache")).is_empty() {
+            cache_cleared = true;
+            break;
+        }
+        assert!(
+            logout.try_wait().expect("inspect logout").is_none(),
+            "logout exited before clearing the cache"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(cache_cleared, "logout did not clear the cache");
+
+    let maintenance_path = harness
+        .directory
+        .path()
+        .join("cache/tokens/cache-maintenance.lock");
+    let maintenance =
+        reltio_client::fs::open_private_lock(&maintenance_path).expect("open maintenance lock");
+    match FileExt::try_lock_shared(&maintenance) {
+        Err(error) if reltio_client::fs::is_lock_contended(&error) => {}
+        Ok(()) => {
+            FileExt::unlock(&maintenance).expect("release unexpected probe lock");
+            panic!("logout released the cache lease before config deconfiguration");
+        }
+        Err(error) => panic!("failed to probe logout cache lease: {error}"),
+    }
+
+    let mut login = harness.command();
+    login
+        .env("RELTIO_ACCESS_TOKEN", "post-logout-token")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args([
+            "--timeout",
+            "30s",
+            "--quiet",
+            "auth",
+            "login",
+            "--method",
+            "bearer",
+            "--expires-in",
+            "1h",
+        ]);
+    let mut login = login.spawn().expect("concurrent login starts");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        login
+            .try_wait()
+            .expect("inspect concurrent login")
+            .is_none(),
+        "concurrent login completed while logout retained the cache lease"
+    );
+    assert!(
+        cached_token_files(&harness.directory.path().join("cache")).is_empty(),
+        "concurrent login installed a token before logout deconfigured the profile"
+    );
+
+    FileExt::unlock(&config_lock).expect("release config lock");
+    let logout_output = logout.wait_with_output().expect("logout completes");
+    assert_success(&logout_output);
+    let logout_result = stdout_json(&logout_output);
+    assert_eq!(logout_result["data"]["local_cache_cleared"], true);
+    assert_eq!(logout_result["data"]["imported_bearer_profiles_cleared"], 1);
+    let login_output = login
+        .wait_with_output()
+        .expect("concurrent login completes");
+    let config = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load final configuration");
+    match login_output.status.code() {
+        Some(5) => {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&login_output.stderr)
+                    .expect("login conflict error")["error"]["code"],
+                "auth_login_commit_conflict"
+            );
+            assert_eq!(
+                config.profiles.get("test").expect("test profile").auth,
+                AuthProfile::default()
+            );
+            assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
+        }
+        Some(0) => {
+            assert_eq!(
+                config
+                    .profiles
+                    .get("test")
+                    .expect("test profile")
+                    .auth
+                    .method,
+                Some(AuthMethod::Bearer)
+            );
+            assert_eq!(
+                cached_token_files(&harness.directory.path().join("cache")).len(),
+                1
+            );
+            assert_profile_and_token(&harness, "test", "post-logout-token");
+        }
+        code => panic!(
+            "concurrent login had an invalid result\ncode: {code:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&login_output.stdout),
+            String::from_utf8_lossy(&login_output.stderr)
+        ),
+    }
 }
 
 #[test]
@@ -732,6 +1668,495 @@ fn help_output_is_guarded_against_cached_credentials() {
     assert_eq!(output.status.code(), Some(5));
     assert!(output.stdout.is_empty());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Usage:"));
+}
+
+#[test]
+fn help_output_is_guarded_against_configured_secret_files() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let secret_file = harness.directory.path().join("help-credential");
+    reltio_client::fs::atomic_write_private(&secret_file, b"Usage:")
+        .expect("private help secret file");
+    let configured = harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--auth-method",
+            "client-credentials",
+            "--client-id",
+            "client-id",
+            "--secret-file",
+            secret_file.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("help credential setup executes");
+    assert_success(&configured);
+
+    let output = harness
+        .command()
+        .arg("--help")
+        .output()
+        .expect("guarded help executes");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Usage:"));
+}
+
+#[test]
+fn preparse_help_fails_closed_when_the_cache_lease_is_contended() {
+    use fs2::FileExt;
+
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "Usage:")
+        .args([
+            "--quiet",
+            "auth",
+            "login",
+            "--method",
+            "bearer",
+            "--expires-in",
+            "1h",
+        ])
+        .output()
+        .expect("bearer login executes");
+    assert_success(&output);
+    let maintenance_path = harness
+        .directory
+        .path()
+        .join("cache/tokens/cache-maintenance.lock");
+    let maintenance =
+        reltio_client::fs::open_private_lock(&maintenance_path).expect("open maintenance lock");
+    FileExt::try_lock_exclusive(&maintenance).expect("hold maintenance lock");
+
+    for (arguments, environment_timeout) in [
+        (vec!["--timeout", "50ms", "--help"], None),
+        (vec!["--timeout=50ms", "--help"], None),
+        (vec!["--help"], Some("50ms")),
+    ] {
+        let mut command = harness.command();
+        command.args(arguments);
+        if let Some(timeout) = environment_timeout {
+            command.env("RELTIO_TIMEOUT", timeout);
+        }
+        let output = run_process_with_watchdog(command, Duration::from_secs(5));
+        assert_eq!(output.status.code(), Some(7));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finite_output_holds_the_cache_lease_through_physical_flush() {
+    use fs2::FileExt;
+
+    let server = MockServer::start().await;
+    let future_token = "future-cache-token-after-output";
+    Mock::given(method("GET"))
+        .and(path("/reltio/api/TestTenant/entities/1"))
+        .and(header("authorization", "Bearer initial-cache-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": "entities/1",
+            "payload": "x".repeat(2 * 1024 * 1024),
+            "future": future_token
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "initial-cache-token")
+        .args([
+            "--quiet",
+            "auth",
+            "login",
+            "--method",
+            "bearer",
+            "--expires-in",
+            "1h",
+        ])
+        .output()
+        .expect("initial bearer login executes");
+    assert_success(&output);
+
+    let maintenance_path = harness
+        .directory
+        .path()
+        .join("cache/tokens/cache-maintenance.lock");
+    let maintenance =
+        reltio_client::fs::open_private_lock(&maintenance_path).expect("open maintenance lock");
+    let mut config_lock_path = harness.config_path().as_os_str().to_os_string();
+    config_lock_path.push(".lock");
+    let config_lock = reltio_client::fs::open_private_lock(&PathBuf::from(config_lock_path))
+        .expect("open config lock");
+    let mut reader = harness.command();
+    reader.stdout(Stdio::piped()).stderr(Stdio::piped()).args([
+        "--compact",
+        "entity",
+        "get",
+        "entities/1",
+    ]);
+    let mut reader = reader.spawn().expect("entity reader starts");
+
+    let mut request_observed = false;
+    for _ in 0..1_000 {
+        if server
+            .received_requests()
+            .await
+            .expect("received entity requests")
+            .len()
+            == 1
+        {
+            request_observed = true;
+            break;
+        }
+        assert!(
+            reader.try_wait().expect("inspect reader").is_none(),
+            "entity reader exited before reaching the server"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(request_observed, "entity request did not reach the server");
+
+    let mut output_lease_observed = false;
+    for _ in 0..1_000 {
+        match FileExt::try_lock_shared(&maintenance) {
+            Ok(()) => FileExt::unlock(&maintenance).expect("release probe lock"),
+            Err(error) if reltio_client::fs::is_lock_contended(&error) => {
+                output_lease_observed = true;
+                break;
+            }
+            Err(error) => panic!("failed to probe maintenance lock: {error}"),
+        }
+        assert!(
+            reader.try_wait().expect("inspect reader").is_none(),
+            "entity reader exited before acquiring its final output lease"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(output_lease_observed, "final output lease was not observed");
+    let mut config_lease_observed = false;
+    for _ in 0..1_000 {
+        match FileExt::try_lock_exclusive(&config_lock) {
+            Ok(()) => FileExt::unlock(&config_lock).expect("release config probe lock"),
+            Err(error) if reltio_client::fs::is_lock_contended(&error) => {
+                config_lease_observed = true;
+                break;
+            }
+            Err(error) => panic!("failed to probe config lock: {error}"),
+        }
+        assert!(
+            reader.try_wait().expect("inspect reader").is_none(),
+            "entity reader exited before acquiring its configuration lease"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        config_lease_observed,
+        "final output did not retain a configuration lease"
+    );
+
+    let mut writer = harness.command();
+    writer
+        .env("RELTIO_ACCESS_TOKEN", future_token)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args([
+            "--timeout",
+            "10s",
+            "--quiet",
+            "auth",
+            "login",
+            "--method",
+            "bearer",
+            "--expires-in",
+            "1h",
+        ]);
+    let mut writer = writer.spawn().expect("concurrent login starts");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        writer
+            .try_wait()
+            .expect("inspect concurrent login")
+            .is_none(),
+        "concurrent token writer committed while output held the lease"
+    );
+    assert!(
+        cached_token_files(&harness.directory.path().join("cache"))
+            .iter()
+            .all(|path| !fs::read(path)
+                .expect("read cached token")
+                .windows(future_token.len())
+                .any(|window| window == future_token.as_bytes()))
+    );
+
+    let reader_output = tokio::task::spawn_blocking(move || reader.wait_with_output())
+        .await
+        .expect("reader wait task")
+        .expect("entity reader completes");
+    assert_success(&reader_output);
+    assert!(String::from_utf8_lossy(&reader_output.stdout).contains(future_token));
+    let writer_output = tokio::task::spawn_blocking(move || writer.wait_with_output())
+        .await
+        .expect("writer wait task")
+        .expect("concurrent login completes");
+    assert_success(&writer_output);
+    FileExt::try_lock_exclusive(&config_lock)
+        .expect("completed output and the subsequent writer release the configuration lease");
+    FileExt::unlock(&config_lock).expect("release config probe lock");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocked_stdout_obeys_the_overall_timeout() {
+    use std::io::Read as _;
+
+    use fs2::FileExt;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/reltio/api/TestTenant/entities/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": "entities/1",
+            "payload": "x".repeat(2 * 1024 * 1024)
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let maintenance_path = harness
+        .directory
+        .path()
+        .join("cache/tokens/cache-maintenance.lock");
+    let maintenance =
+        reltio_client::fs::open_private_lock(&maintenance_path).expect("open maintenance lock");
+    let mut command = harness.command();
+    command
+        .env("RELTIO_ACCESS_TOKEN", "timeout-output-token")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args([
+            "--timeout",
+            "2s",
+            "--compact",
+            "entity",
+            "get",
+            "entities/1",
+        ]);
+    let mut child = command.spawn().expect("blocked-output process starts");
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = child.try_wait().expect("inspect blocked-output process") {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("blocked output respects its deadline");
+    assert_eq!(status.code(), Some(7));
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("captured stdout")
+        .read_to_end(&mut stdout)
+        .expect("read partial stdout");
+    assert!(
+        !stdout.ends_with(b"\n"),
+        "a complete success record was emitted"
+    );
+    FileExt::try_lock_exclusive(&maintenance)
+        .expect("process exit releases the final output lease");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_stdin_obeys_the_overall_timeout_without_waiting_for_eof() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let mut command = harness.command();
+    command.stdin(Stdio::piped()).args([
+        "--timeout",
+        "200ms",
+        "auth",
+        "login",
+        "--method",
+        "bearer",
+        "--token-stdin",
+        "--expires-in",
+        "1h",
+    ]);
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("secret-input process starts");
+    let _open_stdin = child.stdin.take().expect("piped secret stdin");
+
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("secret input respects its deadline")
+        .expect("secret-input process completes");
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigint_interrupts_secret_stdin_without_waiting_for_eof() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use tokio::io::AsyncWriteExt as _;
+
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let mut command = harness.command();
+    command.stdin(Stdio::piped()).args([
+        "--timeout",
+        "30s",
+        "auth",
+        "login",
+        "--method",
+        "bearer",
+        "--token-stdin",
+        "--expires-in",
+        "1h",
+    ]);
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("secret-input process starts");
+    let mut open_stdin = child.stdin.take().expect("piped secret stdin");
+    let pid = Pid::from_raw(
+        i32::try_from(child.id().expect("secret-input process id"))
+            .expect("secret-input process id fits i32"),
+    )
+    .expect("nonzero secret-input process id");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        open_stdin.write_all(&vec![b'x'; 512 * 1024]),
+    )
+    .await
+    .expect("secret reader becomes ready")
+    .expect("write partial secret input");
+    kill_process(pid, Signal::INT).expect("send SIGINT");
+
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("SIGINT interrupts secret input")
+        .expect("secret-input process completes");
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigint_interrupts_blocked_stdout_without_a_success_record() {
+    use std::io::Read as _;
+
+    use fs2::FileExt;
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/reltio/api/TestTenant/entities/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": "entities/1",
+            "payload": "x".repeat(2 * 1024 * 1024)
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let maintenance_path = harness
+        .directory
+        .path()
+        .join("cache/tokens/cache-maintenance.lock");
+    let maintenance =
+        reltio_client::fs::open_private_lock(&maintenance_path).expect("open maintenance lock");
+    let mut command = harness.command();
+    command
+        .env("RELTIO_ACCESS_TOKEN", "sigint-output-token")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args([
+            "--timeout",
+            "10s",
+            "--compact",
+            "entity",
+            "get",
+            "entities/1",
+        ]);
+    let mut child = command.spawn().expect("blocked-output process starts");
+    let pid = Pid::from_child(&child);
+
+    let mut request_observed = false;
+    for _ in 0..1_000 {
+        if server
+            .received_requests()
+            .await
+            .expect("received entity requests")
+            .len()
+            == 1
+        {
+            request_observed = true;
+            break;
+        }
+        assert!(child.try_wait().expect("inspect process").is_none());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(request_observed, "entity request did not reach the server");
+    let mut output_lease_observed = false;
+    for _ in 0..1_000 {
+        match FileExt::try_lock_shared(&maintenance) {
+            Ok(()) => FileExt::unlock(&maintenance).expect("release probe lock"),
+            Err(error) if reltio_client::fs::is_lock_contended(&error) => {
+                output_lease_observed = true;
+                break;
+            }
+            Err(error) => panic!("failed to probe maintenance lock: {error}"),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(output_lease_observed, "final output lease was not observed");
+
+    kill_process(pid, Signal::INT).expect("send SIGINT");
+    let status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(status) = child.try_wait().expect("inspect interrupted process") {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("SIGINT terminates blocked output");
+    assert_eq!(status.code(), Some(130));
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("captured stdout")
+        .read_to_end(&mut stdout)
+        .expect("read partial stdout");
+    assert!(
+        !stdout.ends_with(b"\n"),
+        "a complete success record was emitted"
+    );
+    FileExt::try_lock_exclusive(&maintenance)
+        .expect("process exit releases the final output lease");
 }
 
 #[test]
@@ -1033,7 +2458,7 @@ async fn raw_auth_token_retains_transient_refresh_guard() {
     harness.add_profile(None);
     harness.set_service_url("test", "auth", &auth.uri());
     let secret_file = harness.directory.path().join("raw-token-client-secret");
-    reltio_client::fs::atomic_write_private(&secret_file, b"client-secret")
+    reltio_client::fs::atomic_write_private(&secret_file, b"fixture-client-secret")
         .expect("private secret file");
     let output = harness
         .command()
@@ -1068,6 +2493,110 @@ async fn raw_auth_token_retains_transient_refresh_guard() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authentication_refuses_identical_access_and_refresh_token_provenance() {
+    let auth = MockServer::start().await;
+    let duplicated_token = "provider-duplicated-access-refresh-token";
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": duplicated_token,
+            "refresh_token": duplicated_token,
+            "token_type": "bearer",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&auth)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(None);
+    harness.set_service_url("test", "auth", &auth.uri());
+    let secret_file = harness.directory.path().join("provider-credential");
+    reltio_client::fs::atomic_write_private(&secret_file, b"ordinary-client-secret")
+        .expect("private client secret");
+
+    let output = harness
+        .command()
+        .args([
+            "auth",
+            "login",
+            "--method",
+            "client-credentials",
+            "--client-id",
+            "client-id",
+            "--secret-file",
+            secret_file.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("conflicting provider response executes");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(duplicated_token));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("provider conflict error")["error"]
+            ["code"],
+        "auth_token_provenance_conflict"
+    );
+    assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_token_refuses_access_token_bytes_that_are_also_a_client_secret() {
+    let auth = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "same-client-and-access-secret",
+            "token_type": "bearer",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&auth)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(None);
+    harness.set_service_url("test", "auth", &auth.uri());
+    let secret_file = harness.directory.path().join("equal-token-client-secret");
+    reltio_client::fs::atomic_write_private(&secret_file, b"same-client-and-access-secret")
+        .expect("private secret file");
+    let output = harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--auth-method",
+            "client-credentials",
+            "--client-id",
+            "client-id",
+            "--secret-file",
+            secret_file.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("profile update executes");
+    assert_success(&output);
+
+    for output_arguments in [
+        vec!["--output", "raw", "auth", "token", "--show"],
+        vec!["auth", "token", "--show"],
+    ] {
+        let output = harness
+            .command()
+            .env("RELTIO_AUTH_URL", auth.uri())
+            .args(output_arguments)
+            .output()
+            .expect("token disclosure executes");
+        assert_eq!(output.status.code(), Some(5));
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("same-client-and-access-secret"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr).expect("guarded error")["error"]["code"],
+            "credential_output_refused"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_auth_token_rejects_refresh_token_that_spans_its_appended_newline() {
     let auth = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1085,7 +2614,7 @@ async fn raw_auth_token_rejects_refresh_token_that_spans_its_appended_newline() 
     harness.add_profile(None);
     harness.set_service_url("test", "auth", &auth.uri());
     let secret_file = harness.directory.path().join("raw-newline-client-secret");
-    reltio_client::fs::atomic_write_private(&secret_file, b"client-secret")
+    reltio_client::fs::atomic_write_private(&secret_file, b"fixture-client-secret")
         .expect("private secret file");
     let output = harness
         .command()
@@ -1139,7 +2668,7 @@ async fn raw_auth_token_write_failure_keeps_transient_refresh_guard() {
     harness.add_profile(None);
     harness.set_service_url("test", "auth", &auth.uri());
     let secret_file = harness.directory.path().join("write-failure-client-secret");
-    reltio_client::fs::atomic_write_private(&secret_file, b"client-secret")
+    reltio_client::fs::atomic_write_private(&secret_file, b"fixture-client-secret")
         .expect("private secret file");
     let output = harness
         .command()
@@ -1158,7 +2687,7 @@ async fn raw_auth_token_write_failure_keeps_transient_refresh_guard() {
         .expect("profile update executes");
     assert_success(&output);
 
-    let (_reader, mut writer) = UnixStream::pair().expect("Unix socket pair");
+    let (reader, mut writer) = UnixStream::pair().expect("Unix socket pair");
     writer
         .set_nonblocking(true)
         .expect("nonblocking output socket");
@@ -1171,6 +2700,7 @@ async fn raw_auth_token_write_failure_keeps_transient_refresh_guard() {
             Err(error) => panic!("failed to fill output socket: {error}"),
         }
     }
+    drop(reader);
     let mut command = harness.command();
     command
         .env("RELTIO_AUTH_URL", auth.uri())
@@ -1191,62 +2721,86 @@ async fn raw_auth_token_write_failure_keeps_transient_refresh_guard() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn twenty_cli_processes_singleflight_client_credentials() {
-    let auth = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "shared-process-token",
-            "token_type": "bearer",
-            "expires_in": 3600
-        })))
-        .expect(1)
-        .mount(&auth)
-        .await;
-    let harness = Harness::new();
-    let auth_service = format!("auth={}", auth.uri());
-    let output = harness
-        .command()
-        .args([
-            "profile",
-            "add",
-            "workers",
-            "--environment",
-            "test",
-            "--tenant",
-            "TestTenant",
-            "--auth-method",
-            "client-credentials",
-            "--client-id",
-            "worker-client",
-            "--service-url",
-            &auth_service,
-        ])
-        .output()
-        .expect("profile add executes");
-    assert_success(&output);
-
-    let mut processes = tokio::task::JoinSet::new();
-    for _ in 0..20 {
-        let mut command = harness.command();
-        command.env("RELTIO_CLIENT_SECRET", "worker-secret").args([
-            "--profile",
-            "workers",
-            "--output",
-            "raw",
-            "auth",
-            "token",
-            "--show",
-        ]);
-        processes.spawn(run_process(command));
-    }
-    while let Some(output) = processes.join_next().await {
-        let output = output.expect("process task completes");
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let auth = MockServer::start().await;
+        let response_gate = ResponseGate::new();
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                response_gate.responder(ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": "shared-process-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600
+                }))),
+            )
+            .expect(1)
+            .mount(&auth)
+            .await;
+        let harness = Harness::new();
+        let auth_service = format!("auth={}", auth.uri());
+        let output = harness
+            .command()
+            .args([
+                "profile",
+                "add",
+                "workers",
+                "--environment",
+                "test",
+                "--tenant",
+                "TestTenant",
+                "--auth-method",
+                "client-credentials",
+                "--client-id",
+                "worker-client",
+                "--service-url",
+                &auth_service,
+            ])
+            .output()
+            .expect("profile add executes");
         assert_success(&output);
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "shared-process-token"
-        );
-    }
+
+        let mut children = Vec::with_capacity(20);
+        for index in 0..20 {
+            let mut command = harness.command();
+            command.env("RELTIO_CLIENT_SECRET", "worker-secret").args([
+                "--profile",
+                "workers",
+                "--output",
+                "raw",
+                "auth",
+                "token",
+                "--show",
+            ]);
+            children.push((index, spawn_captured_process(command)));
+        }
+        response_gate.wait_observed().await;
+        for (index, child) in &mut children {
+            assert!(
+                child
+                    .try_wait()
+                    .unwrap_or_else(|error| panic!("inspect CLI process {index}: {error}"))
+                    .is_none(),
+                "CLI process {index} exited before the shared token was released"
+            );
+        }
+        response_gate.release();
+        let mut processes = tokio::task::JoinSet::new();
+        for (index, child) in children {
+            processes.spawn(async move { (index, child.wait_with_output().await) });
+        }
+        while let Some(output) = processes.join_next().await {
+            let (index, output) = output.expect("process task completes");
+            let output =
+                output.unwrap_or_else(|error| panic!("CLI process {index} completes: {error}"));
+            assert_success(&output);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "shared-process-token"
+            );
+        }
+    })
+    .await
+    .expect("twenty CLI processes complete without deadlock");
 }
 
 #[cfg(unix)]
@@ -1380,10 +2934,12 @@ async fn request_timeout_uses_stable_exit_seven() {
 
     assert_eq!(output.status.code(), Some(7));
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stderr).expect("error JSON")["error"]["code"],
-        "request_timeout"
-    );
+    if !output.stderr.is_empty() {
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr).expect("error JSON")["error"]["code"],
+            "request_timeout"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1472,7 +3028,7 @@ async fn entity_by_crosswalk_preserves_wrapper_and_consistency_contract() {
             "/reltio/api/TestTenant/entities/_byCrosswalk/customer-123",
         ))
         .and(header("authorization", "Bearer opaque-token"))
-        .and(query_param("type", "configuration/sources/CRM"))
+        .and(query_param("type", "CRM"))
         .and(query_param("sourceTable", "contacts"))
         .and(query_param("options", "sendHidden,ovOnly"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -1504,7 +3060,7 @@ async fn entity_by_crosswalk_preserves_wrapper_and_consistency_contract() {
             "--value",
             "customer-123",
             "--type",
-            "configuration/sources/CRM",
+            "CRM",
             "--source-table",
             "contacts",
             "--option",
@@ -1626,6 +3182,50 @@ fn raw_entity_crosswalk_enforces_the_narrowed_contract() {
         assert_eq!(output.status.code(), Some(2), "query {query}");
         assert!(output.stdout.is_empty());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_entity_crosswalk_warns_when_documented_id_fallback_is_detected() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/reltio/api/TestTenant/entities/_byCrosswalk/customer-123",
+        ))
+        .and(query_param("type", "CRM"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "index": 0,
+            "object": {"uri": "entities/customer-123", "crosswalks": []},
+            "successful": true
+        }])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let mut command = harness.command();
+    command.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "api",
+        "request",
+        "GET",
+        "/entities/_byCrosswalk/customer-123",
+        "--service",
+        "data",
+        "--query",
+        "type=CRM",
+    ]);
+
+    let output = run_process(command).await;
+
+    assert_success(&output);
+    assert!(
+        stdout_json(&output)["meta"]["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("ID-fallback")))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1802,6 +3402,51 @@ async fn entity_matches_preserves_stored_direct_results_and_warns_about_freshnes
             .as_str()
             .is_some_and(|warning| warning.contains("out of date"))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entity_matches_preserves_server_relevance_and_action_labels() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/reltio/api/TestTenant/entities/1/_matches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "configuration/entityTypes/Individual/matchGroups/Relevance": [
+                {
+                    "object": {"uri": "entities/2"},
+                    "relevance": 0.94,
+                    "matchActionLabel": "not_a_match"
+                },
+                {
+                    "object": {"uri": "entities/3"},
+                    "relevance": 0.948,
+                    "matchActionLabel": "potential_match"
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let mut command = harness.command();
+    command.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "entity",
+        "matches",
+        "1",
+        "--max-items",
+        "2",
+    ]);
+    let output = run_process(command).await;
+
+    assert_success(&output);
+    let envelope = stdout_json(&output);
+    let matches = envelope["data"]["configuration/entityTypes/Individual/matchGroups/Relevance"]
+        .as_array()
+        .expect("relevance match group");
+    assert_eq!(matches[0]["relevance"], json!(0.94));
+    assert_eq!(matches[0]["matchActionLabel"], "not_a_match");
+    assert_eq!(matches[1]["relevance"], json!(0.948));
+    assert_eq!(matches[1]["matchActionLabel"], "potential_match");
 }
 
 #[test]
@@ -2613,6 +4258,131 @@ async fn doctor_guards_credentials_carried_by_caught_online_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entity_scan_refuses_the_conflicting_v2_response_collection() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": {"value": "cursor-1"},
+            "objects": [],
+            "entities": [{"uri": "entities/1"}]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let mut command = harness.command();
+    command.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "entity",
+        "scan",
+        "--filter",
+        "equals(type,'configuration/entityTypes/Organization')",
+        "--max-pages",
+        "1",
+    ]);
+
+    let output = run_process(command).await;
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "no cursor event or summary is valid"
+    );
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured scan error");
+    assert_eq!(error["error"]["code"], "scan_response_route_mismatch");
+    assert_eq!(
+        error["error"]["details"]["unexpected_collection"],
+        "entities"
+    );
+    assert_eq!(
+        error["error"]["details"]["expected_collection_present"],
+        true
+    );
+
+    let mut colliding_command = harness.command();
+    colliding_command
+        .env("RELTIO_ACCESS_TOKEN", "entities")
+        .args([
+            "entity",
+            "scan",
+            "--filter",
+            "equals(type,'configuration/entityTypes/Organization')",
+            "--max-pages",
+            "1",
+        ]);
+    let colliding_output = run_process(colliding_command).await;
+    assert!(!colliding_output.status.success());
+    assert!(
+        colliding_output.stdout.is_empty(),
+        "schema-key redaction cannot become false exhaustion"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entity_scan_options_require_explicit_unverified_acknowledgement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .and(query_param("options", "sendHidden"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": {"value": "cursor-1"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let scan_arguments = [
+        "entity",
+        "scan",
+        "--filter",
+        "equals(type,'configuration/entityTypes/Organization')",
+        "--option",
+        "sendHidden",
+        "--max-pages",
+        "1",
+    ];
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .args(scan_arguments)
+        .output()
+        .expect("unacknowledged scan executes");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured refusal")["error"]["code"],
+        "unverified_scan_options_refused"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    let mut acknowledged = harness.command();
+    acknowledged
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .args(scan_arguments)
+        .arg("--allow-unverified-scan-options");
+    let output = run_process(acknowledged).await;
+    assert_success(&output);
+    assert!(output.stderr.is_empty());
+    let summary = String::from_utf8(output.stdout)
+        .expect("UTF-8 scan output")
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str::<Value>(line).expect("summary event"))
+        .expect("summary output");
+    assert_eq!(summary["type"], "summary");
+    assert!(
+        summary["meta"]["warnings"]
+            .as_array()
+            .expect("summary warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("non-production tenant")))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn entity_scan_streams_pages_and_writes_resume_checkpoint() {
     let server = MockServer::start().await;
     let filter = "equals(type,'configuration/entityTypes/Organization')";
@@ -2701,11 +4471,267 @@ async fn entity_scan_streams_pages_and_writes_resume_checkpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_scan_max_items_bounds_only_the_current_invocation() {
+    let server = MockServer::start().await;
+    let filter = "equals(type,'configuration/entityTypes/Organization')";
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .and(query_param("filter", filter))
+        .and(query_param("max", "2"))
+        .and(body_bytes(Vec::<u8>::new()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": {"value": "cursor-1"},
+            "objects": [{"uri": "entities/1"}, {"uri": "entities/2"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .and(query_param("max", "1"))
+        .and(body_json(json!({"cursor": {"value": "cursor-1"}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": {"value": "cursor-2"},
+            "objects": [{"uri": "entities/3"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let resume = harness.directory.path().join("bounded-resume.json");
+
+    let mut initial = harness.command();
+    initial.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "entity",
+        "scan",
+        "--filter",
+        filter,
+        "--page-size",
+        "2",
+        "--max-pages",
+        "1",
+        "--resume-file",
+        resume.to_str().expect("UTF-8 path"),
+    ]);
+    assert_success(&run_process(initial).await);
+
+    let mut resumed = harness.command();
+    resumed.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "entity",
+        "scan",
+        "--filter",
+        filter,
+        "--page-size",
+        "2",
+        "--max-items",
+        "1",
+        "--resume-file",
+        resume.to_str().expect("UTF-8 path"),
+    ]);
+    let output = run_process(resumed).await;
+    assert_success(&output);
+    let events = String::from_utf8(output.stdout)
+        .expect("UTF-8 JSONL")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid event"))
+        .collect::<Vec<_>>();
+    let items = events
+        .iter()
+        .filter(|event| event["type"] == "item")
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["meta"]["sequence"], 3);
+    let summary = events.last().expect("summary event");
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["meta"]["returned_this_run"], 1);
+    assert_eq!(summary["meta"]["exhausted"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entity_scan_cursor_expiry_is_anchored_to_request_start() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_json(json!({
+                    "cursor": {"value": "cursor-1"},
+                    "objects": [{"uri": "entities/1"}]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let resume = harness.directory.path().join("request-start.resume.json");
+    let mut command = harness.command();
+    command.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "entity",
+        "scan",
+        "--filter",
+        "equals(type,'configuration/entityTypes/Organization')",
+        "--max-pages",
+        "1",
+        "--resume-file",
+        resume.to_str().expect("UTF-8 path"),
+    ]);
+
+    let output = run_process(command).await;
+    let finished_at = chrono::Utc::now();
+
+    assert_success(&output);
+    let state: Value =
+        serde_json::from_slice(&fs::read(&resume).expect("resume state")).expect("resume JSON");
+    let last_read_at = chrono::DateTime::parse_from_rfc3339(
+        state["last_read_at"].as_str().expect("last-read timestamp"),
+    )
+    .expect("last-read RFC 3339")
+    .with_timezone(&chrono::Utc);
+    let expires_at = chrono::DateTime::parse_from_rfc3339(
+        state["expires_at"].as_str().expect("expiry timestamp"),
+    )
+    .expect("expiry RFC 3339")
+    .with_timezone(&chrono::Utc);
+    assert!(
+        finished_at.signed_duration_since(last_read_at) >= chrono::TimeDelta::milliseconds(700),
+        "last_read_at must precede the delayed response: {state}"
+    );
+    assert_eq!(
+        expires_at.signed_duration_since(last_read_at),
+        chrono::TimeDelta::hours(1)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entity_scan_sigint_preserves_checkpoint_without_a_false_summary() {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let server = MockServer::start().await;
+    let filter = "equals(type,'configuration/entityTypes/Organization')";
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .and(query_param("filter", filter))
+        .and(query_param("max", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": {"value": "cursor-1"},
+            "objects": [{"uri": "entities/1"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .and(query_param("max", "1"))
+        .and(body_json(json!({"cursor": {"value": "cursor-1"}})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(json!({
+                    "cursor": {"value": "cursor-2"},
+                    "objects": [{"uri": "entities/2"}]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let resume = harness
+        .directory
+        .path()
+        .join("interrupted-scan.resume.json");
+    let mut command = harness.command();
+    command
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args([
+            "entity",
+            "scan",
+            "--filter",
+            filter,
+            "--page-size",
+            "1",
+            "--checkpoint-every",
+            "1",
+            "--resume-file",
+            resume.to_str().expect("UTF-8 path"),
+        ]);
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    let mut child = command.spawn().expect("scan process starts");
+    let pid = Pid::from_raw(
+        i32::try_from(child.id().expect("scan process id")).expect("scan process id fits i32"),
+    )
+    .expect("nonzero scan process id");
+    let mut continuation_observed = false;
+    for _ in 0..1_000 {
+        if server
+            .received_requests()
+            .await
+            .expect("received scan requests")
+            .len()
+            == 2
+        {
+            continuation_observed = true;
+            break;
+        }
+        assert!(
+            child.try_wait().expect("inspect scan process").is_none(),
+            "scan exited before issuing its continuation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(continuation_observed, "scan continuation was not observed");
+    kill_process(pid, Signal::INT).expect("send SIGINT");
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("scan responds promptly to SIGINT")
+        .expect("scan process completes");
+
+    assert_eq!(output.status.code(), Some(130));
+    let events = String::from_utf8(output.stdout).expect("UTF-8 JSONL");
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid scan event"))
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| event["type"] == "item"));
+    assert!(events.iter().any(|event| event["type"] == "checkpoint"));
+    assert!(events.iter().all(|event| event["type"] != "summary"));
+    let checkpoint: Value = serde_json::from_slice(&fs::read(&resume).expect("resume file"))
+        .expect("valid resume state");
+    assert_eq!(checkpoint["cursor"], "cursor-1");
+    assert_eq!(checkpoint["sequence"], 1);
+    assert_eq!(checkpoint["exhausted"], false);
+    if !output.stderr.is_empty() {
+        let error: Value = serde_json::from_slice(&output.stderr).expect("scan cancellation error");
+        assert_eq!(error["error"]["details"]["remote_response_received"], false);
+        assert_eq!(
+            error["error"]["details"]["last_successful_http_status"],
+            200
+        );
+        assert_eq!(error["error"]["details"]["local_state_committed"], true);
+        assert_eq!(
+            error["error"]["details"]["safe_to_replay"], false,
+            "{error}"
+        );
+        assert_eq!(
+            error["error"]["details"]["artifact_reconciliation"]["required"],
+            true
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn entity_scan_custom_errors_keep_the_cumulative_output_guard() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/reltio/api/TestTenant/entities/_scan"))
-        .and(header("authorization", "Bearer unsafe"))
+        .and(header("authorization", "Bearer scan-page-limit-secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "cursor": {"value": "cursor-1"},
             "objects": [{"uri": "entities/1"}, {"uri": "entities/2"}]
@@ -2716,20 +4742,93 @@ async fn entity_scan_custom_errors_keep_the_cumulative_output_guard() {
     let harness = Harness::new();
     harness.add_profile(Some(&server.uri()));
     let mut command = harness.command();
-    command.env("RELTIO_ACCESS_TOKEN", "unsafe").args([
-        "entity",
-        "scan",
-        "--filter",
-        "equals(type,'configuration/entityTypes/Organization')",
-        "--page-size",
-        "1",
-    ]);
+    command
+        .env("RELTIO_ACCESS_TOKEN", "scan-page-limit-secret")
+        .args([
+            "entity",
+            "scan",
+            "--filter",
+            "equals(type,'configuration/entityTypes/Organization')",
+            "--page-size",
+            "1",
+        ]);
 
     let output = run_process(command).await;
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("unsafe"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("scan-page-limit-secret"));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured scan error");
+    assert_eq!(error["error"]["code"], "scan_page_limit_violated");
+    assert_eq!(error["error"]["http_status"], 200);
+    assert_eq!(error["error"]["details"]["remote_response_received"], true);
+    assert_eq!(error["error"]["details"]["remote_request_completed"], true);
+    assert_eq!(
+        error["error"]["details"]["remote_operation_state"],
+        "scan_page_response_received"
+    );
+    assert_eq!(error["error"]["details"]["output_emitted"], false);
+    assert_eq!(error["error"]["details"]["uncheckpointed_output"], false);
+    assert_eq!(error["error"]["details"]["local_state_committed"], false);
+    assert_eq!(error["error"]["details"]["safe_to_replay"], true);
+    assert_eq!(error["error"]["details"]["returned"], 0);
+    assert_eq!(error["error"]["details"]["pages"], 1);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entity_scan_does_not_advance_progress_before_page_flush() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": {"value": "cursor-1"},
+            "objects": [{"uri": "entities/1"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let resume = harness.directory.path().join("unflushed.resume.json");
+    let (reader, writer) = UnixStream::pair().expect("Unix socket pair");
+    drop(reader);
+    let mut command = harness.command();
+    command
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .args([
+            "entity",
+            "scan",
+            "--filter",
+            "equals(type,'configuration/entityTypes/Organization')",
+            "--page-size",
+            "1",
+            "--max-pages",
+            "1",
+            "--resume-file",
+            resume.to_str().expect("UTF-8 path"),
+        ]);
+
+    let output = run_process(command).await;
+
+    assert_eq!(output.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("scan output error");
+    assert_eq!(error["error"]["code"], "output_write_failed");
+    assert_eq!(error["error"]["details"]["returned"], 0);
+    assert_eq!(error["error"]["details"]["output_emitted"], false);
+    assert_eq!(error["error"]["details"]["output_emission_attempted"], true);
+    assert_eq!(error["error"]["details"]["uncheckpointed_output"], false);
+    assert_eq!(error["error"]["details"]["local_state_committed"], false);
+    assert_eq!(error["error"]["details"]["safe_to_replay"], false);
+    assert_eq!(
+        error["error"]["details"]["artifact_reconciliation"]["required"],
+        true
+    );
+    assert!(!resume.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2738,10 +4837,14 @@ async fn invalid_scan_shape_does_not_echo_protected_cursor_values() {
     let cursor = "protected-cursor-value";
     Mock::given(method("POST"))
         .and(path("/reltio/api/TestTenant/entities/_scan"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "cursor": {"value": {"secret": cursor}},
-            "objects": []
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-request-id", "malformed-scan-request")
+                .set_body_json(json!({
+                    "cursor": {"value": {"secret": cursor}},
+                    "objects": []
+                })),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -2760,10 +4863,20 @@ async fn invalid_scan_shape_does_not_echo_protected_cursor_values() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
     assert!(!stderr.contains(cursor));
+    let error = serde_json::from_str::<Value>(&stderr).expect("structured error");
+    assert_eq!(error["error"]["code"], "api_response_invalid_json");
+    assert_eq!(error["error"]["http_status"], 200);
+    assert_eq!(error["error"]["request_id"], "malformed-scan-request");
+    assert_eq!(error["error"]["details"]["remote_response_received"], true);
+    assert_eq!(error["error"]["details"]["remote_request_completed"], true);
     assert_eq!(
-        serde_json::from_str::<Value>(&stderr).expect("structured error")["error"]["code"],
-        "api_response_invalid_json"
+        error["error"]["details"]["remote_operation_state"],
+        "scan_page_response_received"
     );
+    assert_eq!(error["error"]["details"]["output_emitted"], false);
+    assert_eq!(error["error"]["details"]["returned"], 0);
+    assert_eq!(error["error"]["details"]["pages"], 0);
+    assert_eq!(error["error"]["details"]["safe_to_replay"], true);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2826,6 +4939,7 @@ async fn entity_scan_refuses_invalid_or_mismatched_resume_context() {
             "1",
             "--option",
             "ovOnly",
+            "--allow-unverified-scan-options",
             "--resume-file",
             resume_text,
         ]);
@@ -3176,6 +5290,54 @@ async fn http_500_is_not_retried_and_echoed_token_is_redacted() {
     assert_eq!(error["error"]["details"]["attempts"], 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finite_stderr_records_share_redaction_context() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/reltio/api/TestTenant/entities/1"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let split_secret = "reviewed\n{\"schema_version\"";
+    let mut command = harness.command();
+    command
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .env("RELTIO_CLIENT_SECRET", split_secret)
+        .args([
+            "--output",
+            "raw",
+            "--verbose",
+            "api",
+            "request",
+            "GET",
+            "/entities/1",
+            "--service",
+            "data",
+        ]);
+
+    let output = run_process(command).await;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(split_secret),
+        "separate safe stderr records must not synthesize a credential"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    let final_record: Value = serde_json::from_str(
+        stderr
+            .lines()
+            .last()
+            .expect("a guarded final diagnostic follows the warning"),
+    )
+    .expect("guarded positional diagnostic JSON");
+    assert_eq!(final_record[0], "reltio_guarded_failure");
+    assert_eq!(final_record[1], "api_internal_error");
+}
+
 #[test]
 fn raw_mutation_and_protected_header_are_refused_before_network_io() {
     let harness = Harness::new();
@@ -3241,7 +5403,7 @@ fn raw_mutation_and_protected_header_are_refused_before_network_io() {
     );
 }
 
-#[test]
+#[::std::prelude::v1::test]
 fn release_gate_reports_prd_blockers_and_refuses_stable_readiness() {
     let harness = Harness::new();
     let report = harness
@@ -3292,47 +5454,86 @@ fn release_gate_reports_prd_blockers_and_refuses_stable_readiness() {
     assert_eq!(error["error"]["details"]["manifest_release"], "0.1.0");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutation_audit_absence_fails_closed_before_network_io() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/reltio/api/TestTenant/mutate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
-        .expect(0)
-        .mount(&server)
-        .await;
-    let harness = Harness::new();
-    harness.add_profile(Some(&server.uri()));
-    let mut command = harness.command();
-    command.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
-        "--yes",
-        "api",
-        "request",
-        "POST",
-        "/mutate",
-        "--service",
-        "data",
-        "--data",
-        r#"{"mutation":"applied"}"#,
-        "--allow-unreviewed-endpoint",
-    ]);
-    let output = run_process(command).await;
+#[::std::prelude::v1::test]
+fn release_evidence_functions_are_discoverable_in_cli_integration_harness() {
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = Command::new(&executable)
+        .args(["--list", "--format", "terse"])
+        .output()
+        .expect("list CLI integration tests");
+    assert!(output.status.success(), "test listing failed: {output:?}");
+    let listed = String::from_utf8(output.stdout).expect("UTF-8 test listing");
+    let dep_info = fs::read_to_string(executable.with_extension("d"))
+        .expect("CLI integration-test dep-info is readable")
+        .replace('\\', "/");
+    for (_, path, _, expected) in reltio_client::release_evidence_bindings_for_validation()
+        .iter()
+        .filter(|(_, path, _, _)| *path == "crates/reltio-cli/tests/cli.rs")
+    {
+        assert!(
+            listed
+                .lines()
+                .any(|line| line == format!("{expected}: test")),
+            "release evidence test {expected} is absent from the CLI integration harness"
+        );
+        assert!(
+            dep_info
+                .split_ascii_whitespace()
+                .map(|entry| entry.trim_end_matches(':'))
+                .any(|entry| entry == *path),
+            "release evidence source {path} is absent from CLI integration-test dep-info"
+        );
+    }
+}
 
-    assert_eq!(output.status.code(), Some(5));
-    assert!(output.stdout.is_empty());
-    let error: Value = serde_json::from_slice(&output.stderr).expect("structured refusal");
-    assert_eq!(error["error"]["code"], "mutation_audit_unavailable");
-    assert_eq!(error["error"]["category"], "safety");
-    assert_eq!(error["error"]["retryable"], false);
-    let details = &error["error"]["details"];
-    assert_eq!(details["required_contract"], "mutation_audit_v1");
-    assert_eq!(details["body_sha256"].as_str().map(str::len), Some(64));
-    assert_eq!(details["remote_response_received"], false);
-    assert_eq!(details["remote_request_completed"], false);
-    assert_eq!(details["remote_operation_completed"], false);
-    assert_eq!(details["remote_operation_state"], "request_not_sent");
-    assert_eq!(details["safe_to_replay"], true);
-    assert!(server.received_requests().await.unwrap().is_empty());
+#[::std::prelude::v1::test]
+fn mutation_audit_absence_fails_closed_before_network_io() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/reltio/api/TestTenant/mutate"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let harness = Harness::new();
+            harness.add_profile(Some(&server.uri()));
+            let mut command = harness.command();
+            command.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+                "--yes",
+                "api",
+                "request",
+                "POST",
+                "/mutate",
+                "--service",
+                "data",
+                "--data",
+                r#"{"mutation":"applied"}"#,
+                "--allow-unreviewed-endpoint",
+            ]);
+            let output = run_process(command).await;
+
+            assert_eq!(output.status.code(), Some(5));
+            assert!(output.stdout.is_empty());
+            let error: Value = serde_json::from_slice(&output.stderr).expect("structured refusal");
+            assert_eq!(error["error"]["code"], "mutation_audit_unavailable");
+            assert_eq!(error["error"]["category"], "safety");
+            assert_eq!(error["error"]["retryable"], false);
+            let details = &error["error"]["details"];
+            assert_eq!(details["required_contract"], "mutation_audit_v1");
+            assert_eq!(details["body_sha256"].as_str().map(str::len), Some(64));
+            assert_eq!(details["remote_response_received"], false);
+            assert_eq!(details["remote_request_completed"], false);
+            assert_eq!(details["remote_operation_completed"], false);
+            assert_eq!(details["remote_operation_state"], "request_not_sent");
+            assert_eq!(details["safe_to_replay"], true);
+            assert!(server.received_requests().await.unwrap().is_empty());
+        });
 }
 
 #[cfg(unix)]
@@ -3839,6 +6040,101 @@ async fn malformed_header_is_rejected_before_stdin_or_network() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_request_stdin_obeys_the_overall_timeout_without_waiting_for_eof() {
+    let server = MockServer::start().await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let mut command = harness.command();
+    command
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .stdin(Stdio::piped())
+        .args([
+            "--timeout",
+            "200ms",
+            "api",
+            "request",
+            "POST",
+            "/entities/1",
+            "--service",
+            "data",
+            "--data",
+            "-",
+        ]);
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("raw request starts");
+    let _open_stdin = child.stdin.take().expect("piped request stdin");
+
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("request-body input respects its deadline")
+        .expect("raw request completes");
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(output.stdout.is_empty());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigint_interrupts_raw_request_stdin_without_waiting_for_eof() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use tokio::io::AsyncWriteExt as _;
+
+    let server = MockServer::start().await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let mut command = harness.command();
+    command
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .stdin(Stdio::piped())
+        .args([
+            "--timeout",
+            "30s",
+            "api",
+            "request",
+            "POST",
+            "/entities/1",
+            "--service",
+            "data",
+            "--data",
+            "-",
+        ]);
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("raw request starts");
+    let mut open_stdin = child.stdin.take().expect("piped request stdin");
+    let pid = Pid::from_raw(
+        i32::try_from(child.id().expect("raw request process id"))
+            .expect("raw request process id fits i32"),
+    )
+    .expect("nonzero raw request process id");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        open_stdin.write_all(&vec![b'x'; 128 * 1024]),
+    )
+    .await
+    .expect("request-body reader becomes ready")
+    .expect("write partial request body");
+    kill_process(pid, Signal::INT).expect("send SIGINT");
+
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("SIGINT interrupts request-body input")
+        .expect("raw request completes");
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stdout.is_empty());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn underscore_header_is_rejected_before_stdin_or_network() {
     use std::io::Seek as _;
     use std::process::Stdio;
@@ -3937,6 +6233,451 @@ async fn raw_scan_preflight_rejects_invalid_cursor_without_network() {
         "scan_cursor_empty"
     );
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn raw_scan_page_limit_is_rejected_before_body_input() {
+    use std::io::Seek as _;
+
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let input_path = harness.directory.path().join("unread-reviewed-scan-body");
+    fs::write(&input_path, br#"{"must":"remain unread"}"#).expect("body fixture");
+    let mut input = fs::File::open(&input_path).expect("open body fixture");
+    let mut command = harness.command();
+    command
+        .stdin(Stdio::from(
+            input.try_clone().expect("duplicate body fixture"),
+        ))
+        .args([
+            "api",
+            "request",
+            "POST",
+            "/entities/_scan",
+            "--service",
+            "data",
+            "--query",
+            "max=201",
+            "--data",
+            "-",
+        ]);
+
+    let output = command.output().expect("scan pre-body check executes");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured page-size error")["error"]
+            ["code"],
+        "scan_page_size_too_large"
+    );
+    assert_eq!(input.stream_position().expect("body input position"), 0);
+
+    let missing = harness.directory.path().join("missing-reviewed-scan-body");
+    let data = format!("@{}", missing.display());
+    let output = harness
+        .command()
+        .args([
+            "api",
+            "request",
+            "POST",
+            "/entities/_scan",
+            "--service",
+            "data",
+            "--query",
+            "max=201",
+            "--data",
+            &data,
+        ])
+        .output()
+        .expect("scan file pre-body check executes");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured page-size error")["error"]
+            ["code"],
+        "scan_page_size_too_large"
+    );
+}
+
+#[test]
+fn raw_scan_continuation_is_not_replayable() {
+    let harness = Harness::new();
+    harness.add_profile(Some("https://routing.example"));
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .args([
+            "--dry-run",
+            "api",
+            "request",
+            "POST",
+            "/entities/_scan",
+            "--service",
+            "data",
+            "--query",
+            "max=100",
+            "--data",
+            r#"{"cursor":{"value":"cursor-value"}}"#,
+        ])
+        .output()
+        .expect("scan continuation dry run executes");
+
+    assert_success(&output);
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["data"]["practice_coverage"], "reviewed");
+    assert_eq!(envelope["data"]["safe_to_replay"], false);
+    assert_eq!(envelope["data"]["retry_policy"]["classification"], "unsafe");
+    assert_eq!(
+        envelope["data"]["retry_policy"]["automatic_retries_enabled"],
+        false
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_scan_continuation_response_failures_remain_non_replayable() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/reltio/api/TestTenant/entities/_scan"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-request-id", "raw-scan-continuation-1")
+                .set_body_raw(
+                    br#"{"objects":[],"objects":[]}"#.as_slice(),
+                    "application/json",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let mut command = harness.command();
+    command.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "api",
+        "request",
+        "POST",
+        "/entities/_scan",
+        "--service",
+        "data",
+        "--query",
+        "max=100",
+        "--data",
+        r#"{"cursor":{"value":"cursor-value"}}"#,
+    ]);
+
+    let output = run_process(command).await;
+
+    assert_eq!(output.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured scan error");
+    assert_eq!(error["error"]["code"], "api_response_invalid_json");
+    assert_eq!(error["error"]["http_status"], 200);
+    assert_eq!(error["error"]["request_id"], "raw-scan-continuation-1");
+    assert_eq!(
+        error["error"]["details"]["remote_operation_completed"],
+        true
+    );
+    assert_eq!(error["error"]["details"]["safe_to_replay"], false);
+    assert!(
+        error["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("Do not replay"))
+    );
+}
+
+#[test]
+fn raw_scan_options_are_validated_before_body_input() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let missing = harness.directory.path().join("missing-reviewed-scan-body");
+    let data = format!("@{}", missing.display());
+
+    for (options, expected_code) in [
+        ("futureOption", "invalid_scan_option"),
+        ("ovOnly,nonOvOnly", "scan_option_conflict"),
+    ] {
+        let output = harness
+            .command()
+            .args([
+                "api",
+                "request",
+                "POST",
+                "/entities/_scan",
+                "--service",
+                "data",
+                "--query",
+                &format!("options={options}"),
+                "--data",
+                &data,
+            ])
+            .output()
+            .expect("scan option pre-body check executes");
+
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr).expect("structured option error")["error"]
+                ["code"],
+            expected_code
+        );
+    }
+
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .args([
+            "--dry-run",
+            "api",
+            "request",
+            "POST",
+            "/entities/_scan",
+            "--service",
+            "data",
+            "--query",
+            "filter=equals(type,'configuration/entityTypes/Organization')",
+            "--query",
+            "options=sendHidden",
+        ])
+        .output()
+        .expect("unacknowledged raw scan option executes");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured option refusal")["error"]
+            ["code"],
+        "unverified_scan_options_refused"
+    );
+
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .args([
+            "--dry-run",
+            "api",
+            "request",
+            "POST",
+            "/entities/_scan",
+            "--service",
+            "data",
+            "--query",
+            "filter=equals(type,'configuration/entityTypes/Organization')",
+            "--query",
+            "options=sendHidden",
+            "--allow-unverified-scan-options",
+        ])
+        .output()
+        .expect("scan option dry run executes");
+    assert_success(&output);
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["data"]["practice_coverage"], "partial");
+    assert!(
+        envelope["meta"]["warnings"]
+            .as_array()
+            .expect("scan option warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("non-production tenant")))
+    );
+}
+
+#[test]
+fn raw_request_path_is_validated_before_body_input() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let missing = harness.directory.path().join("missing-raw-request-body");
+    let data = format!("@{}", missing.display());
+
+    let output = harness
+        .command()
+        .args([
+            "api",
+            "request",
+            "POST",
+            "/entities/_scan?max=201",
+            "--service",
+            "data",
+            "--data",
+            &data,
+        ])
+        .output()
+        .expect("path pre-body check executes");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured path error")["error"]["code"],
+        "invalid_request_path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_absolute_scan_routes_use_service_relative_prebody_matching() {
+    let server = MockServer::start().await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let missing = harness.directory.path().join("missing-absolute-scan-body");
+    let data = format!("@{}", missing.display());
+    let reviewed = format!("{}/reltio/api/TestTenant/entities/_scan", server.uri());
+
+    let output = harness
+        .command()
+        .args([
+            "api",
+            "request",
+            "POST",
+            &reviewed,
+            "--service",
+            "data",
+            "--query",
+            "max=201",
+            "--data",
+            &data,
+        ])
+        .output()
+        .expect("absolute reviewed scan preflight executes");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured page-size error")["error"]
+            ["code"],
+        "scan_page_size_too_large"
+    );
+
+    let alias = format!("{reviewed}/");
+    let output = harness
+        .command()
+        .args([
+            "api",
+            "request",
+            "POST",
+            &alias,
+            "--service",
+            "data",
+            "--data",
+            &data,
+        ])
+        .output()
+        .expect("absolute scan alias preflight executes");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured route error")["error"]["code"],
+        "unverified_scan_route_refused"
+    );
+
+    let unrelated = format!(
+        "{}/reltio/api/TestTenant/archive/entities/_scan",
+        server.uri()
+    );
+    let output = harness
+        .command()
+        .args([
+            "api",
+            "request",
+            "POST",
+            &unrelated,
+            "--service",
+            "data",
+            "--query",
+            "max=201",
+            "--data",
+            &data,
+        ])
+        .output()
+        .expect("unrelated absolute suffix executes");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured input error")["error"]["code"],
+        "local_input_unreadable"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_scan_refuses_the_unverified_v2_route_without_network() {
+    let server = MockServer::start().await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "opaque-token")
+        .args([
+            "--dry-run",
+            "--yes",
+            "--confirm-tenant",
+            "TestTenant",
+            "api",
+            "request",
+            "POST",
+            "/entities/v2/_scan",
+            "--service",
+            "data",
+            "--allow-unreviewed-endpoint",
+            "--query",
+            "max=201",
+            "--data",
+            r#"{"filter":"equals(type,'configuration/entityTypes/Organization')"}"#,
+        ])
+        .output()
+        .expect("unverified v2 scan request executes");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured route error")["error"]["code"],
+        "unverified_scan_route_refused"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn raw_scan_refuses_v2_trailing_slash_before_stdin_or_file_input() {
+    use std::io::Seek as _;
+
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let input_path = harness.directory.path().join("unread-v2-scan-body");
+    fs::write(&input_path, br#"{"must":"remain unread"}"#).expect("body fixture");
+    let mut input = fs::File::open(&input_path).expect("open body fixture");
+    let mut stdin_request = harness.command();
+    stdin_request
+        .stdin(Stdio::from(
+            input.try_clone().expect("duplicate body fixture"),
+        ))
+        .args([
+            "api",
+            "request",
+            "POST",
+            "/entities/v2/_scan?probe=1",
+            "--service",
+            "data",
+            "--data",
+            "-",
+        ]);
+
+    let output = stdin_request.output().expect("stdin route check executes");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured route error")["error"]["code"],
+        "unverified_scan_route_refused"
+    );
+    assert_eq!(input.stream_position().expect("body input position"), 0);
+
+    let missing = harness.directory.path().join("missing-v2-scan-body");
+    let data = format!("@{}", missing.display());
+    let output = harness
+        .command()
+        .args([
+            "api",
+            "request",
+            "POST",
+            "/entities/v2/_scan/",
+            "--service",
+            "data",
+            "--data",
+            &data,
+        ])
+        .output()
+        .expect("file route check executes");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured route error")["error"]["code"],
+        "unverified_scan_route_refused"
+    );
 }
 
 #[test]
@@ -4281,7 +7022,7 @@ async fn changed_profile_route_with_profile_credentials_sends_no_auth_or_data_re
     );
     harness.set_service_url("test", "auth", &auth.uri());
     let secret_file = harness.directory.path().join("profile-route-secret");
-    reltio_client::fs::atomic_write_private(&secret_file, b"profile-secret")
+    reltio_client::fs::atomic_write_private(&secret_file, b"fixture-profile-secret")
         .expect("private profile secret");
     let output = harness
         .command()
@@ -4364,7 +7105,7 @@ async fn explicit_changed_route_and_tenant_send_only_environment_bearer() {
         &format!("{}/reltio/api/{{tenant}}", profile_data.uri()),
     );
     harness.set_service_url("test", "auth", &auth.uri());
-    let secret_file = harness.directory.path().join("displaced-profile-secret");
+    let secret_file = harness.directory.path().join("configured-secret");
     reltio_client::fs::atomic_write_private(&secret_file, b"profile-secret")
         .expect("private profile secret");
     let output = harness
@@ -4503,12 +7244,7 @@ async fn failed_auth_login_preserves_previous_provider() {
     let harness = Harness::new();
     harness.add_profile(None);
     harness.set_service_url("test", "auth", &auth.uri());
-    let output = harness
-        .command()
-        .args(["profile", "update", "test", "--auth-method", "bearer"])
-        .output()
-        .expect("profile update executes");
-    assert_success(&output);
+    login_bearer(&harness, "test", "previous-provider-token");
 
     let mut login = harness.command();
     login
@@ -4532,6 +7268,64 @@ async fn failed_auth_login_preserves_previous_provider() {
         .expect("profile show executes");
     assert_success(&output);
     assert_eq!(stdout_json(&output)["data"]["auth"]["method"], "bearer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_provider_transition_removes_the_retired_bearer_generation() {
+    let auth = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "managed-transition-token",
+            "token_type": "bearer",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&auth)
+        .await;
+    let harness = Harness::new();
+    harness.add_profile(None);
+    harness.set_service_url("test", "auth", &auth.uri());
+    login_bearer(&harness, "test", "retired-bearer-token");
+    let secret_file = harness.directory.path().join("transition-secret");
+    reltio_client::fs::atomic_write_private(&secret_file, b"client-secret")
+        .expect("private client secret");
+
+    let mut login = harness.command();
+    login.env("RELTIO_AUTH_URL", auth.uri()).args([
+        "--quiet",
+        "auth",
+        "login",
+        "--method",
+        "client-credentials",
+        "--client-id",
+        "client-id",
+        "--secret-file",
+        secret_file.to_str().expect("UTF-8 path"),
+    ]);
+    let output = run_process(login).await;
+
+    assert_success(&output);
+    let token_files = cached_token_files(&harness.directory.path().join("cache"));
+    assert_eq!(token_files.len(), 1);
+    let cache = fs::read(&token_files[0]).expect("managed cache");
+    assert!(
+        cache
+            .windows("managed-transition-token".len())
+            .any(|window| window == b"managed-transition-token")
+    );
+    assert!(
+        !cache
+            .windows("retired-bearer-token".len())
+            .any(|window| window == b"retired-bearer-token")
+    );
+    let config = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("transitioned config");
+    assert!(config.pending_imported_bearer_cleanups.is_empty());
+    let profile = config.profiles.get("test").expect("transitioned profile");
+    assert_eq!(profile.auth.method, Some(AuthMethod::ClientCredentials));
+    assert!(profile.auth.bearer_cache_key.is_none());
 }
 
 #[test]
@@ -4660,71 +7454,163 @@ async fn login_rejects_changed_route_or_tenant_before_secret_stdin_or_network() 
 }
 
 #[test]
-fn login_guards_displaced_secret_file_and_basic_credentials() {
-    for (environment, client_id, secret, protected) in [
-        ("test", "old-client", "auth.login", "auth.login"),
-        ("enhxOnZ3", "zxq", "vw", "enhxOnZ3"),
-    ] {
-        let harness = Harness::new();
-        let output = harness
-            .command()
-            .args([
-                "profile",
-                "add",
-                "test",
-                "--environment",
-                environment,
-                "--tenant",
-                "TestTenant",
-            ])
-            .output()
-            .expect("profile add executes");
-        assert_success(&output);
-        let secret_file = harness.directory.path().join("previous-secret");
-        reltio_client::fs::atomic_write_private(&secret_file, secret.as_bytes())
-            .expect("private prior secret file");
-        let output = harness
-            .command()
-            .args([
-                "profile",
-                "update",
-                "test",
-                "--auth-method",
-                "client-credentials",
-                "--client-id",
-                client_id,
-                "--secret-file",
-                secret_file.to_str().expect("UTF-8 path"),
-            ])
-            .output()
-            .expect("profile update executes");
-        assert_success(&output);
-        let config_before = fs::read(harness.config_path()).expect("snapshot profile");
+fn login_guards_displaced_secret_file_material() {
+    let harness = Harness::new();
+    let output = harness
+        .command()
+        .args([
+            "profile",
+            "add",
+            "test",
+            "--environment",
+            "test",
+            "--tenant",
+            "TestTenant",
+        ])
+        .output()
+        .expect("profile add executes");
+    assert_success(&output);
+    let secret_file = harness.directory.path().join("previous-secret");
+    reltio_client::fs::atomic_write_private(&secret_file, b"displaced-secret")
+        .expect("private prior secret file");
+    let output = harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--auth-method",
+            "client-credentials",
+            "--client-id",
+            "old-client",
+            "--secret-file",
+            secret_file.to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("profile update executes");
+    assert_success(&output);
+    reltio_client::fs::atomic_write_private(&secret_file, b"auth.login")
+        .expect("replace displaced secret guard fixture");
+    let config_before = fs::read(harness.config_path()).expect("snapshot profile");
 
-        let output = harness
-            .command()
-            .env("RELTIO_ACCESS_TOKEN", "candidate-bearer-token")
-            .args([
-                "--quiet",
-                "auth",
-                "login",
-                "--method",
-                "bearer",
-                "--expires-in",
-                "1h",
-            ])
-            .output()
-            .expect("bearer login executes");
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "candidate-bearer-token")
+        .args([
+            "--quiet",
+            "auth",
+            "login",
+            "--method",
+            "bearer",
+            "--expires-in",
+            "1h",
+        ])
+        .output()
+        .expect("bearer login executes");
 
-        assert_eq!(output.status.code(), Some(5));
-        assert!(output.stdout.is_empty());
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(protected));
-        assert_eq!(
-            fs::read(harness.config_path()).expect("read unchanged profile"),
-            config_before
-        );
-        assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
-    }
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("auth.login"));
+    assert_eq!(
+        fs::read(harness.config_path()).expect("read unchanged profile"),
+        config_before
+    );
+    assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
+}
+
+#[test]
+fn environment_basic_credentials_guard_local_profile_output() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let client_id = "environment-client";
+    let client_secret = "environment-secret-9f4c2a7b";
+    let basic =
+        base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{client_secret}"));
+    let config_before = fs::read(harness.config_path()).expect("snapshot profile config");
+
+    let output = harness
+        .command()
+        .env("RELTIO_CLIENT_ID", client_id)
+        .env("RELTIO_CLIENT_SECRET", client_secret)
+        .args(["profile", "update", "test", "--client-id", &basic])
+        .output()
+        .expect("profile update executes");
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(&basic));
+    assert_eq!(
+        fs::read(harness.config_path()).expect("read unchanged config"),
+        config_before
+    );
+}
+
+#[test]
+fn mixed_source_basic_credentials_guard_local_profile_output() {
+    let configured_id = Harness::new();
+    configured_id.add_profile(None);
+    let output = configured_id
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--auth-method",
+            "client-credentials",
+            "--client-id",
+            "zxq",
+        ])
+        .output()
+        .expect("configured client ID update executes");
+    assert_success(&output);
+    let basic = base64::engine::general_purpose::STANDARD.encode("zxq:vw");
+    let before = fs::read(configured_id.config_path()).expect("configured-ID preimage");
+    let output = configured_id
+        .command()
+        .env("RELTIO_CLIENT_SECRET", "vw")
+        .args(["profile", "update", "test", "--tenant", &basic])
+        .output()
+        .expect("mixed configured-ID update executes");
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(&basic));
+    assert_eq!(
+        fs::read(configured_id.config_path()).expect("unchanged config"),
+        before
+    );
+
+    let configured_secret = Harness::new();
+    configured_secret.add_profile(None);
+    let secret_file = configured_secret.directory.path().join("mixed-secret");
+    reltio_client::fs::atomic_write_private(&secret_file, b"vw").expect("mixed-source secret file");
+    let output = configured_secret
+        .command()
+        .args([
+            "profile",
+            "update",
+            "test",
+            "--auth-method",
+            "client-credentials",
+            "--secret-file",
+            secret_file.to_str().expect("UTF-8 secret path"),
+        ])
+        .output()
+        .expect("configured secret update executes");
+    assert_success(&output);
+    let before = fs::read(configured_secret.config_path()).expect("configured-secret preimage");
+    let output = configured_secret
+        .command()
+        .env("RELTIO_CLIENT_ID", "zxq")
+        .args(["profile", "update", "test", "--tenant", &basic])
+        .output()
+        .expect("mixed configured-secret update executes");
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(&basic));
+    assert_eq!(
+        fs::read(configured_secret.config_path()).expect("unchanged config"),
+        before
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4861,40 +7747,17 @@ async fn warning_guard_refusal_does_not_commit_login_state() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn login_commit_conflict_guards_the_winning_profile_and_rolls_back_cache() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use wiremock::{Request, Respond};
-
-    struct DelayedTokenResponse {
-        observed: Arc<AtomicBool>,
-        release: Arc<AtomicBool>,
-    }
-
-    impl Respond for DelayedTokenResponse {
-        fn respond(&self, _request: &Request) -> ResponseTemplate {
-            self.observed.store(true, Ordering::Release);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !self.release.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            ResponseTemplate::new(200).set_body_json(json!({
+    let auth = MockServer::start().await;
+    let response_gate = ResponseGate::new();
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            response_gate.responder(ResponseTemplate::new(200).set_body_json(json!({
                 "access_token": "candidate-managed-token",
                 "token_type": "bearer",
                 "expires_in": 3600
-            }))
-        }
-    }
-
-    let auth = MockServer::start().await;
-    let request_observed = Arc::new(AtomicBool::new(false));
-    let release_response = Arc::new(AtomicBool::new(false));
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(DelayedTokenResponse {
-            observed: request_observed.clone(),
-            release: release_response.clone(),
-        })
+            }))),
+        )
         .expect(1)
         .mount(&auth)
         .await;
@@ -4905,7 +7768,7 @@ async fn login_commit_conflict_guards_the_winning_profile_and_rolls_back_cache()
     reltio_client::fs::atomic_write_private(&candidate_secret, b"candidate-secret")
         .expect("candidate secret file");
     let winner_secret = harness.directory.path().join("winner-secret");
-    reltio_client::fs::atomic_write_private(&winner_secret, b"auth_login_commit_conflict")
+    reltio_client::fs::atomic_write_private(&winner_secret, b"commit_conflict_marker")
         .expect("winner secret file");
     let mut login = harness.command();
     login.env("RELTIO_AUTH_URL", auth.uri()).args([
@@ -4924,34 +7787,31 @@ async fn login_commit_conflict_guards_the_winning_profile_and_rolls_back_cache()
         .stderr(std::process::Stdio::piped());
     let child = login.spawn().expect("login process starts");
     let pending_login = tokio::task::spawn_blocking(move || child.wait_with_output());
-    for _ in 0..6_000 {
-        if request_observed.load(Ordering::Acquire) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(
-        request_observed.load(Ordering::Acquire),
-        "login must load the old profile before the concurrent update"
-    );
-    let output = harness
-        .command()
-        .args([
-            "profile",
-            "update",
-            "test",
-            "--auth-method",
-            "client-credentials",
-            "--client-id",
-            "winner-client",
-            "--secret-file",
-            winner_secret.to_str().expect("UTF-8 path"),
-        ])
-        .output()
-        .expect("winning profile update executes");
-    assert_success(&output);
-    release_response.store(true, Ordering::Release);
-
+    response_gate.wait_observed().await;
+    ConfigStore::new(harness.config_path())
+        .modify_until(
+            Instant::now() + Duration::from_secs(5),
+            || false,
+            |config| {
+                config
+                    .profiles
+                    .get_mut("test")
+                    .expect("test profile exists")
+                    .auth = AuthProfile {
+                    method: Some(AuthMethod::ClientCredentials),
+                    client_id: Some("winner-client".to_owned()),
+                    secret_file: Some(winner_secret.clone()),
+                    credential_process: None,
+                    bearer_cache_key: None,
+                    bearer_cache_generation: None,
+                };
+                Ok(())
+            },
+        )
+        .expect("winning profile update commits");
+    let winner_config = fs::read_to_string(harness.config_path()).expect("winner config");
+    assert!(winner_config.contains("winner-client"), "{winner_config}");
+    response_gate.release();
     let output = pending_login
         .await
         .expect("login task completes")
@@ -4959,12 +7819,11 @@ async fn login_commit_conflict_guards_the_winning_profile_and_rolls_back_cache()
 
     assert_eq!(output.status.code(), Some(5));
     assert!(output.stdout.is_empty());
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("auth_login_commit_conflict"));
-    let fields: Value = serde_json::from_slice(&output.stderr).expect("guarded conflict error");
-    assert_eq!(fields[0], "reltio_guarded_failure");
-    assert!(fields[1].is_null());
-    assert_eq!(fields[7], 0);
-    assert_eq!(fields[11], 0);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("commit_conflict_marker"));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("guarded conflict error");
+    assert_eq!(error["error"]["code"], "auth_login_commit_conflict");
+    assert_eq!(error["error"]["details"]["safe_to_replay"], false);
+    assert_eq!(error["error"]["details"]["local_state_committed"], false);
     assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
     let profile = harness
         .command()
@@ -5049,7 +7908,7 @@ async fn login_output_failure_reports_that_local_state_was_committed() {
     reltio_client::fs::atomic_write_private(&secret_file, b"client-secret")
         .expect("private secret file");
 
-    let (_reader, mut writer) = UnixStream::pair().expect("Unix socket pair");
+    let (reader, mut writer) = UnixStream::pair().expect("Unix socket pair");
     writer
         .set_nonblocking(true)
         .expect("nonblocking output socket");
@@ -5062,6 +7921,7 @@ async fn login_output_failure_reports_that_local_state_was_committed() {
             Err(error) => panic!("failed to fill output socket: {error}"),
         }
     }
+    drop(reader);
     let mut login = harness.command();
     login
         .env("RELTIO_AUTH_URL", auth.uri())
@@ -5280,7 +8140,7 @@ async fn explicit_login_credentials_override_environment_credentials() {
     let harness = Harness::new();
     harness.add_profile(None);
     harness.set_service_url("test", "auth", &auth.uri());
-    let secret_file = harness.directory.path().join("explicit-secret");
+    let secret_file = harness.directory.path().join("credential-source");
     reltio_client::fs::atomic_write_private(&secret_file, b"explicit-secret")
         .expect("private secret file");
     let mut login = harness.command();
@@ -5340,12 +8200,7 @@ async fn failed_config_commit_does_not_persist_a_new_provider_token() {
     let harness = Harness::new();
     harness.add_profile(None);
     harness.set_service_url("test", "auth", &auth.uri());
-    let output = harness
-        .command()
-        .args(["profile", "update", "test", "--auth-method", "bearer"])
-        .output()
-        .expect("profile update executes");
-    assert_success(&output);
+    login_bearer(&harness, "test", "previous-transaction-bearer");
     let secret_file = harness.directory.path().join("transaction-secret");
     reltio_client::fs::atomic_write_private(&secret_file, b"explicit-secret")
         .expect("private secret file");
@@ -5385,7 +8240,15 @@ async fn failed_config_commit_does_not_persist_a_new_provider_token() {
                     .is_some_and(|name| name.to_string_lossy().starts_with("rate-"))
         })
         .count();
-    assert_eq!(cached_tokens, 0);
+    assert_eq!(cached_tokens, 1);
+    assert!(
+        cached_token_files(&harness.directory.path().join("cache"))
+            .iter()
+            .all(|path| !fs::read(path)
+                .expect("read retained bearer cache")
+                .windows("transaction-token".len())
+                .any(|window| window == b"transaction-token"))
+    );
     let output = harness
         .command()
         .args(["profile", "show", "test"])
@@ -5515,7 +8378,8 @@ fn auth_status_guards_configured_secret_file_material() {
     let harness = Harness::new();
     harness.add_profile(None);
     let secret_file = harness.directory.path().join("client-secret");
-    reltio_client::fs::atomic_write_private(&secret_file, b"data").expect("private secret file");
+    reltio_client::fs::atomic_write_private(&secret_file, b"ordinary-secret")
+        .expect("private secret file");
     let output = harness
         .command()
         .args([
@@ -5532,6 +8396,8 @@ fn auth_status_guards_configured_secret_file_material() {
         .output()
         .expect("profile update executes");
     assert_success(&output);
+    reltio_client::fs::atomic_write_private(&secret_file, b"data")
+        .expect("replace secret with guarded fixture");
 
     let output = harness
         .command()
@@ -5553,7 +8419,7 @@ fn oversized_client_secret_file_is_refused_before_guard_construction() {
     let harness = Harness::new();
     harness.add_profile(None);
     let secret_file = harness.directory.path().join("oversized-client-secret");
-    reltio_client::fs::atomic_write_private(&secret_file, &vec![b'x'; 1024 * 1024 + 1])
+    reltio_client::fs::atomic_write_private(&secret_file, b"ordinary-secret")
         .expect("private secret file");
     let output = harness
         .command()
@@ -5571,6 +8437,8 @@ fn oversized_client_secret_file_is_refused_before_guard_construction() {
         .output()
         .expect("profile update executes");
     assert_success(&output);
+    reltio_client::fs::atomic_write_private(&secret_file, &vec![b'x'; 1024 * 1024 + 1])
+        .expect("replace oversized private secret file");
 
     let output = harness
         .command()
@@ -5843,13 +8711,7 @@ fn logout_clears_stale_profile_tokens_even_when_auth_is_unconfigured() {
     let harness = Harness::new();
     harness.add_profile(None);
     let cache_dir = harness.directory.path().join("cache");
-    reltio_client::auth::TokenManager::import_bearer(
-        &cache_dir,
-        "test",
-        SecretString::from("stale-token".to_owned()),
-        Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
-    )
-    .expect("import stale token");
+    seed_bearer_cache(&harness, "stale-token");
 
     let output = harness
         .command()
@@ -5868,17 +8730,36 @@ fn logout_clears_stale_profile_tokens_even_when_auth_is_unconfigured() {
 }
 
 #[test]
+fn logout_deconfigures_imported_bearer_profiles_after_global_cache_cleanup() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    login_bearer(&harness, "test", "logout-profile-token");
+
+    let output = harness
+        .command()
+        .args(["auth", "logout"])
+        .output()
+        .expect("logout executes");
+
+    assert_success(&output);
+    assert_eq!(
+        stdout_json(&output)["data"]["imported_bearer_profiles_cleared"],
+        1
+    );
+    let config = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("logged-out config");
+    let profile = config.profiles.get("test").expect("profile remains");
+    assert_eq!(profile.auth, AuthProfile::default());
+    assert!(cached_token_files(&harness.directory.path().join("cache")).is_empty());
+}
+
+#[test]
 fn logout_guards_tokens_collected_before_cache_deletion() {
     let harness = Harness::new();
     harness.add_profile(None);
     let cache_dir = harness.directory.path().join("cache");
-    reltio_client::auth::TokenManager::import_bearer(
-        &cache_dir,
-        "test",
-        SecretString::from("data".to_owned()),
-        Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
-    )
-    .expect("import token");
+    seed_bearer_cache(&harness, "data");
 
     let output = harness
         .command()
@@ -5905,13 +8786,7 @@ fn logout_emergency_error_reports_committed_cache_clear() {
     let harness = Harness::new();
     harness.add_profile(None);
     let cache_dir = harness.directory.path().join("cache");
-    reltio_client::auth::TokenManager::import_bearer(
-        &cache_dir,
-        "test",
-        SecretString::from("false".to_owned()),
-        Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
-    )
-    .expect("import token");
+    seed_bearer_cache(&harness, "false");
 
     let output = harness
         .command()
@@ -5935,13 +8810,7 @@ fn logout_irreducible_short_token_uses_a_safe_scalar_after_commit() {
     let harness = Harness::new();
     harness.add_profile(None);
     let cache_dir = harness.directory.path().join("cache");
-    reltio_client::auth::TokenManager::import_bearer(
-        &cache_dir,
-        "test",
-        SecretString::from("1".to_owned()),
-        Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
-    )
-    .expect("import token");
+    seed_bearer_cache(&harness, "1");
 
     let output = harness
         .command()
@@ -5963,14 +8832,7 @@ fn logout_irreducible_short_token_uses_a_safe_scalar_after_commit() {
 fn logout_clears_cache_even_when_configuration_is_invalid() {
     let harness = Harness::new();
     harness.add_profile(None);
-    let cache_dir = harness.directory.path().join("cache");
-    reltio_client::auth::TokenManager::import_bearer(
-        &cache_dir,
-        "test",
-        SecretString::from("stale-token".to_owned()),
-        Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
-    )
-    .expect("import stale token");
+    seed_bearer_cache(&harness, "stale-token");
     fs::write(harness.config_path(), "not valid [ TOML\n").expect("break config");
 
     let output = harness
@@ -6553,6 +9415,42 @@ async fn run_process(mut command: Command) -> Output {
         .expect("process task completes")
 }
 
+fn run_process_with_watchdog(mut command: Command, timeout: Duration) -> Output {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("CLI process starts");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("inspect CLI process").is_some() {
+            return child.wait_with_output().expect("CLI process output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("reap timed-out CLI process");
+            panic!(
+                "CLI process exceeded the test watchdog\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn spawn_captured_process(command: Command) -> tokio::process::Child {
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.spawn().expect("CLI process starts")
+}
+
 fn login_bearer(harness: &Harness, profile: &str, token: &str) {
     let output = harness
         .command()
@@ -6570,6 +9468,29 @@ fn login_bearer(harness: &Harness, profile: &str, token: &str) {
         .output()
         .expect("bearer login executes");
     assert_success(&output);
+}
+
+fn seed_bearer_cache(harness: &Harness, token: &str) {
+    let config = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("load bearer fixture profile");
+    let target = resolve_target(
+        &config,
+        &Environment::default(),
+        &ResolutionOverrides {
+            profile: Some("test".to_owned()),
+            ..ResolutionOverrides::default()
+        },
+    )
+    .expect("resolve bearer fixture target");
+    reltio_client::auth::TokenManager::import_bearer(
+        &harness.directory.path().join("cache"),
+        &harness.config_path(),
+        &target,
+        SecretString::from(token.to_owned()),
+        Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
+    )
+    .expect("import bearer fixture token");
 }
 
 fn assert_profile_and_token(harness: &Harness, profile: &str, expected_token: &str) {
@@ -6623,10 +9544,25 @@ fn cached_token_files(cache_dir: &std::path::Path) -> Vec<PathBuf> {
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
-        "command failed\nstdout: {}\nstderr: {}",
+        "command failed\nstatus: {}\ncode: {:?}\nsignal: {:?}\nstdout: {}\nstderr: {}",
+        output.status,
+        output.status.code(),
+        exit_signal(output.status),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(unix)]
+fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 fn stdout_json(output: &Output) -> Value {

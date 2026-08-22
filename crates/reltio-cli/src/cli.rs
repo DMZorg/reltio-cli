@@ -374,13 +374,16 @@ pub struct EntityScanArgs {
     pub checkpoint_every: u64,
     #[arg(long = "option")]
     pub options: Vec<String>,
+    /// Acknowledge that scan options are sourced from a conflicting route contract.
+    #[arg(long, requires = "options")]
+    pub allow_unverified_scan_options: bool,
     #[arg(long, value_parser = ["active", "all", "not_active"])]
     pub activeness: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct EntityHistoryArgs {
-    /// Entity ID or canonical entities/<id> URI.
+    /// Entity ID or canonical `entities/<id>` URI.
     pub entity: String,
     #[arg(long = "max-items", alias = "max", default_value_t = 50)]
     pub max_items: u32,
@@ -405,7 +408,7 @@ pub struct EntityHistoryArgs {
 
 #[derive(Debug, Args)]
 pub struct EntityMatchesArgs {
-    /// Entity ID or canonical entities/<id> URI.
+    /// Entity ID or canonical `entities/<id>` URI.
     pub entity: String,
     /// Maximum direct matches to request. Reltio documents 200 as the API default, not a limit.
     #[arg(long = "max-items", alias = "max", default_value_t = 50)]
@@ -450,6 +453,9 @@ pub struct ApiRequestArgs {
     /// Required in addition to normal confirmations for an unreviewed mutation.
     #[arg(long)]
     pub allow_unreviewed_endpoint: bool,
+    /// Acknowledge provisional scan options on the exact reviewed scan route.
+    #[arg(long)]
+    pub allow_unverified_scan_options: bool,
 }
 
 #[derive(Debug, Args)]

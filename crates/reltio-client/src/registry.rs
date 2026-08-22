@@ -38,6 +38,8 @@ pub struct Endpoint {
     #[serde(default)]
     pub result_boundary: Option<u64>,
     #[serde(default)]
+    pub page_size_max: Option<u32>,
+    #[serde(default)]
     pub cursor_ttl_seconds: Option<u64>,
     pub command_links: Vec<EndpointCommandLink>,
     pub practice_ids: Vec<String>,
@@ -97,6 +99,7 @@ pub enum Consistency {
 pub enum ReplayPolicy {
     Safe,
     SafeWithLimit,
+    Conditional,
     Unsafe,
 }
 
@@ -196,6 +199,8 @@ pub struct ReleaseOperation {
     pub required_endpoint_ids: Vec<String>,
     #[serde(default)]
     pub contract_ids: Vec<String>,
+    #[serde(default)]
+    pub implementation_test_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -622,6 +627,10 @@ fn validate_release_requirements(requirements: &ReleaseRequirementDocument) -> R
         || requirements.product_contract.path != "docs/PRD.md"
         || requirements.product_contract.sections.is_empty()
         || requirements.inventory_test_ids.is_empty()
+        || !evidence_matches(
+            &requirements.inventory_test_ids,
+            &crate::release_contract::V0_1_INVENTORY_TEST_IDS,
+        )
         || requirements.operations.len() != crate::release_contract::V0_1_REQUIRED_OPERATIONS.len()
         || requirements.capabilities.len()
             != crate::release_contract::V0_1_REQUIRED_CAPABILITIES.len()
@@ -689,6 +698,26 @@ fn validate_release_requirements(requirements: &ReleaseRequirementDocument) -> R
             || allowed_results.len() != contract.allowed_results.len()
             || result_evidence != expected_results
             || contract.guard_test_ids.is_empty()
+            || !evidence_matches(
+                &contract.guard_test_ids,
+                &crate::release_contract::MUTATION_AUDIT_GUARD_EVIDENCE,
+            )
+            || !contract.field_test_ids.iter().all(|(field, evidence)| {
+                crate::release_contract::MUTATION_AUDIT_FIELD_EVIDENCE
+                    .iter()
+                    .find_map(|(expected_field, expected)| {
+                        (*expected_field == field).then_some(*expected)
+                    })
+                    .is_some_and(|expected| evidence_matches(evidence, expected))
+            })
+            || !contract.result_test_ids.iter().all(|(result, evidence)| {
+                crate::release_contract::MUTATION_AUDIT_RESULT_EVIDENCE
+                    .iter()
+                    .find_map(|(expected_result, expected)| {
+                        (*expected_result == result).then_some(*expected)
+                    })
+                    .is_some_and(|expected| evidence_matches(evidence, expected))
+            })
             || !guard_tests.is_disjoint(&implementation_tests)
         {
             return Err(ReltioError::internal(format!(
@@ -780,6 +809,19 @@ fn validate_release_requirements(requirements: &ReleaseRequirementDocument) -> R
                 operation.id
             )));
         }
+        let expected_implementation_evidence = crate::release_contract::V0_1_OPERATION_EVIDENCE
+            .iter()
+            .find_map(|(command, evidence)| (*command == operation.id).then_some(*evidence))
+            .unwrap_or(&[]);
+        if !evidence_matches(
+            &operation.implementation_test_ids,
+            expected_implementation_evidence,
+        ) {
+            return Err(ReltioError::internal(format!(
+                "release operation {} has unapproved implementation evidence",
+                operation.id
+            )));
+        }
         if operation.safety == "remote_write" {
             write_operations.insert(operation.id.as_str());
         }
@@ -847,6 +889,12 @@ fn validate_release_requirements(requirements: &ReleaseRequirementDocument) -> R
             || capability.argument.trim().is_empty()
             || capability.required_value.trim().is_empty()
             || capability.source_section.trim().is_empty()
+            || !crate::release_contract::V0_1_CAPABILITY_EVIDENCE
+                .iter()
+                .find_map(|(id, expected)| (*id == capability.id).then_some(*expected))
+                .is_some_and(|expected| {
+                    evidence_matches(&capability.implementation_test_ids, expected)
+                })
         {
             return Err(ReltioError::internal(format!(
                 "release capability {} has an invalid acceptance definition",
@@ -868,6 +916,12 @@ fn validate_release_requirements(requirements: &ReleaseRequirementDocument) -> R
         if !acceptance_ids.insert(scenario.id.as_str())
             || scenario.summary.trim().is_empty()
             || scenario.source_section.trim().is_empty()
+            || !crate::release_contract::MVP_ACCEPTANCE_EVIDENCE
+                .iter()
+                .find_map(|(id, expected)| (*id == scenario.id).then_some(*expected))
+                .is_some_and(|expected| {
+                    evidence_matches(&scenario.implementation_test_ids, expected)
+                })
         {
             return Err(ReltioError::internal(format!(
                 "acceptance scenario {} has an invalid definition",
@@ -883,7 +937,59 @@ fn validate_release_requirements(requirements: &ReleaseRequirementDocument) -> R
             "the release inventory does not match the independent MVP acceptance set",
         ));
     }
+    let guard_evidence_ids = requirements
+        .contracts
+        .iter()
+        .flat_map(|contract| contract.guard_test_ids.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let mut implementation_evidence_ids = requirements
+        .operations
+        .iter()
+        .flat_map(|operation| operation.implementation_test_ids.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    for contract in &requirements.contracts {
+        implementation_evidence_ids.extend(
+            contract
+                .field_test_ids
+                .values()
+                .chain(contract.result_test_ids.values())
+                .flatten()
+                .map(String::as_str),
+        );
+    }
+    for capability in &requirements.capabilities {
+        implementation_evidence_ids.extend(
+            capability
+                .implementation_test_ids
+                .iter()
+                .map(String::as_str),
+        );
+    }
+    for scenario in &requirements.acceptance_scenarios {
+        implementation_evidence_ids
+            .extend(scenario.implementation_test_ids.iter().map(String::as_str));
+    }
+    if !crate::release_contract::evidence_claim_bindings_are_disjoint(
+        &requirements
+            .inventory_test_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        &guard_evidence_ids,
+        &implementation_evidence_ids,
+        &crate::release_contract::V0_1_RELEASE_EVIDENCE_BINDINGS,
+    ) {
+        return Err(ReltioError::internal(
+            "inventory, guard, and implementation evidence claims overlap",
+        ));
+    }
     Ok(())
+}
+
+fn evidence_matches(actual: &[String], expected: &[&str]) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().map(String::as_str).collect::<BTreeSet<_>>()
+            == expected.iter().copied().collect::<BTreeSet<_>>()
 }
 
 impl ReleaseContract {
@@ -946,9 +1052,44 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+
     use super::*;
 
-    #[test]
+    #[::std::prelude::v1::test]
+    fn release_evidence_functions_are_discoverable_in_client_unit_harness() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let output = Command::new(&executable)
+            .args(["--list", "--format", "terse"])
+            .output()
+            .expect("list client unit tests");
+        assert!(output.status.success(), "test listing failed: {output:?}");
+        let listed = String::from_utf8(output.stdout).expect("UTF-8 test listing");
+        let dep_info = fs::read_to_string(executable.with_extension("d"))
+            .expect("client test dep-info is readable")
+            .replace('\\', "/");
+        for (_, path, _, expected) in crate::release_evidence_bindings_for_validation()
+            .iter()
+            .filter(|(_, path, _, _)| path.starts_with("crates/reltio-client/src/"))
+        {
+            assert!(
+                listed
+                    .lines()
+                    .any(|line| line == format!("{expected}: test")),
+                "release evidence test {expected} is absent from the client unit harness"
+            );
+            assert!(
+                dep_info
+                    .split_ascii_whitespace()
+                    .map(|entry| entry.trim_end_matches(':'))
+                    .any(|entry| entry == *path),
+                "release evidence source {path} is absent from client test dep-info"
+            );
+        }
+    }
+
+    #[::std::prelude::v1::test]
     fn release_inventory_rejects_substituted_required_operation() {
         let mut requirements = Registry::embedded()
             .expect("registry parses")
@@ -966,7 +1107,7 @@ mod tests {
             .expect_err("substituting a required operation must fail");
     }
 
-    #[test]
+    #[::std::prelude::v1::test]
     fn release_inventory_rejects_safety_and_endpoint_downgrades() {
         let baseline = Registry::embedded()
             .expect("registry parses")
@@ -1003,7 +1144,7 @@ mod tests {
             .expect_err("an unrelated dependency endpoint cannot satisfy typed ownership");
     }
 
-    #[test]
+    #[::std::prelude::v1::test]
     fn mutation_audit_guard_evidence_cannot_claim_implementation() {
         let mut requirements = Registry::embedded()
             .expect("registry parses")
@@ -1025,6 +1166,77 @@ mod tests {
     }
 
     #[test]
+    fn aliased_evidence_ids_cannot_bridge_guard_and_implementation_claims() {
+        let bindings = [
+            ("guard-id", "tests/release.rs", "same_test", "guard_test"),
+            (
+                "implementation-id",
+                "tests/release.rs",
+                "same_test",
+                "implementation_test",
+            ),
+        ];
+
+        assert!(
+            !crate::release_contract::evidence_claim_bindings_are_disjoint(
+                &[],
+                &["guard-id"],
+                &["implementation-id"],
+                &bindings,
+            )
+        );
+
+        let harness_alias = [
+            ("guard-id", "tests/guard.rs", "guard_test", "same_test"),
+            (
+                "implementation-id",
+                "tests/implementation.rs",
+                "implementation_test",
+                "same_test",
+            ),
+        ];
+        assert!(
+            !crate::release_contract::evidence_claim_bindings_are_disjoint(
+                &[],
+                &["guard-id"],
+                &["implementation-id"],
+                &harness_alias,
+            )
+        );
+    }
+
+    #[::std::prelude::v1::test]
+    fn release_requirements_reject_unapproved_evidence_substitution() {
+        let baseline = Registry::embedded()
+            .expect("registry parses")
+            .requirements()
+            .clone();
+
+        let mut capability = baseline.clone();
+        capability.capabilities[0]
+            .implementation_test_ids
+            .push("release_prd_inventory".to_owned());
+        let _ = validate_release_requirements(&capability)
+            .expect_err("inventory evidence cannot prove an implementation capability");
+
+        let mut scenario = baseline.clone();
+        scenario.acceptance_scenarios[0]
+            .implementation_test_ids
+            .push("entity_matches_contract".to_owned());
+        let _ = validate_release_requirements(&scenario)
+            .expect_err("an unrelated endpoint test cannot prove an acceptance scenario");
+
+        let mut contract = baseline;
+        contract.contracts[0]
+            .result_test_ids
+            .get_mut("succeeded")
+            .expect("success-result evidence")
+            .push("mutation_audit_absence_fails_closed".to_owned());
+        let _ = validate_release_requirements(&contract)
+            .expect_err("a refusal test cannot prove an audit result implementation");
+    }
+
+    #[::std::prelude::v1::test]
     fn release_requirement_yaml_rejects_unknown_fields() {
         let source = format!("{RELEASE_REQUIREMENTS_YAML}\nunexpected_release_claim: true\n");
         serde_yaml::from_str::<ReleaseRequirementDocument>(&source)

@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{NaiveDate, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use syn::ext::IdentExt;
 
 #[path = "src/release_contract.rs"]
 mod release_contract;
@@ -80,6 +81,8 @@ struct Endpoint {
     #[serde(default)]
     result_boundary: Option<u64>,
     #[serde(default)]
+    page_size_max: Option<u32>,
+    #[serde(default)]
     cursor_ttl_seconds: Option<u64>,
     command_links: Vec<EndpointCommandLink>,
     practice_ids: Vec<String>,
@@ -95,16 +98,56 @@ struct EndpointCommandLink {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EvidenceDocument {
     schema_version: u32,
     tests: Vec<TestEvidence>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TestEvidence {
     id: String,
     path: String,
     function: String,
+}
+
+#[derive(Deserialize)]
+struct CargoManifest {
+    package: CargoPackage,
+    #[serde(default)]
+    features: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    lib: Option<CargoTarget>,
+    #[serde(default, rename = "bin")]
+    bins: Vec<CargoTarget>,
+    #[serde(default, rename = "test")]
+    tests: Vec<CargoTarget>,
+}
+
+#[derive(Deserialize)]
+struct CargoPackage {
+    name: String,
+    #[serde(default)]
+    build: Option<String>,
+    #[serde(default)]
+    autolib: Option<bool>,
+    #[serde(default)]
+    autotests: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CargoTarget {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    test: Option<bool>,
+    #[serde(default)]
+    harness: Option<bool>,
+    #[serde(default, rename = "required-features")]
+    required_features: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +185,8 @@ struct ReleaseOperation {
     required_endpoint_ids: Vec<String>,
     #[serde(default)]
     contract_ids: Vec<String>,
+    #[serde(default)]
+    implementation_test_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -177,8 +222,10 @@ struct ReleaseContract {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamLock {
     schema_version: u32,
+    content_fingerprint_version: u32,
     corpus: UpstreamCorpus,
     deprecations: UpstreamDeprecations,
     release_notes: UpstreamReleaseNotes,
@@ -187,46 +234,107 @@ struct UpstreamLock {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamCorpus {
+    repository: String,
     commit: String,
+    generated_at: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamDeprecations {
     index_url: String,
+    index_content_sha256: String,
+    index_link_count: usize,
+    index_link_url_set_sha256: String,
+    index_links: Vec<String>,
     sitemap_url: String,
     notice_count: usize,
     notice_url_set_sha256: String,
     notice_state_sha256: String,
+    notice_content_sha256: String,
+    notice_content_sources: Vec<UpstreamContentSource>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamReleaseNotes {
     sitemap_url: String,
     family: String,
     page_count: usize,
     page_url_set_sha256: String,
     page_state_sha256: String,
+    page_content_sha256: String,
+    page_content_sources: Vec<UpstreamContentSource>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamReview {
     reviewed_at: String,
+    language: String,
     release_notes_through: String,
+    practice_source_count: usize,
+    practice_source_url_set_sha256: String,
+    practice_source_content_sha256: String,
+    practice_content_sources: Vec<UpstreamContentSource>,
+    notes: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamContentSource {
+    url: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamOpenApi {
     name: String,
     url: String,
     retrieved_at: String,
-    last_modified: String,
-    etag: String,
-    content_type: String,
     sha256: String,
     info_version: String,
-    operation_ids: Vec<String>,
+    operations: Vec<UpstreamOpenApiOperation>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamOpenApiOperation {
+    endpoint_id: String,
+    method: String,
+    path: String,
+    operation_id: String,
+}
+
+const REVIEWED_OPENAPI_OPERATIONS: [(&str, &str, &str, &str); 4] = [
+    (
+        "entity.by-crosswalk",
+        "GET",
+        "/services/reltio/api/{tenantId}/entities/_byCrosswalk/{crosswalkValue}",
+        "getEntityByCrosswalk",
+    ),
+    (
+        "entity.history",
+        "GET",
+        "/services/reltio/api/{tenantId}/entities/{id}/_changes",
+        "getChangesByTenant",
+    ),
+    (
+        "entity.matches",
+        "GET",
+        "/services/reltio/api/{tenantId}/entities/{id}/_matches",
+        "getPotentialMatchesByTenantPerEntity",
+    ),
+    (
+        "entity.scan",
+        "POST",
+        "/services/reltio/api/{tenantId}/entities/v2/_scan",
+        "getEntitiesByScanSearch",
+    ),
+];
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
@@ -237,6 +345,8 @@ fn main() {
     let upstream_path = manifest.join("../../docs/upstream.lock.yaml");
     let product_contract_path = manifest.join("../../docs/PRD.md");
     let repository_root = manifest.join("../..");
+
+    validate_repository_cargo_manifests(&repository_root);
 
     println!("cargo:rerun-if-changed={}", practices_path.display());
     println!("cargo:rerun-if-changed={}", endpoints_path.display());
@@ -261,6 +371,22 @@ fn main() {
         "unsupported upstream-lock schema"
     );
     assert_eq!(
+        upstream.content_fingerprint_version, 2,
+        "unsupported upstream content-fingerprint version"
+    );
+    assert!(
+        upstream.corpus.repository == "https://github.com/reltio-ai/reltio-ai-ready-docs"
+            && upstream
+                .corpus
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && upstream.corpus.commit.len() == 40
+            && chrono::DateTime::parse_from_rfc3339(&upstream.corpus.generated_at)
+                .is_ok_and(|generated| generated <= Utc::now()),
+        "upstream lock has invalid corpus provenance"
+    );
+    assert_eq!(
         requirements.schema_version, 1,
         "unsupported release-requirement schema"
     );
@@ -277,8 +403,12 @@ fn main() {
         "practice catalog and upstream lock use different release-note positions"
     );
     assert!(
-        upstream.deprecations.index_url.starts_with("https://")
-            && upstream.deprecations.sitemap_url.starts_with("https://")
+        upstream.deprecations.index_url
+            == "https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance"
+            && valid_sha256(&upstream.deprecations.index_content_sha256)
+            && upstream.deprecations.index_link_count > 0
+            && valid_sha256(&upstream.deprecations.index_link_url_set_sha256)
+            && upstream.deprecations.sitemap_url == "https://docs.reltio.com/en/reltio/sitemap.xml"
             && upstream.deprecations.notice_count > 0
             && upstream.deprecations.notice_url_set_sha256.len() == 64
             && upstream
@@ -286,21 +416,76 @@ fn main() {
                 .notice_url_set_sha256
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
-            && valid_sha256(&upstream.deprecations.notice_state_sha256),
+            && valid_sha256(&upstream.deprecations.notice_state_sha256)
+            && valid_sha256(&upstream.deprecations.notice_content_sha256),
         "upstream lock has an invalid deprecation-index fingerprint"
     );
+    validate_url_set(
+        "deprecation index links",
+        &upstream.deprecations.index_links,
+        upstream.deprecations.index_link_count,
+        &upstream.deprecations.index_link_url_set_sha256,
+    );
     assert!(
-        upstream.release_notes.sitemap_url.starts_with("https://")
+        upstream.release_notes.sitemap_url == upstream.deprecations.sitemap_url
             && !upstream.release_notes.family.trim().is_empty()
             && upstream.release_notes.page_count > 0
             && valid_sha256(&upstream.release_notes.page_url_set_sha256)
-            && valid_sha256(&upstream.release_notes.page_state_sha256),
+            && valid_sha256(&upstream.release_notes.page_state_sha256)
+            && valid_sha256(&upstream.release_notes.page_content_sha256),
         "upstream lock has an invalid release-note fingerprint"
+    );
+    assert!(
+        upstream.review.language == "en"
+            && !upstream.review.notes.trim().is_empty()
+            && upstream.review.practice_source_count > 0
+            && valid_sha256(&upstream.review.practice_source_url_set_sha256)
+            && valid_sha256(&upstream.review.practice_source_content_sha256),
+        "upstream lock has an invalid practice-source fingerprint"
+    );
+    let deprecation_content_urls = validate_content_sources(
+        "deprecation notices",
+        &upstream.deprecations.notice_content_sources,
+        upstream.deprecations.notice_count,
+        &upstream.deprecations.notice_url_set_sha256,
+        &upstream.deprecations.notice_content_sha256,
+    );
+    let release_content_urls = validate_content_sources(
+        "release notes",
+        &upstream.release_notes.page_content_sources,
+        upstream.release_notes.page_count,
+        &upstream.release_notes.page_url_set_sha256,
+        &upstream.release_notes.page_content_sha256,
+    );
+    let practice_content_urls = validate_content_sources(
+        "practice sources",
+        &upstream.review.practice_content_sources,
+        upstream.review.practice_source_count,
+        &upstream.review.practice_source_url_set_sha256,
+        &upstream.review.practice_source_content_sha256,
+    );
+    let catalog_practice_urls = practices
+        .practices
+        .iter()
+        .map(|practice| practice.source.url.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        practice_content_urls, catalog_practice_urls,
+        "locked practice-source fingerprints do not match the catalog source URLs"
+    );
+    assert!(
+        !deprecation_content_urls.is_empty() && !release_content_urls.is_empty(),
+        "locked documentation content-source sets must not be empty"
     );
     let mut openapi_names = BTreeSet::new();
     assert!(
         !upstream.openapi.is_empty(),
         "upstream lock has no OpenAPI source"
+    );
+    assert_eq!(
+        upstream.openapi.len(),
+        1,
+        "the drift workflow must be extended before adding another OpenAPI source"
     );
     for source in &upstream.openapi {
         assert!(
@@ -309,20 +494,58 @@ fn main() {
             source.name
         );
         assert!(
-            source.url.starts_with("https://")
-                && chrono::DateTime::parse_from_rfc3339(&source.retrieved_at).is_ok()
-                && !source.last_modified.trim().is_empty()
-                && !source.etag.trim().is_empty()
-                && !source.content_type.trim().is_empty()
+            source.name == "data-operation"
+                && source.url == "https://developer.reltio.com/swagger/Data%20Operation"
+                && chrono::DateTime::parse_from_rfc3339(&source.retrieved_at)
+                    .is_ok_and(|retrieved| retrieved <= Utc::now())
                 && valid_sha256(&source.sha256)
-                && !source.info_version.trim().is_empty()
-                && !source.operation_ids.is_empty()
-                && source
-                    .operation_ids
-                    .iter()
-                    .all(|operation| !operation.trim().is_empty()),
+                && source.info_version == "2020.2"
+                && !source.operations.is_empty()
+                && source.operations.iter().all(|operation| {
+                    !operation.endpoint_id.is_empty()
+                        && !operation.method.is_empty()
+                        && operation.path.starts_with('/')
+                        && !operation.operation_id.is_empty()
+                        && operation
+                            .operation_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                }),
             "upstream lock has invalid OpenAPI provenance for {}",
             source.name
+        );
+        let operations = source
+            .operations
+            .iter()
+            .map(|operation| {
+                (
+                    operation.endpoint_id.as_str(),
+                    operation.method.as_str(),
+                    operation.path.as_str(),
+                    operation.operation_id.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            operations.len(),
+            source.operations.len(),
+            "OpenAPI operation bindings contain duplicates"
+        );
+        assert_eq!(
+            operations,
+            REVIEWED_OPENAPI_OPERATIONS.into_iter().collect(),
+            "OpenAPI operation bindings differ from the reviewed endpoint ownership"
+        );
+        let endpoint_ids = endpoints
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            operations
+                .iter()
+                .all(|(endpoint_id, _, _, _)| endpoint_ids.contains(endpoint_id)),
+            "OpenAPI operation bindings reference unknown endpoint IDs"
         );
     }
     assert!(
@@ -331,39 +554,238 @@ fn main() {
     );
 
     let mut evidence_ids = BTreeSet::new();
+    let mut evidence_attributions = BTreeMap::new();
+    let mut evidence_sources = BTreeMap::new();
+    let mut package_features = BTreeMap::new();
+    let canonical_repository_root = repository_root
+        .canonicalize()
+        .expect("repository root must be canonicalizable");
+    validate_release_cargo_targets(&canonical_repository_root);
     for test in &evidence.tests {
+        assert!(
+            !test.id.trim().is_empty()
+                && !test.path.trim().is_empty()
+                && !test.function.trim().is_empty(),
+            "test-evidence entries require nonempty IDs, paths, and functions"
+        );
         assert!(
             evidence_ids.insert(test.id.as_str()),
             "duplicate test-evidence ID: {}",
             test.id
         );
-        let source_path = repository_root.join(&test.path);
-        println!("cargo:rerun-if-changed={}", source_path.display());
-        let source = fs::read_to_string(&source_path).unwrap_or_else(|error| {
+        evidence_attributions.insert(
+            test.id.as_str(),
+            (test.path.as_str(), test.function.as_str()),
+        );
+        let relative_path = Path::new(&test.path);
+        assert!(
+            !relative_path.is_absolute()
+                && relative_path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+            "test evidence {} must use a repository-relative path without traversal",
+            test.id
+        );
+        let source_path = repository_root.join(relative_path);
+        let canonical_source_path = source_path.canonicalize().unwrap_or_else(|error| {
             panic!(
-                "test evidence {} references unreadable {}: {error}",
-                test.id,
-                source_path.display()
+                "test evidence {} references a source that cannot be canonicalized ({}): {error}",
+                test.id, test.path
             )
         });
-        assert!(
-            source.contains(&format!("fn {}", test.function)),
-            "test evidence {} references missing function {} in {}",
-            test.id,
-            test.function,
-            test.path
+        assert_eq!(
+            canonical_source_path,
+            canonical_repository_root.join(relative_path),
+            "test evidence {} uses a symlink, case alias, or noncanonical source path",
+            test.id
         );
-        let function_offset = source
-            .find(&format!("fn {}", test.function))
-            .expect("function presence checked above");
-        let attribute_window = &source[function_offset.saturating_sub(512)..function_offset];
-        assert!(
-            attribute_window.contains("#[test]") || attribute_window.contains("#[tokio::test"),
-            "test evidence {} references {} without a test attribute",
-            test.id,
-            test.function
+        if !evidence_sources.contains_key(&test.path) {
+            println!("cargo:rerun-if-changed={}", source_path.display());
+            let source = fs::read_to_string(&source_path).unwrap_or_else(|error| {
+                panic!(
+                    "test evidence {} references unreadable {}: {error}",
+                    test.id,
+                    source_path.display()
+                )
+            });
+            let syntax = syn::parse_file(&source).unwrap_or_else(|error| {
+                panic!(
+                    "test evidence {} references Rust source that cannot be parsed ({}): {error}",
+                    test.id, test.path
+                )
+            });
+            evidence_sources.insert(test.path.clone(), syntax);
+        }
+        let declared_features =
+            evidence_package_features(&repository_root, &test.path, &mut package_features);
+        validate_test_evidence(
+            evidence_sources
+                .get(&test.path)
+                .expect("evidence source was inserted above"),
+            test,
+            declared_features,
         );
     }
+
+    let mut release_evidence_ids = BTreeSet::new();
+    release_evidence_ids.extend(requirements.inventory_test_ids.iter().map(String::as_str));
+    for operation in &requirements.operations {
+        release_evidence_ids.extend(operation.implementation_test_ids.iter().map(String::as_str));
+    }
+    for contract in &requirements.contracts {
+        release_evidence_ids.extend(contract.guard_test_ids.iter().map(String::as_str));
+        release_evidence_ids.extend(
+            contract
+                .field_test_ids
+                .values()
+                .chain(contract.result_test_ids.values())
+                .flatten()
+                .map(String::as_str),
+        );
+    }
+    for capability in &requirements.capabilities {
+        release_evidence_ids.extend(
+            capability
+                .implementation_test_ids
+                .iter()
+                .map(String::as_str),
+        );
+    }
+    for scenario in &requirements.acceptance_scenarios {
+        release_evidence_ids.extend(scenario.implementation_test_ids.iter().map(String::as_str));
+    }
+    let approved_release_evidence = release_contract::V0_1_RELEASE_EVIDENCE_BINDINGS
+        .iter()
+        .map(|(id, _, _, _)| *id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        release_evidence_ids, approved_release_evidence,
+        "release-critical evidence IDs do not match the independently compiled bindings"
+    );
+    for (id, expected_path, expected_function, harness_name) in
+        release_contract::V0_1_RELEASE_EVIDENCE_BINDINGS
+    {
+        let actual = evidence_attributions
+            .get(id)
+            .unwrap_or_else(|| panic!("release evidence {id} has no test attribution"));
+        assert_eq!(
+            *actual,
+            (expected_path, expected_function),
+            "release evidence {id} was redirected to an unapproved source or function"
+        );
+        assert!(
+            !harness_name.trim().is_empty(),
+            "release evidence {id} has no Cargo harness name"
+        );
+        let expected_harness_name = cargo_harness_name(
+            expected_path,
+            expected_function,
+            evidence_sources
+                .get(expected_path)
+                .unwrap_or_else(|| panic!("release evidence {id} has no parsed source")),
+        );
+        assert_eq!(
+            harness_name, expected_harness_name,
+            "release evidence {id} has a Cargo harness name unrelated to its source function"
+        );
+        validate_release_test_function(
+            evidence_sources
+                .get(expected_path)
+                .expect("release evidence has parsed source"),
+            id,
+            expected_function,
+        );
+        let package = Path::new(expected_path)
+            .components()
+            .nth(1)
+            .and_then(|component| match component {
+                Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .expect("release evidence package component");
+        validate_release_source_module(
+            &canonical_repository_root,
+            expected_path,
+            package_features
+                .get(&package)
+                .unwrap_or_else(|| panic!("release evidence package {package} has no features")),
+        );
+        assert!(
+            expected_path.starts_with("crates/reltio-client/src/")
+                || expected_path.starts_with("crates/reltio-cli/src/")
+                || expected_path == "crates/reltio-cli/tests/cli.rs",
+            "release evidence {id} uses a target without a Cargo-list verifier"
+        );
+    }
+
+    let guard_evidence_ids = requirements
+        .contracts
+        .iter()
+        .flat_map(|contract| contract.guard_test_ids.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let mut implementation_evidence_ids = requirements
+        .operations
+        .iter()
+        .flat_map(|operation| operation.implementation_test_ids.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    for contract in &requirements.contracts {
+        implementation_evidence_ids.extend(
+            contract
+                .field_test_ids
+                .values()
+                .chain(contract.result_test_ids.values())
+                .flatten()
+                .map(String::as_str),
+        );
+    }
+    for capability in &requirements.capabilities {
+        implementation_evidence_ids.extend(
+            capability
+                .implementation_test_ids
+                .iter()
+                .map(String::as_str),
+        );
+    }
+    for scenario in &requirements.acceptance_scenarios {
+        implementation_evidence_ids
+            .extend(scenario.implementation_test_ids.iter().map(String::as_str));
+    }
+    let guard_evidence_bindings = guard_evidence_ids
+        .iter()
+        .map(|id| {
+            *evidence_attributions
+                .get(id)
+                .unwrap_or_else(|| panic!("guard evidence {id} has no attribution"))
+        })
+        .collect::<BTreeSet<_>>();
+    let implementation_evidence_bindings = implementation_evidence_ids
+        .iter()
+        .map(|id| {
+            *evidence_attributions
+                .get(id)
+                .unwrap_or_else(|| panic!("implementation evidence {id} has no attribution"))
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        guard_evidence_bindings.is_disjoint(&implementation_evidence_bindings),
+        "guard and implementation claims must not resolve to the same test function"
+    );
+    assert!(
+        release_contract::evidence_claim_bindings_are_disjoint(
+            &requirements
+                .inventory_test_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            &guard_evidence_ids.iter().copied().collect::<Vec<_>>(),
+            &implementation_evidence_ids
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            &release_contract::V0_1_RELEASE_EVIDENCE_BINDINGS,
+        ),
+        "independently compiled inventory, guard, and implementation bindings overlap"
+    );
 
     assert_eq!(
         requirements.target_release, "0.1.0",
@@ -380,6 +802,13 @@ fn main() {
     assert!(
         !requirements.inventory_test_ids.is_empty(),
         "release requirements have no inventory tests"
+    );
+    assert!(
+        evidence_matches(
+            &requirements.inventory_test_ids,
+            &release_contract::V0_1_INVENTORY_TEST_IDS,
+        ),
+        "release inventory evidence does not match the independent approved set"
     );
     for test_id in &requirements.inventory_test_ids {
         assert!(
@@ -472,6 +901,26 @@ fn main() {
                 && allowed_results.len() == contract.allowed_results.len()
                 && result_evidence == expected_results
                 && !contract.guard_test_ids.is_empty()
+                && evidence_matches(
+                    &contract.guard_test_ids,
+                    &release_contract::MUTATION_AUDIT_GUARD_EVIDENCE,
+                )
+                && contract.field_test_ids.iter().all(|(field, evidence)| {
+                    release_contract::MUTATION_AUDIT_FIELD_EVIDENCE
+                        .iter()
+                        .find_map(|(expected_field, expected)| {
+                            (*expected_field == field).then_some(*expected)
+                        })
+                        .is_some_and(|expected| evidence_matches(evidence, expected))
+                })
+                && contract.result_test_ids.iter().all(|(result, evidence)| {
+                    release_contract::MUTATION_AUDIT_RESULT_EVIDENCE
+                        .iter()
+                        .find_map(|(expected_result, expected)| {
+                            (*expected_result == result).then_some(*expected)
+                        })
+                        .is_some_and(|expected| evidence_matches(evidence, expected))
+                })
                 && guard_tests.is_disjoint(&implementation_tests),
             "release contract {} has an incomplete acceptance definition",
             contract.id
@@ -562,6 +1011,18 @@ fn main() {
         assert_eq!(
             endpoint_ids, expected_endpoint_ids,
             "release operation {} has an unapproved endpoint binding",
+            operation.id
+        );
+        let expected_implementation_evidence = release_contract::V0_1_OPERATION_EVIDENCE
+            .iter()
+            .find_map(|(command, evidence)| (*command == operation.id).then_some(*evidence))
+            .unwrap_or(&[]);
+        assert!(
+            evidence_matches(
+                &operation.implementation_test_ids,
+                expected_implementation_evidence,
+            ),
+            "release operation {} has unapproved implementation evidence",
             operation.id
         );
         if operation.safety == "remote_write" {
@@ -658,7 +1119,13 @@ fn main() {
             release_commands.contains(capability.command.as_str())
                 && !capability.argument.trim().is_empty()
                 && !capability.required_value.trim().is_empty()
-                && !capability.source_section.trim().is_empty(),
+                && !capability.source_section.trim().is_empty()
+                && release_contract::V0_1_CAPABILITY_EVIDENCE
+                    .iter()
+                    .find_map(|(id, expected)| { (*id == capability.id).then_some(*expected) })
+                    .is_some_and(|expected| {
+                        evidence_matches(&capability.implementation_test_ids, expected)
+                    }),
             "release capability {} has an invalid acceptance definition",
             capability.id
         );
@@ -684,7 +1151,13 @@ fn main() {
         assert!(
             acceptance_ids.insert(scenario.id.as_str())
                 && !scenario.summary.trim().is_empty()
-                && !scenario.source_section.trim().is_empty(),
+                && !scenario.source_section.trim().is_empty()
+                && release_contract::MVP_ACCEPTANCE_EVIDENCE
+                    .iter()
+                    .find_map(|(id, expected)| (*id == scenario.id).then_some(*expected))
+                    .is_some_and(|expected| {
+                        evidence_matches(&scenario.implementation_test_ids, expected)
+                    }),
             "acceptance scenario {} has an invalid definition",
             scenario.id
         );
@@ -817,10 +1290,12 @@ fn main() {
             ["read", "authentication", "write", "high_impact"].contains(&endpoint.safety.as_str())
                 && ["consistent", "eventual", "unknown", "not_applicable"]
                     .contains(&endpoint.consistency.as_str())
-                && ["safe", "safe_with_limit", "unsafe"].contains(&endpoint.replay.as_str())
+                && ["safe", "safe_with_limit", "conditional", "unsafe"]
+                    .contains(&endpoint.replay.as_str())
                 && ["none", "offset", "cursor"].contains(&endpoint.pagination.as_str())
                 && endpoint.max_body_bytes.is_none_or(|limit| limit > 0)
                 && endpoint.result_boundary.is_none_or(|limit| limit > 0)
+                && endpoint.page_size_max.is_none_or(|limit| limit > 0)
                 && endpoint.cursor_ttl_seconds.is_none_or(|limit| limit > 0),
             "endpoint {} has invalid protocol or safety metadata",
             endpoint.id
@@ -981,6 +1456,407 @@ fn main() {
             );
         }
     }
+
+    let mut referenced_evidence_ids = BTreeSet::new();
+    referenced_evidence_ids.extend(requirements.inventory_test_ids.iter().map(String::as_str));
+    for operation in &requirements.operations {
+        referenced_evidence_ids
+            .extend(operation.implementation_test_ids.iter().map(String::as_str));
+    }
+    for contract in &requirements.contracts {
+        referenced_evidence_ids.extend(contract.guard_test_ids.iter().map(String::as_str));
+        referenced_evidence_ids.extend(
+            contract
+                .field_test_ids
+                .values()
+                .chain(contract.result_test_ids.values())
+                .flatten()
+                .map(String::as_str),
+        );
+    }
+    for capability in &requirements.capabilities {
+        referenced_evidence_ids.extend(
+            capability
+                .implementation_test_ids
+                .iter()
+                .map(String::as_str),
+        );
+    }
+    for scenario in &requirements.acceptance_scenarios {
+        referenced_evidence_ids.extend(scenario.implementation_test_ids.iter().map(String::as_str));
+    }
+    for practice in &practices.practices {
+        referenced_evidence_ids.extend(practice.test_ids.iter().map(String::as_str));
+    }
+    for endpoint in &endpoints.endpoints {
+        referenced_evidence_ids.extend(endpoint.test_ids.iter().map(String::as_str));
+    }
+    let unreferenced = evidence_ids
+        .difference(&referenced_evidence_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    let undeclared = referenced_evidence_ids
+        .difference(&evidence_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        unreferenced.is_empty() && undeclared.is_empty(),
+        "test-evidence attribution must be exact; unreferenced: {unreferenced:?}; undeclared: {undeclared:?}"
+    );
+}
+
+fn evidence_package_features<'a>(
+    repository_root: &Path,
+    evidence_path: &str,
+    cache: &'a mut BTreeMap<String, BTreeSet<String>>,
+) -> &'a BTreeSet<String> {
+    let components = Path::new(evidence_path).components().collect::<Vec<_>>();
+    assert!(
+        components.len() >= 3
+            && components[0].as_os_str() == "crates"
+            && matches!(components[1], Component::Normal(_)),
+        "test evidence path {evidence_path} is not owned by a workspace crate"
+    );
+    let package = components[1].as_os_str().to_string_lossy().into_owned();
+    if !cache.contains_key(&package) {
+        let manifest_path = repository_root
+            .join("crates")
+            .join(&package)
+            .join("Cargo.toml");
+        println!("cargo:rerun-if-changed={}", manifest_path.display());
+        let manifest = fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+            panic!(
+                "test evidence package {package} has no readable Cargo manifest at {}: {error}",
+                manifest_path.display()
+            )
+        });
+        let manifest: CargoManifest = toml::from_str(&manifest).unwrap_or_else(|error| {
+            panic!(
+                "test evidence package {package} has an invalid Cargo manifest at {}: {error}",
+                manifest_path.display()
+            )
+        });
+        cache.insert(package.clone(), default_feature_set(&manifest.features));
+    }
+    cache
+        .get(&package)
+        .expect("evidence package features were inserted above")
+}
+
+fn default_feature_set(features: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
+    let mut enabled = BTreeSet::new();
+    let mut pending = Vec::new();
+    if features.contains_key("default") {
+        enabled.insert("default".to_owned());
+        pending.push("default".to_owned());
+    }
+    while let Some(feature) = pending.pop() {
+        let Some(members) = features.get(&feature) else {
+            continue;
+        };
+        for member in members {
+            if member.starts_with("dep:") || member.contains('/') || !features.contains_key(member)
+            {
+                continue;
+            }
+            if enabled.insert(member.clone()) {
+                pending.push(member.clone());
+            }
+        }
+    }
+    enabled
+}
+
+fn validate_test_evidence(
+    syntax: &syn::File,
+    test: &TestEvidence,
+    declared_features: &BTreeSet<String>,
+) {
+    let mut matches = Vec::new();
+    let mut inherited_attributes = syntax.attrs.iter().collect::<Vec<_>>();
+    collect_test_functions(
+        &syntax.items,
+        &test.function,
+        &mut inherited_attributes,
+        &mut matches,
+        declared_features,
+    );
+    assert_eq!(
+        matches.len(),
+        1,
+        "test evidence {} must reference exactly one function named {} in {}",
+        test.id,
+        test.function,
+        test.path
+    );
+    let (is_test, ignored, matrix_enabled, attributes_supported) = matches[0];
+    assert!(
+        is_test && !ignored && matrix_enabled && attributes_supported,
+        "test evidence {} references {} without an executable test on the release matrix",
+        test.id,
+        test.function
+    );
+}
+
+fn collect_test_functions<'a>(
+    items: &'a [syn::Item],
+    function: &str,
+    inherited_attributes: &mut Vec<&'a syn::Attribute>,
+    matches: &mut Vec<(bool, bool, bool, bool)>,
+    declared_features: &BTreeSet<String>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Fn(item) if item.sig.ident == function => {
+                let is_test = item.attrs.iter().any(|attribute| {
+                    attribute.path().is_ident("test")
+                        || path_is(attribute.path(), &["tokio", "test"])
+                        || builtin_test_attribute(attribute)
+                });
+                let ignored = item.attrs.iter().any(|attribute| {
+                    attribute.path().is_ident("ignore") || attribute.path().is_ident("cfg_attr")
+                });
+                let attributes_supported = inherited_attributes
+                    .iter()
+                    .all(|attribute| passive_evidence_attribute(attribute))
+                    && item.attrs.iter().all(|attribute| {
+                        passive_evidence_attribute(attribute)
+                            || attribute.path().is_ident("test")
+                            || path_is(attribute.path(), &["tokio", "test"])
+                            || builtin_test_attribute(attribute)
+                    });
+                let matrix_enabled = EVIDENCE_TARGETS.iter().any(|target| {
+                    inherited_attributes
+                        .iter()
+                        .copied()
+                        .chain(item.attrs.iter())
+                        .all(|attribute| {
+                            !attribute.path().is_ident("cfg_attr")
+                                && cfg_attribute_allows(attribute, *target, declared_features)
+                        })
+                });
+                matches.push((is_test, ignored, matrix_enabled, attributes_supported));
+            }
+            syn::Item::Mod(item) => {
+                if let Some((_, items)) = &item.content {
+                    let inherited_len = inherited_attributes.len();
+                    inherited_attributes.extend(item.attrs.iter());
+                    collect_test_functions(
+                        items,
+                        function,
+                        inherited_attributes,
+                        matches,
+                        declared_features,
+                    );
+                    inherited_attributes.truncate(inherited_len);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn validate_release_test_function(syntax: &syn::File, id: &str, function: &str) {
+    let mut matches = Vec::new();
+    collect_release_test_functions(&syntax.items, function, &mut matches);
+    assert_eq!(
+        matches,
+        [true],
+        "release evidence {id} must use exactly one synchronous #[::std::prelude::v1::test] function"
+    );
+}
+
+fn collect_release_test_functions(items: &[syn::Item], function: &str, matches: &mut Vec<bool>) {
+    for item in items {
+        match item {
+            syn::Item::Fn(item) if item.sig.ident == function => {
+                matches.push(
+                    item.sig.asyncness.is_none()
+                        && item.attrs.iter().any(builtin_test_attribute)
+                        && item.attrs.iter().all(|attribute| {
+                            passive_evidence_attribute(attribute)
+                                || builtin_test_attribute(attribute)
+                        }),
+                );
+            }
+            syn::Item::Mod(item) => {
+                if let Some((_, items)) = &item.content {
+                    collect_release_test_functions(items, function, matches);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EvidenceTarget {
+    os: &'static str,
+    family: &'static str,
+    arch: &'static str,
+    environment: &'static str,
+    vendor: &'static str,
+}
+
+const EVIDENCE_TARGETS: [EvidenceTarget; 5] = [
+    EvidenceTarget {
+        os: "linux",
+        family: "unix",
+        arch: "x86_64",
+        environment: "gnu",
+        vendor: "unknown",
+    },
+    EvidenceTarget {
+        os: "linux",
+        family: "unix",
+        arch: "aarch64",
+        environment: "gnu",
+        vendor: "unknown",
+    },
+    EvidenceTarget {
+        os: "macos",
+        family: "unix",
+        arch: "x86_64",
+        environment: "",
+        vendor: "apple",
+    },
+    EvidenceTarget {
+        os: "macos",
+        family: "unix",
+        arch: "aarch64",
+        environment: "",
+        vendor: "apple",
+    },
+    EvidenceTarget {
+        os: "windows",
+        family: "windows",
+        arch: "x86_64",
+        environment: "msvc",
+        vendor: "pc",
+    },
+];
+
+fn cfg_attribute_allows(
+    attribute: &syn::Attribute,
+    target: EvidenceTarget,
+    declared_features: &BTreeSet<String>,
+) -> bool {
+    if !attribute.path().is_ident("cfg") {
+        return true;
+    }
+    attribute
+        .parse_args::<syn::Meta>()
+        .ok()
+        .and_then(|predicate| cfg_predicate_matches(&predicate, target, declared_features))
+        .unwrap_or(false)
+}
+
+fn cfg_predicate_matches(
+    predicate: &syn::Meta,
+    target: EvidenceTarget,
+    declared_features: &BTreeSet<String>,
+) -> Option<bool> {
+    match predicate {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(true),
+        syn::Meta::Path(path) if path.is_ident("debug_assertions") => Some(false),
+        syn::Meta::Path(path) if path.is_ident("unix") || path.is_ident("windows") => {
+            Some(path.is_ident(target.family))
+        }
+        syn::Meta::Path(_) => None,
+        syn::Meta::NameValue(value) => {
+            let name = value.path.get_ident().map(ToString::to_string)?;
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(expected),
+                ..
+            }) = &value.value
+            else {
+                return None;
+            };
+            Some(match name.as_str() {
+                "feature" => declared_features.contains(&expected.value()),
+                "target_os" => expected.value() == target.os,
+                "target_family" => expected.value() == target.family,
+                "target_arch" => expected.value() == target.arch,
+                "target_env" => expected.value() == target.environment,
+                "target_vendor" => expected.value() == target.vendor,
+                "target_pointer_width" => expected.value() == "64",
+                "target_endian" => expected.value() == "little",
+                "target_has_atomic" => {
+                    matches!(expected.value().as_str(), "8" | "16" | "32" | "64" | "ptr")
+                }
+                _ => return None,
+            })
+        }
+        syn::Meta::List(list) => {
+            let predicates = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .ok();
+            let predicates = predicates?;
+            if list.path.is_ident("all") {
+                combine_cfg_all(&predicates, target, declared_features)
+            } else if list.path.is_ident("any") {
+                combine_cfg_any(&predicates, target, declared_features)
+            } else if list.path.is_ident("not") && predicates.len() == 1 {
+                cfg_predicate_matches(&predicates[0], target, declared_features).map(|value| !value)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn combine_cfg_all(
+    predicates: &syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>,
+    target: EvidenceTarget,
+    declared_features: &BTreeSet<String>,
+) -> Option<bool> {
+    let mut unknown = false;
+    for predicate in predicates {
+        match cfg_predicate_matches(predicate, target, declared_features) {
+            Some(false) => return Some(false),
+            Some(true) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(true)
+}
+
+fn combine_cfg_any(
+    predicates: &syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>,
+    target: EvidenceTarget,
+    declared_features: &BTreeSet<String>,
+) -> Option<bool> {
+    let mut unknown = false;
+    for predicate in predicates {
+        match cfg_predicate_matches(predicate, target, declared_features) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
+}
+
+fn path_is(path: &syn::Path, segments: &[&str]) -> bool {
+    path.segments.len() == segments.len()
+        && path
+            .segments
+            .iter()
+            .zip(segments)
+            .all(|(actual, expected)| actual.ident == *expected)
+}
+
+fn passive_evidence_attribute(attribute: &syn::Attribute) -> bool {
+    ["cfg", "allow", "warn", "deny", "forbid", "doc"]
+        .iter()
+        .any(|name| attribute.path().is_ident(name))
+}
+
+fn builtin_test_attribute(attribute: &syn::Attribute) -> bool {
+    attribute.path().leading_colon.is_some()
+        && path_is(attribute.path(), &["std", "prelude", "v1", "test"])
 }
 
 fn parse_yaml<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> T {
@@ -996,6 +1872,484 @@ fn valid_date(value: &str) -> bool {
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_content_sources(
+    label: &str,
+    sources: &[UpstreamContentSource],
+    expected_count: usize,
+    expected_url_set_sha256: &str,
+    expected_content_sha256: &str,
+) -> BTreeSet<String> {
+    assert_eq!(
+        sources.len(),
+        expected_count,
+        "locked {label} content-source count does not match its aggregate count"
+    );
+    let urls = sources
+        .iter()
+        .map(|source| {
+            assert!(
+                source.url.starts_with("https://") && valid_sha256(&source.sha256),
+                "locked {label} source has invalid provenance: {}",
+                source.url
+            );
+            source.url.clone()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        urls.len(),
+        sources.len(),
+        "locked {label} content sources contain duplicate URLs"
+    );
+    let url_manifest = urls.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(url_manifest.as_bytes())),
+        expected_url_set_sha256,
+        "locked {label} URL-set hash does not match its per-URL entries"
+    );
+    let by_url = sources
+        .iter()
+        .map(|source| (source.url.as_str(), source.sha256.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut content_manifest = String::new();
+    for (url, sha256) in by_url {
+        content_manifest.push_str(url);
+        content_manifest.push('\t');
+        content_manifest.push_str(sha256);
+        content_manifest.push('\n');
+    }
+    assert_eq!(
+        format!("{:x}", Sha256::digest(content_manifest.as_bytes())),
+        expected_content_sha256,
+        "locked {label} aggregate content hash does not match its per-URL entries"
+    );
+    urls
+}
+
+fn validate_url_set(label: &str, urls: &[String], expected_count: usize, expected_sha256: &str) {
+    let unique = urls.iter().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        urls.len(),
+        expected_count,
+        "locked {label} count does not match its aggregate count"
+    );
+    assert_eq!(
+        unique.len(),
+        urls.len(),
+        "locked {label} contains duplicate URLs"
+    );
+    assert!(
+        unique.iter().all(|url| url == "https://docs.reltio.com/en"
+            || url.starts_with("https://docs.reltio.com/en/")),
+        "locked {label} contains a noncanonical documentation URL"
+    );
+    let manifest = unique.into_iter().collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(manifest.as_bytes())),
+        expected_sha256,
+        "locked {label} hash does not match its per-URL entries"
+    );
+}
+
+fn validate_release_cargo_targets(repository_root: &Path) {
+    let client_manifest_path = repository_root.join("crates/reltio-client/Cargo.toml");
+    let client_manifest =
+        fs::read_to_string(&client_manifest_path).expect("read reltio-client manifest");
+    validate_standard_library_dependencies(&client_manifest, &client_manifest_path);
+    let client: CargoManifest =
+        toml::from_str(&client_manifest).expect("parse reltio-client manifest");
+    assert_eq!(client.package.name, "reltio-client");
+    assert_eq!(
+        client.package.build.as_deref(),
+        Some("build.rs"),
+        "reltio-client must execute the reviewed release validator"
+    );
+    let client_features = default_feature_set(&client.features);
+    if let Some(target) = &client.lib {
+        assert_eq!(target.path.as_deref().unwrap_or("src/lib.rs"), "src/lib.rs");
+        assert!(target.test.unwrap_or(true));
+        assert!(target.harness.unwrap_or(true));
+        assert!(
+            target
+                .required_features
+                .iter()
+                .all(|feature| client_features.contains(feature))
+        );
+    } else {
+        assert!(client.package.autolib.unwrap_or(true));
+        assert!(
+            repository_root
+                .join("crates/reltio-client/src/lib.rs")
+                .is_file()
+        );
+    }
+
+    let cli_manifest_path = repository_root.join("crates/reltio-cli/Cargo.toml");
+    let cli_manifest = fs::read_to_string(&cli_manifest_path).expect("read reltio-cli manifest");
+    validate_standard_library_dependencies(&cli_manifest, &cli_manifest_path);
+    let cli: CargoManifest = toml::from_str(&cli_manifest).expect("parse reltio-cli manifest");
+    assert_eq!(cli.package.name, "reltio-cli");
+    let cli_features = default_feature_set(&cli.features);
+    let release_bins = cli
+        .bins
+        .iter()
+        .filter(|target| target.name.as_deref() == Some("reltio"))
+        .collect::<Vec<_>>();
+    assert_eq!(release_bins.len(), 1, "release CLI target must be unique");
+    let release_bin = release_bins[0];
+    assert_eq!(
+        release_bin.path.as_deref().unwrap_or("src/main.rs"),
+        "src/main.rs"
+    );
+    assert!(release_bin.test.unwrap_or(true));
+    assert!(release_bin.harness.unwrap_or(true));
+    assert!(
+        release_bin
+            .required_features
+            .iter()
+            .all(|feature| cli_features.contains(feature))
+    );
+    let integration_targets = cli
+        .tests
+        .iter()
+        .filter(|target| target.name.as_deref() == Some("cli"))
+        .collect::<Vec<_>>();
+    if integration_targets.is_empty() {
+        assert!(cli.package.autotests.unwrap_or(true));
+        assert!(
+            repository_root
+                .join("crates/reltio-cli/tests/cli.rs")
+                .is_file()
+        );
+    } else {
+        assert_eq!(
+            integration_targets.len(),
+            1,
+            "release integration target must be unique"
+        );
+        let target = integration_targets[0];
+        assert_eq!(
+            target.path.as_deref().unwrap_or("tests/cli.rs"),
+            "tests/cli.rs"
+        );
+        assert!(target.test.unwrap_or(true));
+        assert!(target.harness.unwrap_or(true));
+        assert!(
+            target
+                .required_features
+                .iter()
+                .all(|feature| cli_features.contains(feature))
+        );
+    }
+}
+
+fn validate_standard_library_dependencies(source: &str, manifest_path: &Path) {
+    let manifest: toml::Value = toml::from_str(source).expect("parse release Cargo manifest");
+    validate_standard_library_target_name(&manifest, manifest_path);
+    validate_standard_library_dependency_table(&manifest, manifest_path);
+}
+
+fn validate_repository_cargo_manifests(repository_root: &Path) {
+    let mut directories = vec![
+        repository_root
+            .canonicalize()
+            .expect("repository root must be canonicalizable"),
+    ];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory).expect("repository directory must be readable") {
+            let entry = entry.expect("repository entry must be readable");
+            let file_type = entry.file_type().expect("repository entry type");
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                if name != ".git" && name != "target" {
+                    directories.push(path);
+                }
+            } else if file_type.is_file() && entry.file_name() == "Cargo.toml" {
+                println!("cargo:rerun-if-changed={}", path.display());
+                let source = fs::read_to_string(&path).expect("repository Cargo manifest");
+                validate_standard_library_dependencies(&source, &path);
+            }
+        }
+    }
+}
+
+fn validate_standard_library_target_name(manifest: &toml::Value, manifest_path: &Path) {
+    let package_name = manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(|name| name.replace('-', "_"));
+    let library_name = manifest
+        .get("lib")
+        .and_then(|target| target.get("name"))
+        .and_then(toml::Value::as_str);
+    assert!(
+        !package_name
+            .as_deref()
+            .is_some_and(|name| name == "core" || name == "std")
+            && !library_name.is_some_and(|name| name == "core" || name == "std"),
+        "{} defines a standard-library crate name",
+        manifest_path.display()
+    );
+}
+
+fn validate_standard_library_dependency_table(value: &toml::Value, manifest_path: &Path) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (name, child) in table {
+        if ["dependencies", "dev-dependencies", "build-dependencies"].contains(&name.as_str()) {
+            if let Some(dependencies) = child.as_table() {
+                assert!(
+                    !dependencies.contains_key("core") && !dependencies.contains_key("std"),
+                    "{} aliases a standard-library crate through {name}",
+                    manifest_path.display()
+                );
+            }
+        }
+        validate_standard_library_dependency_table(child, manifest_path);
+    }
+}
+
+fn validate_release_source_module(
+    repository_root: &Path,
+    evidence_path: &str,
+    enabled_features: &BTreeSet<String>,
+) {
+    let module_path = source_module_prefix(evidence_path);
+    let target_root = if evidence_path.starts_with("crates/reltio-client/src/") {
+        repository_root.join("crates/reltio-client/src/lib.rs")
+    } else if evidence_path.starts_with("crates/reltio-cli/src/") {
+        repository_root.join("crates/reltio-cli/src/main.rs")
+    } else if evidence_path == "crates/reltio-cli/tests/cli.rs" {
+        repository_root.join(evidence_path)
+    } else {
+        panic!("release evidence path {evidence_path} has no validated Cargo target");
+    };
+    let expected_source = repository_root.join(evidence_path);
+    let canonical_target = target_root
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("release target root is unreadable: {error}"));
+    assert_eq!(
+        canonical_target, target_root,
+        "release target root uses a symlink or noncanonical path"
+    );
+    println!("cargo:rerun-if-changed={}", target_root.display());
+    let syntax = syn::parse_file(
+        &fs::read_to_string(&target_root).expect("release target root must be readable"),
+    )
+    .expect("release target root must parse");
+    let resolved = resolve_module_source(
+        &target_root,
+        &syntax.items,
+        target_root.parent().expect("release target parent"),
+        &module_path,
+        &EVIDENCE_TARGETS,
+        enabled_features,
+    );
+    assert_eq!(
+        resolved, expected_source,
+        "release evidence {evidence_path} is not loaded at its claimed Cargo module path"
+    );
+}
+
+fn resolve_module_source(
+    current_source: &Path,
+    items: &[syn::Item],
+    module_directory: &Path,
+    remaining_modules: &[String],
+    active_targets: &[EvidenceTarget],
+    enabled_features: &BTreeSet<String>,
+) -> PathBuf {
+    validate_standard_library_source_aliases(items, current_source);
+    let Some((module, remaining_modules)) = remaining_modules.split_first() else {
+        return current_source.to_path_buf();
+    };
+    let declarations = items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(item) if item.ident == module => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        declarations.len(),
+        1,
+        "release module path {} has no unique declaration in {}",
+        module,
+        current_source.display()
+    );
+    let declaration = declarations[0];
+    assert!(
+        declaration.attrs.iter().all(passive_evidence_attribute),
+        "release module {module} uses an expansion-capable attribute"
+    );
+    let enabled_targets = active_targets
+        .iter()
+        .copied()
+        .filter(|target| {
+            declaration
+                .attrs
+                .iter()
+                .all(|attribute| cfg_attribute_allows(attribute, *target, enabled_features))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !enabled_targets.is_empty(),
+        "release module {module} is disabled on the shipped release matrix"
+    );
+    let next_module_directory = module_directory.join(module);
+    if let Some((_, inline_items)) = &declaration.content {
+        return resolve_module_source(
+            current_source,
+            inline_items,
+            &next_module_directory,
+            remaining_modules,
+            &enabled_targets,
+            enabled_features,
+        );
+    }
+
+    let flat_source = module_directory.join(format!("{module}.rs"));
+    let directory_source = next_module_directory.join("mod.rs");
+    let candidates = [flat_source, directory_source]
+        .into_iter()
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "release module {module} has no unique conventional source"
+    );
+    let next_source = candidates[0].clone();
+    assert_eq!(
+        next_source
+            .canonicalize()
+            .expect("release module source must be canonicalizable"),
+        next_source,
+        "release module {module} uses a symlink or noncanonical source"
+    );
+    println!("cargo:rerun-if-changed={}", next_source.display());
+    let syntax = syn::parse_file(
+        &fs::read_to_string(&next_source).expect("release module source must be readable"),
+    )
+    .expect("release module source must parse");
+    resolve_module_source(
+        &next_source,
+        &syntax.items,
+        &next_module_directory,
+        remaining_modules,
+        &enabled_targets,
+        enabled_features,
+    )
+}
+
+fn validate_standard_library_source_aliases(items: &[syn::Item], source: &Path) {
+    for item in items {
+        match item {
+            syn::Item::ExternCrate(item) => {
+                let bound_name = item
+                    .rename
+                    .as_ref()
+                    .map_or(&item.ident, |(_, rename)| rename)
+                    .unraw();
+                assert!(
+                    bound_name != "core" && bound_name != "std",
+                    "release source {} aliases a standard-library crate",
+                    source.display()
+                );
+            }
+            syn::Item::Mod(item) => {
+                if let Some((_, items)) = &item.content {
+                    validate_standard_library_source_aliases(items, source);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn source_module_prefix(path: &str) -> Vec<String> {
+    let components = Path::new(path)
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_string_lossy().into_owned(),
+            _ => panic!("release evidence path {path} has unsupported components"),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        components.len() >= 4 && components[0] == "crates",
+        "release evidence path {path} is not a Cargo source target"
+    );
+    match components[2].as_str() {
+        "src" => {
+            let mut prefix = components[3..components.len() - 1].to_vec();
+            let stem = Path::new(components.last().expect("source filename"))
+                .file_stem()
+                .expect("source file stem")
+                .to_string_lossy();
+            if stem != "lib" && stem != "main" && stem != "mod" {
+                prefix.push(stem.into_owned());
+            }
+            prefix
+        }
+        "tests" => {
+            assert_eq!(
+                components.len(),
+                4,
+                "release integration evidence path {path} requires an explicit verifier"
+            );
+            Vec::new()
+        }
+        _ => panic!("release evidence path {path} is not in a verified Cargo target"),
+    }
+}
+
+fn cargo_harness_name(path: &str, function: &str, syntax: &syn::File) -> String {
+    let mut prefix = source_module_prefix(path);
+
+    let mut matches = Vec::new();
+    collect_inline_function_paths(&syntax.items, function, &mut Vec::new(), &mut matches);
+    assert_eq!(
+        matches.len(),
+        1,
+        "release evidence function {function} in {path} has no unique module path"
+    );
+    prefix.extend(matches.pop().expect("one function path"));
+    prefix.push(function.to_owned());
+    prefix.join("::")
+}
+
+fn collect_inline_function_paths(
+    items: &[syn::Item],
+    function: &str,
+    modules: &mut Vec<String>,
+    matches: &mut Vec<Vec<String>>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Fn(item) if item.sig.ident == function => matches.push(modules.clone()),
+            syn::Item::Mod(item) => {
+                if let Some((_, items)) = &item.content {
+                    modules.push(item.ident.to_string());
+                    collect_inline_function_paths(items, function, modules, matches);
+                    modules.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn evidence_matches(actual: &[String], expected: &[&str]) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().map(String::as_str).collect::<BTreeSet<_>>()
+            == expected.iter().copied().collect::<BTreeSet<_>>()
 }
 
 impl Practice {

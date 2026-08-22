@@ -20,6 +20,8 @@ jobs:
     name: Format, lint, and policy
     runs-on: ubuntu-latest
     steps:
+      - name: Initialize API-practice evidence
+        run: printf '%s\n' '{"schema_version":1,"ok":false,"error":{"code":"practice_gate_not_reached"}}' > "$RUNNER_TEMP/practice-coverage.json"
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -35,17 +37,26 @@ jobs:
       - name: Documentation links
         run: cargo test --locked -p reltio-cli --test cli shipped_local_markdown_links_resolve
       - name: Practice release gate
-        run: cargo run --locked -p reltio-cli -- --compact api practices check --strict > practice-coverage.json
+        run: |
+          candidate="$RUNNER_TEMP/practice-coverage.next.json"
+          if cargo run --locked -p reltio-cli -- --compact api practices check --strict > "${candidate}"; then
+            mv "${candidate}" "$RUNNER_TEMP/practice-coverage.json"
+          else
+            status="$?"
+            rm -f "${candidate}"
+            exit "${status}"
+          fi
       - name: Upload API-practice coverage
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: api-practice-coverage
-          path: practice-coverage.json
+          path: ${{ runner.temp }}/practice-coverage.json
           if-no-files-found: error
           retention-days: 30
 
   windows-quality:
-    name: Windows lint and security boundary
+    name: Windows compile and lint
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -74,8 +85,36 @@ jobs:
       - name: Install Linux ACL development library
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libacl1-dev
+      - name: Windows security native tests
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p reltio-windows-security --all-targets --all-features
       - name: Test workspace
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --exclude reltio-windows-security --all-targets --all-features --locked
+      - name: Release login-conflict safety test
+        run: cargo test --release --locked -p reltio-cli --test cli login_commit_conflict_guards_the_winning_profile_and_rolls_back_cache -- --exact
+      - name: Release singleflight safety test
+        run: cargo test --release --locked -p reltio-cli --test cli twenty_cli_processes_singleflight_client_credentials -- --exact
+      - name: Release final-output lease test
+        run: cargo test --release --locked -p reltio-cli --test cli finite_output_holds_the_cache_lease_through_physical_flush -- --exact
+      - name: Release preparse-output lease test
+        run: cargo test --release --locked -p reltio-cli --test cli preparse_help_fails_closed_when_the_cache_lease_is_contended -- --exact
+      - name: Release blocked-output deadline test
+        run: cargo test --release --locked -p reltio-cli --test cli blocked_stdout_obeys_the_overall_timeout -- --exact
+      - name: Release secret-input deadline test
+        run: cargo test --release --locked -p reltio-cli --test cli secret_stdin_obeys_the_overall_timeout_without_waiting_for_eof -- --exact
+      - name: Release token-provenance safety test
+        run: cargo test --release --locked -p reltio-cli --test cli auth_token_refuses_access_token_bytes_that_are_also_a_client_secret -- --exact
+      - name: Release profile-removal recovery test
+        run: cargo test --release --locked -p reltio-cli --test cli interrupted_profile_removal_recovers_from_the_durable_cleanup_marker -- --exact
+      - name: Unix release blocked-output signal test
+        if: runner.os != 'Windows'
+        run: cargo test --release --locked -p reltio-cli --test cli sigint_interrupts_blocked_stdout_without_a_success_record -- --exact
+      - name: Unix release scan signal test
+        if: runner.os != 'Windows'
+        run: cargo test --release --locked -p reltio-cli --test cli entity_scan_sigint_preserves_checkpoint_without_a_false_summary -- --exact
+      - name: Unix release secret-input signal test
+        if: runner.os != 'Windows'
+        run: cargo test --release --locked -p reltio-cli --test cli sigint_interrupts_secret_stdin_without_waiting_for_eof -- --exact
       - name: Release build smoke test
         run: cargo build --workspace --release --locked
       - name: Binary smoke test

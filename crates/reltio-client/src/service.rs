@@ -190,6 +190,12 @@ impl ServiceResolver {
                 "embedded URL credentials are not allowed",
             ));
         }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(ReltioError::usage(
+                "invalid_request_path",
+                "request URL paths cannot contain a query or fragment; use explicit query arguments",
+            ));
+        }
         canonical_url_path(&url)?;
         if !same_origin(&base, &url) || !path_is_within_base(&base, &url)? {
             return Err(ReltioError::new(
@@ -266,6 +272,28 @@ impl ServiceResolver {
             return Ok(origin_only(validate_service_url(&self.target.environment)?));
         }
         validate_service_url(&format!("https://{}.reltio.com/", self.target.environment))
+    }
+}
+
+pub fn validate_request_path_argument(path: &str) -> Result<()> {
+    if path.trim() != path {
+        return Err(ReltioError::usage(
+            "invalid_request_path",
+            "request URLs and paths cannot contain leading or trailing whitespace",
+        ));
+    }
+    match Url::parse(path) {
+        Ok(url) => {
+            validate_absolute_input_path(path)?;
+            validate_service_url(url.as_str())?;
+            canonical_url_path(&url)?;
+            Ok(())
+        }
+        Err(url::ParseError::RelativeUrlWithoutBase) => validate_relative_path(path),
+        Err(error) => Err(ReltioError::usage(
+            "invalid_request_path",
+            format!("invalid request URL or path: {error}"),
+        )),
     }
 }
 
@@ -502,9 +530,12 @@ fn validate_absolute_input_path(value: &str) -> Result<()> {
     } else {
         remainder
     };
-    let raw_path = raw_path
-        .split_once(['?', '#'])
-        .map_or(raw_path, |(path, _)| path);
+    if raw_path.contains(['?', '#']) {
+        return Err(ReltioError::usage(
+            "invalid_request_path",
+            "request URL paths cannot contain a query or fragment; use explicit query arguments",
+        ));
+    }
     validate_relative_path(raw_path)
 }
 
@@ -678,6 +709,24 @@ mod tests {
             )
             .expect_err("userinfo must fail regardless of scheme casing");
         assert_eq!(error.code, "url_credentials_refused");
+    }
+
+    #[test]
+    fn absolute_request_urls_reject_embedded_queries_and_fragments() {
+        let mut configured = target();
+        configured.base_url = Some(Url::parse("http://127.0.0.1:39000").unwrap());
+        let resolver = ServiceResolver::new(configured);
+        for suffix in ["?max=201", "#fragment"] {
+            let error = resolver
+                .request_url(
+                    Service::Data,
+                    &format!(
+                        "http://127.0.0.1:39000/reltio/api/ExampleTenant/entities/_scan{suffix}"
+                    ),
+                )
+                .expect_err("embedded query and fragment must fail");
+            assert_eq!(error.code, "invalid_request_path");
+        }
     }
 
     #[test]
