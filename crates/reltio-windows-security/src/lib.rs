@@ -460,6 +460,18 @@ impl DirectoryGuards {
             )
         })
     }
+
+    fn permit_immediate_child_replacement(&mut self) -> Result<()> {
+        let index = self.handles.len().checked_sub(1).ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the local path has no guarded parent directory",
+            )
+        })?;
+        let replacement = ffi::reopen_directory_for_replacement(&self.handles[index])?;
+        self.handles[index] = replacement;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -529,7 +541,7 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         )
     })?;
     let context = ffi::SecurityContext::new()?;
-    let guards = ensure_directory_tree(parent, &context)?;
+    let mut guards = ensure_directory_tree(parent, &context)?;
     guards.revalidate(&context)?;
 
     if let Some(existing) = open_existing_for_inspection(&path)? {
@@ -559,6 +571,9 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         validate_private_file_handle(&existing, &context)?;
     }
 
+    // Windows opens the relative rename target for FILE_WRITE_DATA. Relax only
+    // write sharing on the same verified parent object after every path lookup.
+    guards.permit_immediate_child_replacement()?;
     ffi::move_replace(
         &temporary.file,
         guards.immediate_parent()?,
@@ -1500,7 +1515,16 @@ mod tests {
         let path = parent.join("secret");
         atomic_write_private(&path, b"secret").expect("private write");
         let context = ffi::SecurityContext::new().expect("security context");
-        let guards = validate_directory_tree(&parent, &context).expect("directory guards");
+        let mut guards = validate_directory_tree(&parent, &context).expect("directory guards");
+        guards
+            .permit_immediate_child_replacement()
+            .expect("replacement-ready parent guard");
+        OpenOptions::new()
+            .access_mode(FILE_WRITE_DATA)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&parent)
+            .expect("replacement target access must remain share-compatible");
 
         let error = OpenOptions::new()
             .access_mode(DELETE)
