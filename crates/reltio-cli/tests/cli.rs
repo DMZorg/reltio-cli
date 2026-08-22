@@ -93,13 +93,35 @@ struct Harness {
 fn test_tempdir() -> TempDir {
     #[cfg(windows)]
     {
-        // Hosted Windows TEMP can contain an 8.3 alias, which storage paths
-        // intentionally reject because its long-form identity is ambiguous.
-        let current = std::env::current_dir().expect("current test directory");
+        use std::path::{Component, Prefix};
+
+        // Canonicalization expands an inherited 8.3 TEMP alias but returns a
+        // verbatim path, which production storage paths intentionally reject.
+        let canonical = std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical Windows temporary directory");
+        let mut components = canonical.components();
+        let drive = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+                other => panic!("Windows temporary directory is not on a local drive: {other:?}"),
+            },
+            other => panic!("Windows temporary directory has no drive prefix: {other:?}"),
+        };
+        assert!(
+            matches!(components.next(), Some(Component::RootDir)),
+            "Windows temporary directory is not drive-absolute"
+        );
+        let mut temporary = std::path::PathBuf::from(format!("{}:\\", char::from(drive)));
+        for component in components {
+            match component {
+                Component::Normal(name) => temporary.push(name),
+                other => panic!("canonical Windows temporary directory is invalid: {other:?}"),
+            }
+        }
         tempfile::Builder::new()
             .prefix(".reltio-cli-")
-            .tempdir_in(current)
-            .expect("temporary directory without an inherited 8.3 alias")
+            .tempdir_in(temporary)
+            .expect("temporary directory under the long-form Windows TEMP path")
     }
     #[cfg(not(windows))]
     {
