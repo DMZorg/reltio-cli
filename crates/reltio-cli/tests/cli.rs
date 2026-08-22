@@ -90,10 +90,27 @@ struct Harness {
     directory: TempDir,
 }
 
+fn test_tempdir() -> TempDir {
+    #[cfg(windows)]
+    {
+        // Hosted Windows TEMP can contain an 8.3 alias, which storage paths
+        // intentionally reject because its long-form identity is ambiguous.
+        let current = std::env::current_dir().expect("current test directory");
+        tempfile::Builder::new()
+            .prefix(".reltio-cli-")
+            .tempdir_in(current)
+            .expect("temporary directory without an inherited 8.3 alias")
+    }
+    #[cfg(not(windows))]
+    {
+        tempfile::tempdir().expect("temporary directory")
+    }
+}
+
 impl Harness {
     fn new() -> Self {
         Self {
-            directory: tempfile::tempdir().expect("temporary directory"),
+            directory: test_tempdir(),
         }
     }
 
@@ -7209,7 +7226,7 @@ fn profile_rejects_static_data_tenant_route_and_dot_tenant() {
 
 #[test]
 fn bare_relative_config_path_is_supported() {
-    let directory = tempfile::tempdir().expect("temporary directory");
+    let directory = test_tempdir();
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("reltio"));
     let output = command
         .current_dir(directory.path())
