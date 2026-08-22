@@ -47,12 +47,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_NAME_NORMALIZED,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_ID_INFO, FILE_NAME_NORMALIZED,
     FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-    FILE_WRITE_EA, FileAttributeTagInfo, FileDispositionInfo, FileStandardInfo, GetDriveTypeW,
-    GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, OPEN_EXISTING,
-    READ_CONTROL, ReOpenFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    FILE_WRITE_EA, FileAttributeTagInfo, FileDispositionInfo, FileIdInfo, FileStandardInfo,
+    GetDriveTypeW, GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
+    OPEN_EXISTING, READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     SetFileInformationByHandle, VOLUME_NAME_NT, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Console::{
@@ -744,25 +744,50 @@ pub(crate) fn open_directory(path: &Path) -> Result<File> {
     )
 }
 
-pub(crate) fn reopen_directory_for_replacement(directory: &File) -> Result<File> {
-    // SAFETY: `directory` is a live CreateFileW handle. ReOpenFile returns a
-    // distinct owned handle to that same object; write sharing is required for
-    // the relative target open performed by the Windows rename implementation.
-    let handle = unsafe {
-        ReOpenFile(
-            raw_handle(directory),
-            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(last_error(
-            "failed to prepare the guarded Windows directory for replacement",
+pub(crate) fn open_directory_for_replacement(path: &Path) -> Result<File> {
+    open_file(
+        path,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+        COMMON_OPEN_FLAGS | FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+        "failed to prepare the guarded Windows directory for replacement",
+    )
+}
+
+pub(crate) fn require_same_object(first: &File, second: &File) -> Result<()> {
+    let first = file_identity(first)?;
+    let second = file_identity(second)?;
+    if first.VolumeSerialNumber != second.VolumeSerialNumber
+        || first.FileId.Identifier != second.FileId.Identifier
+    {
+        return Err(Error::policy(
+            ErrorKind::InvalidPath,
+            "the guarded Windows parent directory identity changed",
         ));
     }
-    // SAFETY: ReOpenFile returned a fresh owned handle and this is its only owner.
-    Ok(unsafe { File::from_raw_handle(handle) })
+    Ok(())
+}
+
+fn file_identity(file: &File) -> Result<FILE_ID_INFO> {
+    let mut identity = FILE_ID_INFO::default();
+    // SAFETY: `file` keeps the handle live and the typed output buffer and byte
+    // count exactly match the FileIdInfo contract.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            raw_handle(file),
+            FileIdInfo,
+            std::ptr::from_mut(&mut identity).cast::<c_void>(),
+            u32::try_from(size_of::<FILE_ID_INFO>()).unwrap_or(u32::MAX),
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "failed to inspect the guarded Windows directory identity",
+        ));
+    }
+    Ok(identity)
 }
 
 pub(crate) fn open_path_for_comparison(path: &Path) -> Result<File> {

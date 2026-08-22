@@ -461,14 +461,21 @@ impl DirectoryGuards {
         })
     }
 
-    fn permit_immediate_child_replacement(&mut self) -> Result<()> {
+    fn permit_immediate_child_replacement(
+        &mut self,
+        path: &Path,
+        context: &ffi::SecurityContext,
+    ) -> Result<()> {
         let index = self.handles.len().checked_sub(1).ok_or_else(|| {
             Error::policy(
                 ErrorKind::InvalidPath,
                 "the local path has no guarded parent directory",
             )
         })?;
-        let replacement = ffi::reopen_directory_for_replacement(&self.handles[index])?;
+        let replacement = ffi::open_directory_for_replacement(path)?;
+        ffi::require_same_object(&self.handles[index], &replacement)?;
+        validate_directory_handle(&replacement)?;
+        ffi::inspect_ancestor_policy(&replacement, context)?;
         self.handles[index] = replacement;
         Ok(())
     }
@@ -571,9 +578,10 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         validate_private_file_handle(&existing, &context)?;
     }
 
-    // Windows opens the relative rename target for FILE_WRITE_DATA. Relax only
-    // write sharing on the same verified parent object after every path lookup.
-    guards.permit_immediate_child_replacement()?;
+    // Windows opens the relative rename target for FILE_WRITE_DATA. Acquire a
+    // write-sharing handle while the strict guard still pins the parent, then
+    // prove both handles identify the same object before releasing that guard.
+    guards.permit_immediate_child_replacement(parent, &context)?;
     ffi::move_replace(
         &temporary.file,
         guards.immediate_parent()?,
@@ -1517,7 +1525,7 @@ mod tests {
         let context = ffi::SecurityContext::new().expect("security context");
         let mut guards = validate_directory_tree(&parent, &context).expect("directory guards");
         guards
-            .permit_immediate_child_replacement()
+            .permit_immediate_child_replacement(&parent, &context)
             .expect("replacement-ready parent guard");
         OpenOptions::new()
             .access_mode(FILE_WRITE_DATA)
