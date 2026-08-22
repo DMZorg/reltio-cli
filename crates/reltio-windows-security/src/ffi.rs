@@ -903,9 +903,10 @@ pub(crate) fn set_process_dll_directory_for_test(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 pub(crate) fn process_dll_directory_is_default_for_test() -> bool {
-    // SAFETY: A zero-sized query with a null output buffer is documented and
-    // returns zero when no custom DLL directory is configured.
-    (unsafe { GetDllDirectoryW(0, null_mut()) }) == 0
+    let mut directory = [u16::MAX];
+    // SAFETY: The one-element output buffer remains live and its declared size
+    // is exact. An empty DLL directory fits as one terminating NUL.
+    (unsafe { GetDllDirectoryW(1, directory.as_mut_ptr()) }) == 0 && directory[0] == 0
 }
 
 fn require_fixed_drive_type(drive_type: u32) -> Result<()> {
