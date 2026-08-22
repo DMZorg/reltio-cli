@@ -7,7 +7,7 @@
 use std::ffi::{OsStr, c_void};
 use std::fmt;
 use std::fs::File;
-use std::mem::{offset_of, size_of};
+use std::mem::{align_of, offset_of, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
@@ -43,13 +43,14 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_LIST_DIRECTORY,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO,
+    FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
     FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo,
-    FileDispositionInfo, FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx,
-    GetFileType, GetFinalPathNameByHandleW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, OPEN_EXISTING, READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
-    SetFileInformationByHandle, VOLUME_NAME_NT, WRITE_DAC, WRITE_OWNER,
+    FileDispositionInfo, FileRenameInfoEx, FileStandardInfo, GetDriveTypeW,
+    GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, OPEN_EXISTING,
+    READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SetFileInformationByHandle,
+    VOLUME_NAME_NT, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Console::{
     FlushConsoleInputBuffer, GetConsoleMode, INPUT_RECORD, KEY_EVENT,
@@ -78,7 +79,9 @@ use windows_sys::Win32::System::Threading::{
     OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
     WaitForSingleObject,
 };
-use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+use windows_sys::Win32::System::WindowsProgramming::{
+    DRIVE_FIXED, FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+};
 
 use crate::{Error, ErrorKind, Result};
 
@@ -98,6 +101,7 @@ const UNTRUSTED_EXECUTABLE_DIRECTORY_MUTATION: u32 =
     UNTRUSTED_ANCESTOR_MUTATION | FILE_WRITE_DATA | FILE_APPEND_DATA;
 const CONSOLE_READ_NOWAIT: u16 = 0x0002;
 const MAX_FINAL_PATH_UNITS: usize = 32_768;
+const _: () = assert!(align_of::<FILE_RENAME_INFO>() <= align_of::<usize>());
 
 type ReadConsoleInputExW =
     unsafe extern "system" fn(HANDLE, *mut INPUT_RECORD, u32, *mut u32, u16) -> i32;
@@ -729,7 +733,7 @@ pub(crate) fn create_private_directory(path: &Path, context: &SecurityContext) -
 pub(crate) fn open_directory(path: &Path) -> Result<File> {
     open_file(
         path,
-        FILE_READ_ATTRIBUTES | READ_CONTROL,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
         FILE_SHARE_READ,
         OPEN_EXISTING,
         COMMON_OPEN_FLAGS | FILE_FLAG_BACKUP_SEMANTICS,
@@ -801,7 +805,7 @@ pub(crate) fn open_file_for_read(path: &Path) -> Result<File> {
 pub(crate) fn open_file_for_inspection(path: &Path) -> Result<File> {
     open_file(
         path,
-        FILE_READ_ATTRIBUTES | READ_CONTROL,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
         FILE_SHARE_READ,
         OPEN_EXISTING,
         COMMON_OPEN_FLAGS | FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
@@ -1376,16 +1380,84 @@ fn basic_allowed_ace(dacl: *mut ACL, index: u32) -> Result<Option<AllowedAceView
     }))
 }
 
-pub(crate) fn move_replace(_source_handle: &File, source: &Path, destination: &Path) -> Result<()> {
-    let source = wide_path(source)?;
+pub(crate) fn move_replace(source: &File, destination: &Path) -> Result<()> {
     let destination = wide_path(destination)?;
-    // SAFETY: Both paths are NUL-terminated local paths. `_source_handle`
-    // deliberately keeps the verified source object open through this call.
+    let file_name_units = destination.len().checked_sub(1).ok_or_else(|| {
+        Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement path is empty",
+        )
+    })?;
+    let file_name_bytes = file_name_units
+        .checked_mul(size_of::<u16>())
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the Windows replacement path is too long",
+            )
+        })?;
+    let buffer_size = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(
+            destination
+                .len()
+                .checked_mul(size_of::<u16>())
+                .ok_or_else(|| {
+                    Error::policy(
+                        ErrorKind::InvalidPath,
+                        "the Windows replacement path is too long",
+                    )
+                })?,
+        )
+        .ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the Windows replacement path is too long",
+            )
+        })?;
+    let buffer_size_u32 = u32::try_from(buffer_size).map_err(|_| {
+        Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement path is too long",
+        )
+    })?;
+    let word_size = size_of::<usize>();
+    let word_count = buffer_size
+        .checked_add(word_size - 1)
+        .map(|size| size / word_size)
+        .ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the Windows replacement path is too long",
+            )
+        })?;
+    let mut buffer = vec![0_usize; word_count];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: The usize buffer has sufficient size and alignment for the
+    // variable-length FILE_RENAME_INFO. Every fixed field is initialized, and
+    // the copied UTF-16 destination includes its terminating NUL while the
+    // reported FileNameLength deliberately excludes it.
+    unsafe {
+        std::ptr::addr_of_mut!((*information).Anonymous).write(FILE_RENAME_INFO_0 {
+            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        });
+        std::ptr::addr_of_mut!((*information).RootDirectory).write(null_mut());
+        std::ptr::addr_of_mut!((*information).FileNameLength).write(file_name_bytes);
+        destination.as_ptr().copy_to_nonoverlapping(
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            destination.len(),
+        );
+    }
+    // SAFETY: `source` remains live and grants DELETE access, and `information`
+    // points to the initialized variable-length buffer described above. POSIX
+    // replacement keeps already-open snapshots valid while assigning the
+    // destination name to this verified source handle.
     if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        SetFileInformationByHandle(
+            raw_handle(source),
+            FileRenameInfoEx,
+            information.cast::<c_void>(),
+            buffer_size_u32,
         )
     } == 0
     {

@@ -88,12 +88,12 @@ openapi:
         path: /services/reltio/api/{tenantId}/entities/v2/_scan
         operation_id: getEntitiesByScanSearch
 review:
-  reviewed_at: 2026-08-21
+  reviewed_at: 2026-08-22
   language: en
   release_notes_through: 2026.1.9.0
   practice_source_count: 19
-  practice_source_url_set_sha256: 64e0193ebecaa0b18e2c7286b7279524281edb375aae93a2eb86ce4890e4b5d0
-  practice_source_content_sha256: e74a1fdc447eff8b2dd7a4a17f1268886e1dc7f26559a9c7b6d89ecde586bfa2
+  practice_source_url_set_sha256: 73e65d5b8046f7beb30b9fdb8c8fb78795f632d0f5cd7b529a49a701410a8f7b
+  practice_source_content_sha256: aa2513a83397d630fad3f3b639e36bc064829ecaafbc102572e452a1d86bd65e
   practice_content_sources:
     - url: https://developer.reltio.com/swagger/Data%20Operation
       sha256: e084d21575bf2b51faee031b57d41d61d12b5a926cb7e27f320e12cfeaa3246c
@@ -125,7 +125,7 @@ review:
       sha256: 68b9cc060aec67a1eca5aa9153b77794b60cb488419cb1367ff932d6c19f3e83
     - url: https://docs.reltio.com/en/reltio/what-does-reltio-do/what-reltio-does-at-a-glance/data-unification-and-mdm-at-a-glance/data-unification-and-mdm-in-detail/reltio-match-and-merge/additional-topics-on-matching
       sha256: 7a0a99a740c0eca818ff264a0d1ec2a0b80f5734fbf6b6916b9149f1891beb8e
-    - url: https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-at-a-glance/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits
+    - url: https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-overview/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits
       sha256: 98f0830f00bd34d6e8c9401bbcf5d4bfa578760b028fac22ce04b73a6a8f89c1
     - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/internal-api-sign-in-service---oct-2023
       sha256: 3b0c3465bef3d02728874f8810b0146bb34144e1d3af37cd61ec1b61a6d6848d
@@ -137,7 +137,10 @@ review:
     Reviewed the official AI-ready corpus through its 2026-08-21 synchronization,
     current English documentation, 2026.1 release notes through 2026.1.9.0,
     current deprecation notices, and the live Data Operation OpenAPI for every
-    operation registered in endpoints.yaml. Release-note pages, deprecation
+    operation registered in endpoints.yaml. The API request limits page moved
+    from Implementation assistance at a glance to Implementation assistance
+    overview without changing its reviewed limits or semantic fingerprint.
+    Release-note pages, deprecation
     notices, and every distinct practice source are locked by per-URL effective
     URL, normalized visible text, and resolved HTTP(S) link targets, as well as
     aggregate URL/index position and canonical index links. The version 2

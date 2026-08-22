@@ -2,7 +2,7 @@ schema_version: 1
 target_release: 0.1.0
 product_contract:
   path: docs/PRD.md
-  sha256: 84183cceb0795421446501bb92b430d408c4ac4bf5c8c7cb57bcf8cafb48a654
+  sha256: 6bdfe3f8355649a8d92bac252ea1c0efe15b1dd55c1a77b8cc67ec8f6085f5c0
   sections: ["6.1", "7.2", "9.1", "13.4", "16.3", "19.1"]
 inventory_test_ids: [release_prd_inventory, release_endpoint_role_ownership, release_inventory_substitution_guard, release_safety_binding_downgrade_guard, release_unknown_field_guard, release_audit_evidence_separation, release_evidence_substitution_guard, release_version_binding, release_cli_gate, release_client_harness_discovery, release_cli_unit_harness_discovery, release_cli_integration_harness_discovery]
 

@@ -1,7 +1,7 @@
 schema_version: 1
 catalog:
   corpus_commit: 411a4ab96393ce450fe5d48ec0e1116b1b58660a
-  reviewed_at: 2026-08-21
+  reviewed_at: 2026-08-22
   release_notes_through: 2026.1.9.0
 practices:
   - id: AUTH-CENTRALIZED-001
@@ -185,10 +185,10 @@ practices:
       recommended_max_body_bytes: 20971520
     summary: Reject POST bodies over 50 MB before network I/O; batching workflows should target 10-20 MB.
     source:
-      url: https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-at-a-glance/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits
+      url: https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-overview/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits
       section: Maximum POST request size
       updated_at: 2025-06-27
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-08-22
     commands: [auth.check, entity.search, entity.scan, api.request, doctor]
     implementation: crates/reltio-client/src/http.rs
     test_ids: [post_body_size_guard]

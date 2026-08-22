@@ -175,12 +175,15 @@ jobs:
               index=$((index + 1))
               local page_path="${RUNNER_TEMP}/reltio-${label}-${index}.source"
               local effective_url
-              effective_url="$(curl "${browser_curl[@]}" --output "${page_path}" --write-out '%{url_effective}' "${source_url}")"
+              if ! effective_url="$(curl "${browser_curl[@]}" --output "${page_path}" --write-out '%{url_effective}' "${source_url}")"; then
+                echo "failed to retrieve official ${label} source: ${source_url}" >&2
+                return 1
+              fi
               if [[ "${effective_url}" == */upgrade_browser* || ( "${effective_url}" != https://docs.reltio.com/* && "${effective_url}" != https://developer.reltio.com/* ) ]]; then
                 echo "official documentation resolved to an unapproved location: ${source_url} -> ${effective_url}" >&2
                 return 1
               fi
-              python3 -c '
+              if ! python3 -c '
           import hashlib
           import sys
           from html.parser import HTMLParser
@@ -248,7 +251,10 @@ jobs:
               *sorted(parser.links),
           ])
           print(f"{source_url}\t{hashlib.sha256(material.encode()).hexdigest()}")
-          ' "${source_url}" "${effective_url}" "${page_path}" >> "${manifest}"
+          ' "${source_url}" "${effective_url}" "${page_path}" >> "${manifest}"; then
+                echo "failed to fingerprint official ${label} source: ${source_url}" >&2
+                return 1
+              fi
             done
             if [[ ! -s "${manifest}" ]]; then
               echo "no official ${label} sources were fingerprinted" >&2

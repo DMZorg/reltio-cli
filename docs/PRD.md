@@ -1123,7 +1123,7 @@ Each slice includes tests, user documentation, agent guidance, error cases, and 
 
 ## 24. Source references
 
-Product research was reviewed on 2026-08-08 and applicable API guidance was re-reviewed on 2026-08-21. Links are included to preserve the assumptions behind the design; implementation agents must re-verify details that can change.
+Product research was reviewed on 2026-08-08 and applicable API guidance was re-reviewed on 2026-08-22. Links are included to preserve the assumptions behind the design; implementation agents must re-verify details that can change.
 
 ### Reltio
 
@@ -1132,7 +1132,7 @@ Product research was reviewed on 2026-08-08 and applicable API guidance was re-r
 - [Get started with Reltio REST APIs and service URLs](https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/get-started-with-reltio-rest-apis)
 - [Consistency of data retrieval in Reltio APIs](https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis)
 - [API error codes and retry guidance](https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/search-using-activity-log-api/api-error-codes)
-- [API request limits](https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-at-a-glance/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits)
+- [API request limits](https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-overview/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits)
 - [Load data using ROCS utilities](https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/load-data-using-rocs-utilities)
 - [Authentication API](https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api)
 - [Access Reltio APIs](https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/access-reltio-apis)

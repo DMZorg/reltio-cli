@@ -37,6 +37,10 @@ jobs:
       - name: Documentation links
         run: cargo test --locked -p reltio-cli --test cli shipped_local_markdown_links_resolve
       - name: Practice release gate
+        env:
+          RELTIO_CONFIG: ${{ runner.temp }}/reltio-config/config.toml
+          RELTIO_CACHE_DIR: ${{ runner.temp }}/reltio-cache
+          RELTIO_STATE_DIR: ${{ runner.temp }}/reltio-state
         run: |
           candidate="$RUNNER_TEMP/practice-coverage.next.json"
           if cargo run --locked -p reltio-cli -- --compact api practices check --strict > "${candidate}"; then
@@ -119,6 +123,10 @@ jobs:
         run: cargo build --workspace --release --locked
       - name: Binary smoke test
         if: runner.os != 'Windows'
+        env:
+          RELTIO_CONFIG: ${{ runner.temp }}/reltio-config/config.toml
+          RELTIO_CACHE_DIR: ${{ runner.temp }}/reltio-cache
+          RELTIO_STATE_DIR: ${{ runner.temp }}/reltio-state
         run: ./target/release/reltio --version
       - name: Windows binary smoke test
         if: runner.os == 'Windows'

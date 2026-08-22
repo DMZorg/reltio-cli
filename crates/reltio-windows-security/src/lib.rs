@@ -456,17 +456,12 @@ impl DirectoryGuards {
 #[derive(Debug)]
 struct PendingTemporaryFile {
     file: File,
-    path: PathBuf,
     armed: bool,
 }
 
 impl PendingTemporaryFile {
-    fn new(file: File, path: PathBuf) -> Self {
-        Self {
-            file,
-            path,
-            armed: true,
-        }
+    fn new(file: File) -> Self {
+        Self { file, armed: true }
     }
 
     fn disarm(&mut self) {
@@ -530,7 +525,7 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         let name = format!(".reltio-{:032x}.tmp", rand::random::<u128>());
         let temporary_path = parent.join(name);
         match ffi::create_private_temporary(&temporary_path, &context) {
-            Ok(file) => break PendingTemporaryFile::new(file, temporary_path),
+            Ok(file) => break PendingTemporaryFile::new(file),
             Err(error) if error.is_already_exists() => continue,
             Err(error) => return Err(error),
         }
@@ -549,7 +544,7 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         validate_private_file_handle(&existing, &context)?;
     }
 
-    ffi::move_replace(&temporary.file, &temporary.path, &path)?;
+    ffi::move_replace(&temporary.file, &path)?;
     // A successful rename is the commit point. Cleanup must never delete the
     // installed destination if any later diagnostic were to fail.
     temporary.disarm();
@@ -1307,7 +1302,11 @@ mod tests {
             );
         }
 
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let current = std::env::current_dir().expect("current directory");
+        let temporary = tempfile::Builder::new()
+            .prefix(".reltio-path-")
+            .tempdir_in(current)
+            .expect("temporary directory without an inherited 8.3 alias");
         let ancestor = temporary.path().join("Cache");
         let descendant = temporary.path().join("cache").join("tokens");
         assert!(
@@ -1748,6 +1747,7 @@ mod tests {
 
         let output = Command::new(std::env::current_exe().expect("current test executable"))
             .args([
+                "--nocapture",
                 "--exact",
                 "tests::inherited_dll_directory_is_reset_before_process_creation",
             ])
@@ -1756,7 +1756,8 @@ mod tests {
             .expect("isolated DLL-directory test process");
         assert!(
             output.status.success(),
-            "child stderr: {}",
+            "child stdout: {}\nchild stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
