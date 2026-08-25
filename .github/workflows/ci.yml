@@ -21,6 +21,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  NEXUS_LINUX_CI: ${{ github.event_name == 'workflow_dispatch' && inputs.linux_runner == 'nexus-run' }}
   RUST_BACKTRACE: "1"
   RUSTUP_TOOLCHAIN: 1.85.0
 
@@ -118,34 +119,43 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --exclude reltio-windows-security --all-targets --all-features --locked
       - name: Release login-conflict safety test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo test --release --locked -p reltio-cli --test cli login_commit_conflict_guards_the_winning_profile_and_rolls_back_cache -- --exact
       - name: Release singleflight safety test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo test --release --locked -p reltio-cli --test cli twenty_cli_processes_singleflight_client_credentials -- --exact
       - name: Release final-output lease test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo test --release --locked -p reltio-cli --test cli finite_output_holds_the_cache_lease_through_physical_flush -- --exact
       - name: Release preparse-output lease test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo test --release --locked -p reltio-cli --test cli preparse_help_fails_closed_when_the_cache_lease_is_contended -- --exact
       - name: Release blocked-output deadline test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo test --release --locked -p reltio-cli --test cli blocked_stdout_obeys_the_overall_timeout -- --exact
       - name: Release secret-input deadline test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo test --release --locked -p reltio-cli --test cli secret_stdin_obeys_the_overall_timeout_without_waiting_for_eof -- --exact
       - name: Release token-provenance safety test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo test --release --locked -p reltio-cli --test cli auth_token_refuses_access_token_bytes_that_are_also_a_client_secret -- --exact
       - name: Release profile-removal recovery test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo test --release --locked -p reltio-cli --test cli interrupted_profile_removal_recovers_from_the_durable_cleanup_marker -- --exact
       - name: Unix release blocked-output signal test
-        if: runner.os != 'Windows'
+        if: ${{ runner.os != 'Windows' && env.NEXUS_LINUX_CI != 'true' }}
         run: cargo test --release --locked -p reltio-cli --test cli sigint_interrupts_blocked_stdout_without_a_success_record -- --exact
       - name: Unix release scan signal test
-        if: runner.os != 'Windows'
+        if: ${{ runner.os != 'Windows' && env.NEXUS_LINUX_CI != 'true' }}
         run: cargo test --release --locked -p reltio-cli --test cli entity_scan_sigint_preserves_checkpoint_without_a_false_summary -- --exact
       - name: Unix release secret-input signal test
-        if: runner.os != 'Windows'
+        if: ${{ runner.os != 'Windows' && env.NEXUS_LINUX_CI != 'true' }}
         run: cargo test --release --locked -p reltio-cli --test cli sigint_interrupts_secret_stdin_without_waiting_for_eof -- --exact
       - name: Release build smoke test
+        if: env.NEXUS_LINUX_CI != 'true'
         run: cargo build --workspace --release --locked
       - name: Binary smoke test
-        if: runner.os != 'Windows'
+        if: ${{ runner.os != 'Windows' && env.NEXUS_LINUX_CI != 'true' }}
         env:
           RELTIO_CONFIG: /tmp/reltio-${{ github.run_id }}-${{ github.run_attempt }}-config/config.toml
           RELTIO_CACHE_DIR: /tmp/reltio-${{ github.run_id }}-${{ github.run_attempt }}-cache
@@ -154,6 +164,33 @@ jobs:
       - name: Windows binary smoke test
         if: runner.os == 'Windows'
         run: ./target/release/reltio.exe --version
+
+  nexus-release:
+    name: Nexus release tests
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.linux_runner == 'nexus-run' }}
+    runs-on: ${{ fromJSON(vars.NEXUS_RUNS_ON_LINUX) }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Bootstrap pinned Rustup
+        uses: ./.github/actions/bootstrap-rustup
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Bootstrap pinned linker
+        uses: ./.github/actions/bootstrap-zig-linker
+      - name: Test release workspace
+        run: cargo test --workspace --exclude reltio-windows-security --all-targets --all-features --release --locked
+      - name: Release build smoke test
+        run: cargo build --workspace --release --locked
+      - name: Binary smoke test
+        env:
+          RELTIO_CONFIG: /tmp/reltio-${{ github.run_id }}-${{ github.run_attempt }}-config/config.toml
+          RELTIO_CACHE_DIR: /tmp/reltio-${{ github.run_id }}-${{ github.run_attempt }}-cache
+          RELTIO_STATE_DIR: /tmp/reltio-${{ github.run_id }}-${{ github.run_attempt }}-state
+        run: ./target/release/reltio --version
 
   dependencies:
     name: Dependency policy
