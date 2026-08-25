@@ -1,0 +1,57 @@
+name: Install pinned Cargo policy tools
+description: Install checksum-verified static cargo-audit and cargo-deny binaries
+
+runs:
+  using: composite
+  steps:
+    - name: Install cargo-audit 0.22.2 and cargo-deny 0.20.2
+      shell: bash
+      env:
+        CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+      run: |
+        set -euo pipefail
+        if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
+          printf '%s\n' 'the pinned Cargo policy binaries require x86_64 Linux' >&2
+          exit 1
+        fi
+
+        audit_archive="$RUNNER_TEMP/cargo-audit.tgz"
+        deny_archive="$RUNNER_TEMP/cargo-deny.tar.gz"
+        curl \
+          --fail \
+          --location \
+          --proto '=https' \
+          --retry 5 \
+          --retry-all-errors \
+          --show-error \
+          --silent \
+          --tlsv1.2 \
+          --output "$audit_archive" \
+          'https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz'
+        curl \
+          --fail \
+          --location \
+          --proto '=https' \
+          --retry 5 \
+          --retry-all-errors \
+          --show-error \
+          --silent \
+          --tlsv1.2 \
+          --output "$deny_archive" \
+          'https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz'
+        printf '%s  %s\n' "$CARGO_AUDIT_SHA256" "$audit_archive" | sha256sum --check --strict -
+        printf '%s  %s\n' "$CARGO_DENY_SHA256" "$deny_archive" | sha256sum --check --strict -
+
+        tar --extract --gzip --file "$audit_archive" --directory "$RUNNER_TEMP"
+        tar --extract --gzip --file "$deny_archive" --directory "$RUNNER_TEMP"
+        mkdir -p "$CARGO_HOME/bin"
+        cp \
+          "$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" \
+          "$CARGO_HOME/bin/cargo-audit"
+        cp \
+          "$RUNNER_TEMP/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny" \
+          "$CARGO_HOME/bin/cargo-deny"
+        chmod 0700 "$CARGO_HOME/bin/cargo-audit" "$CARGO_HOME/bin/cargo-deny"
+        [ "$("$CARGO_HOME/bin/cargo-audit" --version)" = 'cargo-audit 0.22.2' ]
+        [ "$("$CARGO_HOME/bin/cargo-deny" --version)" = 'cargo-deny 0.20.2' ]

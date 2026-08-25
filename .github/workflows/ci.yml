@@ -40,25 +40,12 @@ jobs:
         uses: ./.github/actions/bootstrap-rustup
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.85.0 --profile minimal --component rustfmt,clippy
+      - name: Bootstrap pinned linker on Nexus
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.linux_runner == 'nexus-run' }}
+        uses: ./.github/actions/bootstrap-zig-linker
       - name: Install Linux ACL development library
-        run: |
-          set -euo pipefail
-          as_root() {
-            if [ "$(id -u)" -eq 0 ]; then
-              "$@"
-            else
-              sudo "$@"
-            fi
-          }
-          if command -v apt-get >/dev/null 2>&1; then
-            as_root apt-get update
-            as_root apt-get install --yes --no-install-recommends libacl1-dev
-          elif command -v dnf >/dev/null 2>&1; then
-            as_root dnf install --assumeyes libacl-devel
-          else
-            printf '%s\n' 'unsupported Linux package manager: expected apt-get or dnf' >&2
-            exit 1
-          fi
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_runner != 'nexus-run' }}
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libacl1-dev
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -119,26 +106,12 @@ jobs:
         uses: ./.github/actions/bootstrap-rustup
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Bootstrap pinned linker on Nexus
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.linux_runner == 'nexus-run' }}
+        uses: ./.github/actions/bootstrap-zig-linker
       - name: Install Linux ACL development library
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          as_root() {
-            if [ "$(id -u)" -eq 0 ]; then
-              "$@"
-            else
-              sudo "$@"
-            fi
-          }
-          if command -v apt-get >/dev/null 2>&1; then
-            as_root apt-get update
-            as_root apt-get install --yes --no-install-recommends libacl1-dev
-          elif command -v dnf >/dev/null 2>&1; then
-            as_root dnf install --assumeyes libacl-devel
-          else
-            printf '%s\n' 'unsupported Linux package manager: expected apt-get or dnf' >&2
-            exit 1
-          fi
+        if: ${{ runner.os == 'Linux' && (github.event_name != 'workflow_dispatch' || inputs.linux_runner != 'nexus-run') }}
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libacl1-dev
       - name: Windows security native tests
         if: runner.os == 'Windows'
         run: cargo test --locked -p reltio-windows-security --all-targets --all-features
@@ -196,10 +169,16 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.85.0 --profile minimal
       - name: Install dependency-tool Rust toolchain
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_runner != 'nexus-run' }}
         run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install pinned dependency tools on Nexus
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.linux_runner == 'nexus-run' }}
+        uses: ./.github/actions/install-cargo-policy-tools
       - name: Install cargo-audit
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_runner != 'nexus-run' }}
         run: cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
       - name: Install cargo-deny
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_runner != 'nexus-run' }}
         run: cargo +1.88.0 install cargo-deny --version 0.20.2 --locked
       - name: Audit advisories
         run: cargo audit --deny warnings
