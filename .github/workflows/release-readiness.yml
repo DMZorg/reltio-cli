@@ -32,8 +32,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
-    runs-on: ${{ matrix.os }}
+        os: [ubuntu-26.04, ubuntu-24.04-arm, macos-26, macos-15-intel, windows-latest]
+    runs-on: ${{ fromJSON(((((github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && ((matrix.os == 'ubuntu-26.04' && vars.NEXUS_RUNS_ON_UBUNTU_26_04_X64_PRIVILEGED_RUST) || (matrix.os == 'ubuntu-24.04-arm' && vars.NEXUS_RUNS_ON_UBUNTU_24_04_ARM64_PRIVILEGED_RUST) || (matrix.os == 'macos-26' && vars.NEXUS_RUNS_ON_MACOS_RUST) || (matrix.os == 'macos-15-intel' && vars.NEXUS_RUNS_ON_MACOS_15_X64_RUST))) || format('["{0}"]', matrix.os))) }}
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -51,7 +51,7 @@ jobs:
     name: Product contract gate
     if: ${{ github.event_name != 'push' || !contains(github.ref_name, '-') }}
     needs: evidence-tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((((github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && vars.NEXUS_RUNS_ON_UBUNTU_26_04_X64_PRIVILEGED_RUST) || '["ubuntu-26.04"]')) }}
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
