@@ -1,5 +1,7 @@
 # Reltio CLI Entity Data
 
+`--fields` is implemented only by `entity get`, `entity search`, and `entity scan`. Other commands fail with `fields_unsupported` instead of silently returning an unnarrowed response.
+
 ## Direct Read
 
 `entity get` accepts an ID or `entities/<id>` URI and reports `consistency: consistent`. `--fields` accepts documented lowercase top-level fields or nonempty `attributes.<path>` values. Repeated `--option` accepts `sendHidden`, `ovOnly`, `nonOvOnly`, `serializeInitialSourcesInCrosswalks`, `cleanEntity`, `showAppliedSurvivorshipRules`, `showEndDatedReferenceAttributes`, or `explainOv`. It also exposes Reltio's documented historical `--time`, duplicate-crosswalk, value-limit, explicit-survivorship-group, reverse-transcoding, and masking controls. `--reverse-transcode-lookups` carries a Preview availability warning in structured metadata and on stderr for raw/table output; verify the tenant capability and destination mapping before depending on the result.

@@ -130,7 +130,6 @@ async fn get(runtime: &Runtime, arguments: EntityGetArgs) -> Result<()> {
 }
 
 async fn by_crosswalk(runtime: &Runtime, arguments: EntityByCrosswalkArgs) -> Result<()> {
-    reject_fields(runtime, "entity by-crosswalk")?;
     let started = Instant::now();
     let deadline = runtime.deadline_from(started)?;
     let request = EntityByCrosswalkRequest {
@@ -304,7 +303,6 @@ async fn search(runtime: &Runtime, arguments: EntitySearchArgs) -> Result<()> {
 }
 
 async fn history(runtime: &Runtime, arguments: EntityHistoryArgs) -> Result<()> {
-    reject_fields(runtime, "entity history")?;
     let started = Instant::now();
     let deadline = runtime.deadline_from(started)?;
     let request = EntityHistoryRequest {
@@ -413,7 +411,6 @@ async fn history(runtime: &Runtime, arguments: EntityHistoryArgs) -> Result<()> 
 }
 
 async fn matches(runtime: &Runtime, arguments: EntityMatchesArgs) -> Result<()> {
-    reject_fields(runtime, "entity matches")?;
     let started = Instant::now();
     let deadline = runtime.deadline_from(started)?;
     let request = EntityMatchesRequest {
@@ -1866,17 +1863,6 @@ fn scan_query_hash(runtime: &Runtime, arguments: &EntityScanArgs) -> String {
         "activeness": arguments.activeness
     });
     sha256_hex(normalized.to_string().as_bytes())
-}
-
-fn reject_fields(runtime: &Runtime, command: &str) -> Result<()> {
-    if runtime.globals.fields.is_some() {
-        Err(ReltioError::usage(
-            "fields_unsupported",
-            format!("--fields is not part of the reviewed {command} contract"),
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 fn ensure_finite_response_active(

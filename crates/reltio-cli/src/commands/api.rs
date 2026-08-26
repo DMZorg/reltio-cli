@@ -261,6 +261,7 @@ async fn request(runtime: &Runtime, arguments: ApiRequestArgs) -> Result<()> {
                 "no_retry": runtime.globals.no_retry
             },
             "practice_coverage": coverage,
+            "max_response_bytes": runtime.globals.max_response_bytes,
             "network_request_sent": false
         });
         let output_guard = manager.redact_local_credentials(&mut plan, &known_secrets)?;

@@ -890,6 +890,108 @@ fn dry_run_is_rejected_instead_of_mutating_local_profile_state() {
 }
 
 #[test]
+fn unsupported_global_fields_fail_instead_of_being_silently_ignored() {
+    let harness = Harness::new();
+    for arguments in [
+        vec!["--fields", "uri", "profile", "list"],
+        vec!["--fields", "uri", "auth", "status"],
+        vec!["--fields", "uri", "entity", "history", "entities/1"],
+        vec!["--fields", "uri", "api", "practices", "list"],
+    ] {
+        let output = harness
+            .command()
+            .args(arguments)
+            .output()
+            .expect("unsupported fields command executes");
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr).expect("structured fields error")["error"]
+                ["code"],
+            "fields_unsupported"
+        );
+    }
+}
+
+#[test]
+fn credential_process_arguments_do_not_change_parse_error_output() {
+    let harness = Harness::new();
+    let output = harness
+        .command()
+        .args([
+            "auth",
+            "login",
+            "--method",
+            "credential-process",
+            "--credential-process",
+            "broker",
+            "--credential-process-arg",
+            "--output=table",
+            "--not-a-cli-option",
+        ])
+        .output()
+        .expect("invalid credential-process command executes");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("structured parse error")["error"]["code"],
+        "invalid_cli_usage"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dry_run_validates_and_reports_the_response_limit_before_network() {
+    let server = MockServer::start().await;
+    let harness = Harness::new();
+    harness.add_profile(Some(&server.uri()));
+
+    let mut zero = harness.command();
+    zero.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "--max-response-bytes",
+        "0",
+        "--dry-run",
+        "api",
+        "request",
+        "GET",
+        "/entities/1",
+        "--service",
+        "data",
+    ]);
+    let output = run_process(zero).await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("response-limit error")["error"]["code"],
+        "invalid_response_limit"
+    );
+
+    let mut minimum = harness.command();
+    minimum.env("RELTIO_ACCESS_TOKEN", "opaque-token").args([
+        "--max-response-bytes",
+        "1",
+        "--dry-run",
+        "api",
+        "request",
+        "GET",
+        "/entities/1",
+        "--service",
+        "data",
+    ]);
+    let output = run_process(minimum).await;
+    assert_success(&output);
+    assert_eq!(stdout_json(&output)["data"]["max_response_bytes"], 1);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[test]
 fn raw_output_is_rejected_for_commands_without_documented_raw_material() {
     let harness = Harness::new();
     for arguments in [
@@ -1268,6 +1370,77 @@ fn profile_add_rejects_unbound_bearer_configuration() {
         "bearer_configuration_requires_login"
     );
     assert!(!harness.config_path().exists());
+}
+
+#[test]
+fn quiet_login_retains_the_plaintext_cache_warning_in_metadata() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+    let output = harness
+        .command()
+        .env("RELTIO_ACCESS_TOKEN", "quiet-login-token")
+        .args([
+            "--quiet",
+            "auth",
+            "login",
+            "--method",
+            "bearer",
+            "--expires-in",
+            "1h",
+        ])
+        .output()
+        .expect("quiet bearer login executes");
+
+    assert_success(&output);
+    assert!(output.stderr.is_empty());
+    assert!(
+        stdout_json(&output)["meta"]["warnings"]
+            .as_array()
+            .expect("login warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("owner-only local file")))
+    );
+}
+
+#[test]
+fn auth_status_narrates_environment_overrides_unless_quiet() {
+    let harness = Harness::new();
+    harness.add_profile(None);
+
+    for quiet in [false, true] {
+        let mut command = harness.command();
+        command.env("RELTIO_ACCESS_TOKEN", "status-override-token");
+        if quiet {
+            command.arg("--quiet");
+        }
+        let output = command
+            .args(["auth", "status"])
+            .output()
+            .expect("auth status executes");
+
+        assert_success(&output);
+        let envelope = stdout_json(&output);
+        assert_eq!(envelope["data"]["environment_override"], true);
+        assert!(
+            envelope["meta"]["warnings"]
+                .as_array()
+                .expect("status warnings")
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("environment credentials override")))
+        );
+        if quiet {
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("environment credentials override")
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

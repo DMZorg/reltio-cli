@@ -46,6 +46,8 @@ When an active credential equals a normal error field name, value, boolean spell
 | `entity_search_boundary_exceeded` | `offset + max` exceeds 10,000 | Use `entity scan` |
 | `query_filter_too_long` | Entity filter would be silently truncated by Reltio | Simplify the filter or use another workflow |
 | `invalid_query_value` | A reviewed query parameter has an empty, malformed, or undocumented value | Use the exact endpoint parameter contract; for Get Entity, use documented lowercase fields |
+| `fields_unsupported` | `--fields` was supplied to a command that does not implement response selection | Use `--fields` only with `entity get`, `entity search`, or `entity scan` |
+| `invalid_response_limit` | `--max-response-bytes` is zero | Supply a positive response-byte limit; dry runs enforce the same local bound as live requests |
 | `invalid_entity_option` | An entity option is malformed or unsupported for that operation | Use an option documented for the selected Entity API operation |
 | `invalid_scan_option` | An entity scan option is outside the conservative source-bounded allowlist | Use `sendHidden`, `searchByOv`, `ovOnly`, or `nonOvOnly`; live-tenant applicability to `/entities/_scan` remains unverified |
 | `scan_option_conflict` | `ovOnly` and `nonOvOnly` were requested together | Select exactly one operational-value response mode |

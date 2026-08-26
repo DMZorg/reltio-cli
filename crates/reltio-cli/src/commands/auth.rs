@@ -27,6 +27,9 @@ use crate::output::{Meta, prepare_raw_guarded, prepare_success_guarded};
 
 const SECRET_INPUT_LIMIT: u64 = 1024 * 1024;
 const LOGIN_EXPIRY_SKEW_SECONDS: i64 = 5;
+const TOKEN_CACHE_WARNING: &str = "access tokens are cached in an owner-only local file; configure managed secret injection if local plaintext cache is prohibited";
+const ENVIRONMENT_CREDENTIAL_OVERRIDE_WARNING: &str =
+    "environment credentials override part or all of the selected profile authentication provider";
 
 enum PendingLogin {
     Bearer {
@@ -404,12 +407,7 @@ async fn login(runtime: &Runtime, arguments: AuthLoginArgs) -> Result<()> {
     } else {
         meta.practice_coverage = Some(PracticeCoverage::Reviewed);
     }
-    if !runtime.globals.quiet {
-        meta.warnings.push(
-            "access tokens are cached in an owner-only local file; configure managed secret injection if local plaintext cache is prohibited"
-                .to_owned(),
-        );
-    }
+    meta.warnings.push(TOKEN_CACHE_WARNING.to_owned());
     let data = json!({
         "authenticated": true,
         "provider": provider,
@@ -885,14 +883,9 @@ async fn status(runtime: &Runtime) -> Result<()> {
     meta.elapsed_ms = started.elapsed().as_millis();
     meta.auth_source = Some(status.source.clone());
     if status.environment_override {
-        meta.warnings.push(
-            "environment credentials override part or all of the selected profile authentication provider"
-                .to_owned(),
-        );
+        meta.warnings
+            .push(ENVIRONMENT_CREDENTIAL_OVERRIDE_WARNING.to_owned());
     }
-    runtime
-        .ensure_not_cancelled("before_auth_status_output", false)
-        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let data = json!({
         "configured": status.configured,
         "provider": status.provider,
@@ -902,9 +895,20 @@ async fn status(runtime: &Runtime) -> Result<()> {
         "environment_override": status.environment_override,
         "configuration_sources": target.sources
     });
+    let success = prepare_success_guarded(&data, &meta, runtime.render, &output_guard)?;
     runtime
-        .emit_success(&data, &meta, deadline, &output_guard)
-        .await
+        .ensure_not_cancelled("before_auth_status_output", false)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    if status.environment_override {
+        runtime
+            .emit_warning(
+                ENVIRONMENT_CREDENTIAL_OVERRIDE_WARNING,
+                deadline,
+                &output_guard,
+            )
+            .await?;
+    }
+    runtime.emit_prepared(success, deadline).await
 }
 
 async fn check(runtime: &Runtime) -> Result<()> {

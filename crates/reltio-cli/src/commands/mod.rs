@@ -154,6 +154,7 @@ impl Runtime {
         invocation_deadline: Instant,
         stderr_context: OutputContext,
     ) -> Result<Self> {
+        validate_global_options(cli)?;
         let paths = ConfigPaths::discover(&environment)?;
         let store = ConfigStore::new(paths.config_file.clone());
         Ok(Self {
@@ -732,6 +733,31 @@ impl Runtime {
             token_manager,
         ))
     }
+}
+
+fn validate_global_options(cli: &Cli) -> Result<()> {
+    if cli.max_response_bytes == 0 {
+        return Err(ReltioError::usage(
+            "invalid_response_limit",
+            "maximum response size must be greater than zero",
+        ));
+    }
+    if cli.fields.is_some()
+        && !matches!(
+            &cli.command,
+            Command::Entity(crate::cli::EntityCommand {
+                command: EntitySubcommand::Get(_)
+                    | EntitySubcommand::Search(_)
+                    | EntitySubcommand::Scan(_)
+            })
+        )
+    {
+        return Err(ReltioError::usage(
+            "fields_unsupported",
+            "--fields is supported only by `entity get`, `entity search`, and `entity scan`; it is never silently ignored",
+        ));
+    }
+    Ok(())
 }
 
 fn recover_pending_imported_bearer_cleanups_sync(

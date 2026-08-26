@@ -36,7 +36,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub compact: bool,
 
-    /// Select response fields. Get Entity accepts lowercase fields and `attributes.<path>`.
+    /// Select response fields for entity get, search, and scan. Unsupported elsewhere.
     #[arg(long, global = true)]
     pub fields: Option<String>,
 
@@ -72,7 +72,7 @@ pub struct Cli {
     #[arg(long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Maximum buffered response size for finite API commands.
+    /// Maximum buffered response size for finite API commands. Must be greater than zero.
     #[arg(long, global = true, default_value_t = 32 * 1024 * 1024)]
     pub max_response_bytes: usize,
 

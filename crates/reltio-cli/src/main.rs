@@ -550,30 +550,47 @@ fn parse_output_format(value: &str) -> Option<OutputFormat> {
 }
 
 fn preparse_output_format(environment: &Environment) -> OutputFormat {
-    let mut arguments = env::args_os().skip(1);
+    preparse_output_format_from(env::args_os().skip(1))
+        .or_else(|| {
+            environment
+                .get("RELTIO_OUTPUT")
+                .and_then(parse_output_format)
+        })
+        .unwrap_or(OutputFormat::Json)
+}
+
+fn preparse_output_format_from<I, S>(arguments: I) -> Option<OutputFormat>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let mut arguments = arguments.into_iter().map(Into::into);
     while let Some(argument) = arguments.next() {
         if argument == OsStr::new("--") {
             break;
         }
+        if argument == OsStr::new("--credential-process-arg") {
+            let _ = arguments.next();
+            continue;
+        }
         if argument == OsStr::new("--output") {
-            return arguments
-                .next()
-                .as_deref()
-                .and_then(OsStr::to_str)
-                .and_then(parse_output_format)
-                .unwrap_or(OutputFormat::Json);
+            return Some(
+                arguments
+                    .next()
+                    .as_deref()
+                    .and_then(OsStr::to_str)
+                    .and_then(parse_output_format)
+                    .unwrap_or(OutputFormat::Json),
+            );
         }
         if let Some(value) = argument
             .to_str()
             .and_then(|argument| argument.strip_prefix("--output="))
         {
-            return parse_output_format(value).unwrap_or(OutputFormat::Json);
+            return Some(parse_output_format(value).unwrap_or(OutputFormat::Json));
         }
     }
-    environment
-        .get("RELTIO_OUTPUT")
-        .and_then(parse_output_format)
-        .unwrap_or(OutputFormat::Json)
+    None
 }
 
 #[cfg(test)]
@@ -606,6 +623,29 @@ mod tests {
                 "--timeout=5ms",
             ]),
             Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn credential_process_arguments_do_not_become_the_preparse_output_format() {
+        assert_eq!(
+            preparse_output_format_from([
+                "auth",
+                "login",
+                "--credential-process-arg",
+                "--output=table",
+            ]),
+            None
+        );
+        assert_eq!(
+            preparse_output_format_from([
+                "--output=yaml",
+                "auth",
+                "login",
+                "--credential-process-arg",
+                "--output=table",
+            ]),
+            Some(OutputFormat::Yaml)
         );
     }
 

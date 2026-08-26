@@ -677,18 +677,15 @@ fn argument_metadata(
 fn command_constraints(command: &str) -> &'static [&'static str] {
     match command {
         "entity.by-crosswalk" => &[
-            "global --fields is unsupported",
             "ovOnly and nonOvOnly cannot be combined",
             "GET accepts only RFC 3986 unreserved crosswalk values; other values require the deferred POST variant",
         ],
         "entity.history" => &[
-            "global --fields is unsupported",
             "max_items must be greater than zero",
             "offset + max_items must not exceed 1000",
             "filter conflicts with show_all",
         ],
         "entity.matches" => &[
-            "global --fields is unsupported",
             "max_items must be greater than zero",
             "forceMatch=true is unavailable in typed and raw commands",
             "grouped continuation cardinality is unknown; next_offset is not synthesized",
@@ -705,6 +702,10 @@ fn command_constraints(command: &str) -> &'static [&'static str] {
 
 fn argument_constraints(command: &str, argument: &str) -> Vec<&'static str> {
     match (command, argument) {
+        (_, "fields") if !matches!(command, "entity.get" | "entity.search" | "entity.scan") => {
+            vec!["unsupported; use only with entity get, entity search, or entity scan"]
+        }
+        (_, "max_response_bytes") => vec!["must be greater than zero"],
         ("entity.by-crosswalk", "value") => vec!["RFC 3986 unreserved characters only"],
         ("entity.by-crosswalk", "options") => {
             vec!["ovOnly and nonOvOnly cannot be combined"]
@@ -1030,6 +1031,38 @@ mod tests {
             assert_eq!(
                 schema_argument(&value, "output")["environment"],
                 "RELTIO_OUTPUT",
+                "{}",
+                metadata.name
+            );
+        }
+    }
+
+    #[test]
+    fn schemas_report_global_field_applicability_and_response_bounds() {
+        const FIELDS_CONSTRAINT: &str =
+            "unsupported; use only with entity get, entity search, or entity scan";
+        for metadata in all() {
+            let value = schema(Some(metadata.name)).expect("schema");
+            let fields = schema_argument(&value, "fields")["constraints"]
+                .as_array()
+                .expect("field constraints");
+            let fields_supported = matches!(
+                metadata.name,
+                "entity.get" | "entity.search" | "entity.scan"
+            );
+            assert_eq!(
+                fields
+                    .iter()
+                    .any(|constraint| constraint == FIELDS_CONSTRAINT),
+                !fields_supported,
+                "{}",
+                metadata.name
+            );
+            assert!(
+                schema_argument(&value, "max_response_bytes")["constraints"]
+                    .as_array()
+                    .expect("response constraints")
+                    .contains(&Value::String("must be greater than zero".to_owned())),
                 "{}",
                 metadata.name
             );
