@@ -6,7 +6,7 @@ corpus:
   generated_at: 2026-09-11T18:32:03Z
 deprecations:
   index_url: https://docs.reltio.com/en/reltio/deprecation-notices-at-a-glance
-  index_content_sha256: bd959325b85b82d5092469381ccaa18a8490c9366aa8c66833276660f20042cc
+  index_content_sha256: f846abc9b1a776c13e23b3dc26f4e417e91357879cd6e14aaa62e7a2f05328a7
   index_link_count: 26
   index_link_url_set_sha256: 763d8ba1e6fed3c83c948788a546170477a9a7129e038c241b659cf3ca3d904b
   index_links:

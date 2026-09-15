@@ -619,6 +619,7 @@ jobs:
           name: reltio-documentation-drift
           path: |
             ${{ runner.temp }}/reltio-documentation-drift.md
+            ${{ runner.temp }}/reltio-data-operation-openapi.yaml
             ${{ runner.temp }}/reltio-*-content.tsv
             ${{ runner.temp }}/reltio-content-source-diff.txt
             ${{ runner.temp }}/reltio-changed-source-urls.txt
