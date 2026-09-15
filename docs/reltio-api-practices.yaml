@@ -1,8 +1,8 @@
 schema_version: 1
 catalog:
-  corpus_commit: 411a4ab96393ce450fe5d48ec0e1116b1b58660a
-  reviewed_at: 2026-08-22
-  release_notes_through: 2026.1.9.0
+  corpus_commit: a1f599b2c5e788185405e90005c0ab6e9b35bed6
+  reviewed_at: 2026-09-15
+  release_notes_through: 2026.1.10.0
 practices:
   - id: AUTH-CENTRALIZED-001
     title: Use the centralized authentication service
@@ -14,10 +14,10 @@ practices:
     path_patterns: ["/oauth/token"]
     summary: Use https://auth.reltio.com/oauth/token by default and hard-reject the retired tenant-internal sign-in path; explicit custom identity-provider hosts remain partially reviewed.
     source:
-      url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/internal-api-sign-in-service---oct-2023
+      url: https://docs.reltio.com/en/reltio/deprecation-notices-at-a-glance/internal-api-sign-in-service---oct-2023
       section: Internal API sign in service
       updated_at: 2024-12-09
-    reviewed_at: 2026-08-10
+    reviewed_at: 2026-09-15
     commands: [auth.login, auth.check, auth.token, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/service.rs
     test_ids: [auth_url_is_centralized, deprecated_auth_path_absent, deprecated_auth_path_refused]
@@ -35,7 +35,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/obtaining-access-tokens-with-client-credentials-grant-type
       section: Request
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-10
+    reviewed_at: 2026-09-15
     commands: [auth.login, auth.check, auth.token, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [auth_client_credentials_request, auth_login_secret_source_conflict, auth_login_secret_read_order, auth_windows_hidden_input_parser_unicode_editing_limit, auth_windows_hidden_input_parser_surrogate_validation, auth_unix_hidden_input_cleanup, auth_login_prior_credential_guard, auth_environment_basic_guard, auth_mixed_source_basic_guard, auth_provider_preparse_guard, auth_unix_credential_process_preparse_guard, auth_credential_process_timeout_arg_boundary, auth_unix_credential_process_output_bound, auth_credential_process_cleanup_error_metadata_unit, auth_credential_process_timeout_metadata_unit, auth_credential_process_request_timeout_replay, auth_credential_process_request_cancellation_replay, auth_unix_credential_process_environment_filter]
@@ -49,14 +49,14 @@ practices:
     methods: [POST]
     path_patterns: ["/oauth/token"]
     limits:
-      token_requests_per_second: 10
+      local_token_requests_per_second: 10
       default_token_lifetime_seconds: 3600
-    summary: Reuse a token until expiry, reject candidates that are unusable inside the local skew window before replacing a cache preimage, coordinate acquisition to avoid the token endpoint's 10-request-per-second limit, and stop rather than creating repeated refresh generations when a rejected token is reissued unchanged.
+    summary: Reuse a token until expiry, reject candidates that are unusable inside the local skew window before replacing a cache preimage, coordinate acquisition with a local ten-request-per-second throttle; the upstream rolling limit is undisclosed and shared by source IP, so unrelated caches and hosts can still receive 429, and stop rather than creating repeated refresh generations when a rejected token is reissued unchanged.
     source:
-      url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/obtaining-access-tokens-with-client-credentials-grant-type
-      section: Token API request limit
-      updated_at: 2026-07-31
-    reviewed_at: 2026-08-10
+      url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/authentication-token-api-rate-limiting
+      section: Recommended practices
+      updated_at: 2026-09-04
+    reviewed_at: 2026-09-15
     commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [auth_singleflight_cache, auth_cross_process_singleflight, auth_expired_cache_refresh, auth_provider_expiry_guard, auth_candidate_expiry_guard, auth_same_token_reissue_guard, auth_login_cache_transaction, auth_login_cache_reader_isolation, auth_login_profile_rollback, auth_login_malformed_displaced_cache, auth_login_commit_conflict, auth_login_output_preflight, auth_login_warning_preflight, auth_login_output_state, auth_login_broken_pipe_state, auth_bearer_generation_switch, auth_bearer_generation_crash_isolation, auth_bearer_generation_collision, auth_logout_partial_commit, auth_logout_cache_linearization, auth_global_cache_output_guard, auth_orphan_cache_output_guard, auth_cache_output_guard_lease, auth_cache_output_guard_control, auth_cli_final_output_lease, auth_preparse_output_lease, auth_output_timeout_control, auth_output_sigint_control, auth_output_event_order, auth_control_source_order, auth_profile_candidate_credential_guard, auth_profile_candidate_locked_guard, auth_profile_removal_recovery, auth_profile_removal_compensation, auth_profile_removal_pending_union, auth_profile_remove_without_bearer, auth_bearer_transition_cleanup, auth_bearer_cache_migration, auth_storage_path_isolation, auth_macos_storage_case_isolation, auth_unix_storage_physical_alias, auth_unix_storage_casefold_isolation, auth_macos_storage_firmlink_isolation, auth_windows_storage_casefold_and_tilde_rejection, auth_credential_process_cache_identity, auth_cancellation_outcome]
@@ -74,7 +74,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/multi-token-support
       section: Understanding Multi Token Support
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-10
+    reviewed_at: 2026-09-15
     commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [auth_explicit_reissue_lifetime, auth_same_token_reissue_guard]
@@ -91,10 +91,10 @@ practices:
       documented_jwt_size_characters: 3000
     summary: JWT access tokens replaced UUID tokens; storage and redaction must not assume a UUID shape or fixed length, and every final or orphaned local cache generation remains part of final-byte output guards.
     source:
-      url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/uuid-format-for-60-minute-authentication-tokens---apr-2024
+      url: https://docs.reltio.com/en/reltio/deprecation-notices-at-a-glance/uuid-format-for-60-minute-authentication-tokens---apr-2024
       section: What action do you need to take?
       updated_at: 2024-12-09
-    reviewed_at: 2026-08-10
+    reviewed_at: 2026-09-15
     commands: [auth.login, auth.status, auth.check, auth.token, auth.logout, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [opaque_token_roundtrip, opaque_token_redaction, auth_token_raw_cumulative_guard, auth_token_disclosure_provenance, auth_prior_cache_disclosure_guard, auth_raw_broken_pipe_state, auth_output_newline_guard, auth_token_raw_newline_guard, auth_malformed_cache_guard, auth_malformed_cache_duplicate_guard, auth_global_cache_output_guard, auth_cached_help_output_guard, auth_orphan_cache_output_guard, auth_cli_final_output_lease, auth_preparse_output_lease, auth_provider_preparse_guard, auth_unix_credential_process_preparse_guard, auth_refresh_token_validation, auth_refresh_token_no_commit, auth_login_output_preflight, auth_login_warning_preflight]
@@ -114,7 +114,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/access-reltio-apis
       section: API Error Retries
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-10
+    reviewed_at: 2026-09-15
     commands: [auth.login, auth.check, auth.token, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/auth.rs
     test_ids: [auth_token_non_rate_limit_no_retry, auth_rate_limit_single_retry, auth_rate_limit_oversized_replay, auth_rate_limit_oversized_terminal, auth_no_retry_disables_token_replay]
@@ -141,7 +141,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api
       section: Entities API
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [auth.check, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/http.rs
     test_ids: [entity_get_contract, entity_crosswalk_contract, entity_history_contract, entity_matches_contract, protected_authorization_header]
@@ -165,7 +165,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/search-using-activity-log-api/api-error-codes
       section: Best Practice for Retry Mechanism
       updated_at: 2025-04-29
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [auth.check, entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.history, entity.matches, api.request, doctor]
     implementation: crates/reltio-client/src/http.rs
     test_ids: [retry_matrix, retry_backoff_sequence, retry_oversized_body_replay, retry_oversized_body_terminal, no_retry_500]
@@ -188,7 +188,7 @@ practices:
       url: https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-overview/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits
       section: Maximum POST request size
       updated_at: 2025-06-27
-    reviewed_at: 2026-08-22
+    reviewed_at: 2026-09-15
     commands: [auth.check, entity.search, entity.scan, api.request, doctor]
     implementation: crates/reltio-client/src/http.rs
     test_ids: [post_body_size_guard]
@@ -206,7 +206,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis
       section: Consistent API endpoints
       updated_at: 2025-01-17
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [entity.get, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_get_consistency]
@@ -228,7 +228,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity
       section: Parameters
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-09
+    reviewed_at: 2026-09-15
     commands: [entity.get, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_get_query_parameters, raw_entity_get_query_parameters, raw_entity_get_invalid_query, entity_get_parameter_validation]
@@ -246,7 +246,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity
       section: Reverse Transcoding
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-09
+    reviewed_at: 2026-09-15
     commands: [entity.get, api.request]
     implementation: crates/reltio-cli/src/commands/entity.rs
     test_ids: [entity_get_query_parameters, raw_entity_get_query_parameters, entity_get_preview_warning_outputs]
@@ -267,7 +267,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/get-entity-by-crosswalk
       section: Request, Parameters, and Response
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-11
+    reviewed_at: 2026-09-15
     commands: [entity.by-crosswalk, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_crosswalk_contract, entity_crosswalk_validation, entity_crosswalk_id_fallback, entity_crosswalk_source_normalization, raw_entity_crosswalk_preflight, raw_entity_crosswalk_fallback_warning]
@@ -285,7 +285,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis
       section: Consistent API endpoints
       updated_at: 2025-01-17
-    reviewed_at: 2026-08-11
+    reviewed_at: 2026-09-15
     commands: [entity.by-crosswalk, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_crosswalk_contract]
@@ -303,7 +303,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-search
       section: Request
       updated_at: 2026-08-07
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [entity.search, auth.check, api.request, doctor]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_search_post_body]
@@ -321,7 +321,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-search
       section: Request
       updated_at: 2026-08-07
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [api.request]
     implementation: crates/reltio-cli/src/commands/api.rs
     test_ids: [raw_get_search_preflight]
@@ -346,7 +346,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-search
       section: Parameters
       updated_at: 2026-08-07
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [entity.search, auth.check, api.request, doctor]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_search_boundary, entity_search_boundary_warning_outputs, raw_entity_search_boundary_warning_outputs]
@@ -369,7 +369,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis
       section: Eventually Consistent API endpoints
       updated_at: 2025-01-17
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [entity.search, entity.scan, auth.check, api.request, doctor]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_search_consistency, entity_scan_consistency]
@@ -390,7 +390,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/search-entity-with-cursor
       section: Search Entity with Cursor
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [entity.scan, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_scan_pages, entity_scan_continuation_replay, raw_entity_scan_continuation_replay, entity_scan_sigint_no_summary, entity_scan_resume_validation, entity_scan_resume_cli_version, entity_scan_resume_expiry, entity_scan_active_cursor_expiry, entity_scan_cursor_deadline, entity_scan_cursor_request_start, entity_scan_resume_work_bound, entity_scan_resume_route, entity_scan_output_context, entity_scan_final_guard_context, entity_scan_flush_progress, entity_scan_artifact_reconciliation, entity_scan_guard_refusal_replay, entity_scan_response_outcome, entity_scan_checkpoint_commit_metadata, entity_scan_resume_io_control, entity_scan_response_route_guard]
@@ -410,7 +410,7 @@ practices:
       url: https://developer.reltio.com/swagger/Data%20Operation
       section: POST /entities/v2/_scan max
       updated_at: 2026-08-21
-    reviewed_at: 2026-08-21
+    reviewed_at: 2026-09-15
     commands: [entity.scan, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_scan_page_limit, raw_entity_scan_prebody_page_limit, entity_scan_progress_error, raw_entity_scan_v2_route_refused, raw_entity_scan_v2_alias_refused]
@@ -431,7 +431,7 @@ practices:
       url: https://developer.reltio.com/swagger/Data%20Operation
       section: Entities > getEntitiesByScanSearch > POST /services/reltio/api/{tenantId}/entities/v2/_scan > options
       updated_at: 2026-08-21
-    reviewed_at: 2026-08-21
+    reviewed_at: 2026-09-15
     commands: [entity.scan, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_scan_options_contract, raw_entity_scan_options_prebody, entity_scan_option_acknowledgement]
@@ -459,7 +459,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/filtering-entities
       section: Format
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [entity.search, auth.check, entity.scan, api.request, doctor]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_search_filter_guard, entity_scan_filter_guard, query_plus_encoding, raw_query_filter_guard]
@@ -481,7 +481,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
       section: Parameters and Response
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-11
+    reviewed_at: 2026-09-15
     commands: [entity.history, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_history_contract, entity_history_boundary, raw_entity_history_preflight]
@@ -499,7 +499,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
       section: Response-time recommendations
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-11
+    reviewed_at: 2026-09-15
     commands: [entity.history, api.request]
     implementation: crates/reltio-cli/src/commands/api.rs
     test_ids: [entity_history_guidance, raw_entity_history_preflight]
@@ -517,7 +517,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
       section: Response and canonical values
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-11
+    reviewed_at: 2026-09-15
     commands: [entity.history, api.request]
     implementation: crates/reltio-cli/src/commands/entity.rs
     test_ids: [entity_history_canonical_values, raw_entity_history_preflight]
@@ -538,7 +538,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
       section: Parameters and 1,000-event note
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-11
+    reviewed_at: 2026-09-15
     commands: [entity.history, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_history_contract, entity_history_boundary, raw_entity_history_preflight]
@@ -564,7 +564,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/potential-matches-api
       section: Request, Parameters, and Response
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-11
+    reviewed_at: 2026-09-15
     commands: [entity.matches, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_matches_contract, entity_matches_validation, raw_entity_matches_preflight]
@@ -582,7 +582,7 @@ practices:
       url: https://docs.reltio.com/en/reltio/what-does-reltio-do/what-reltio-does-at-a-glance/data-unification-and-mdm-at-a-glance/data-unification-and-mdm-in-detail/reltio-match-and-merge/additional-topics-on-matching
       section: Tenant-level match strategy
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-11
+    reviewed_at: 2026-09-15
     commands: [entity.matches, api.request]
     implementation: crates/reltio-cli/src/commands/entity.rs
     test_ids: [entity_matches_contract, raw_entity_matches_preflight]
@@ -597,10 +597,10 @@ practices:
     path_patterns: ["/entities/{id}/_matches"]
     summary: After 2026.1.9.0 reaches a tenant, selected matching APIs truncate returned relevance to two decimal places instead of rounding; DEV/TEST rollout is scheduled for 2026-08-21 and PRD for 2026-08-28. Preserve the server value, response order, and matchActionLabel exactly; do not locally truncate, round, sort, threshold, or derive an action from the displayed score.
     source:
-      url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/release-notes-at-a-glance/2026.1-release-notes/2026.1-bi-weekly-release-notes-rn
+      url: https://docs.reltio.com/en/reltio/release-notes-at-a-glance/2026.1-release-notes/2026.1-bi-weekly-release-notes-rn
       section: 2026.1.9.0 RN - Matching APIs truncate displayed relevance scores
       updated_at: 2026-08-21
-    reviewed_at: 2026-08-21
+    reviewed_at: 2026-09-15
     commands: [entity.matches, api.request]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_matches_relevance_precision]
@@ -626,7 +626,7 @@ practices:
       url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api
       section: Entity object structure
       updated_at: 2026-07-31
-    reviewed_at: 2026-08-08
+    reviewed_at: 2026-09-15
     commands: [entity.get, entity.by-crosswalk, entity.search, entity.scan, entity.matches, auth.check, api.request, doctor]
     implementation: crates/reltio-client/src/entities.rs
     test_ids: [entity_lossless_roundtrip, entity_crosswalk_contract, entity_matches_contract, entity_response_fidelity, entity_response_arbitrary_precision, entity_typed_raw_fidelity]

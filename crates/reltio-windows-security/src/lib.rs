@@ -620,7 +620,7 @@ pub fn open_bounded_file(
     })?;
     let context = ffi::SecurityContext::new()?;
     let guards = validate_directory_tree(parent, &context)?;
-    let file = ffi::open_file_for_read(&path)?;
+    let file = retry_transient_sharing(|| ffi::open_file_for_read(&path))?;
     let information = validate_regular_handle(&file)?;
     if require_private {
         ffi::inspect_private_policy(&file, &context, ffi::ObjectKind::File)?;
@@ -874,7 +874,7 @@ fn ensure_directory_tree(
     let mut handles = Vec::with_capacity(components.len());
 
     for (index, component) in components.iter().enumerate() {
-        match ffi::open_directory(component) {
+        match retry_transient_sharing(|| ffi::open_directory(component)) {
             Ok(handle) => {
                 validate_directory_handle(&handle)?;
                 ffi::inspect_ancestor_policy(&handle, context)?;
@@ -886,7 +886,7 @@ fn ensure_directory_tree(
                     Err(error) if error.is_already_exists() => {}
                     Err(error) => return Err(error),
                 }
-                let handle = ffi::open_directory(component)?;
+                let handle = retry_transient_sharing(|| ffi::open_directory(component))?;
                 validate_private_directory_handle(&handle, context)?;
                 handles.push(handle);
             }
@@ -903,7 +903,7 @@ fn validate_directory_tree(
 ) -> Result<DirectoryGuards> {
     let mut handles = Vec::new();
     for component in directory_chain(directory)? {
-        let handle = ffi::open_directory(&component)?;
+        let handle = retry_transient_sharing(|| ffi::open_directory(&component))?;
         validate_directory_handle(&handle)?;
         ffi::inspect_ancestor_policy(&handle, context)?;
         handles.push(handle);
@@ -1430,6 +1430,56 @@ mod tests {
         release.join().expect("guard release thread");
         let reader = open_bounded_file(&path, 64, true).expect("replacement remains private");
         assert_eq!(reader.read_all().expect("bounded read"), b"replacement");
+    }
+
+    #[test]
+    fn directory_validation_retries_a_transient_parent_writer() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = temporary.path().join("private").join("secret");
+        atomic_write_private(&path, b"initial").expect("initial private write");
+        for read in [false, true] {
+            let writer = OpenOptions::new()
+                .access_mode(FILE_WRITE_DATA)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path.parent().expect("private parent"))
+                .expect("transient parent writer");
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                drop(writer);
+            });
+            if read {
+                let reader = open_bounded_file(&path, 64, true)
+                    .expect("directory validation waits for parent writer");
+                assert_eq!(reader.read_all().expect("private contents"), b"initial");
+            } else {
+                drop(
+                    open_private_lock(&path.with_extension("lock"))
+                        .expect("directory creation path waits for parent writer"),
+                );
+            }
+            release.join().expect("writer release thread");
+        }
+    }
+
+    #[test]
+    fn bounded_reader_retries_a_transient_file_writer() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = temporary.path().join("secret");
+        atomic_write_private(&path, b"initial").expect("initial private write");
+        let writer = OpenOptions::new()
+            .access_mode(FILE_WRITE_DATA)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .expect("transient file writer");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+        let reader =
+            open_bounded_file(&path, 64, true).expect("snapshot waits for transient writer");
+        release.join().expect("writer release thread");
+        assert_eq!(reader.read_all().expect("private contents"), b"initial");
     }
 
     #[test]

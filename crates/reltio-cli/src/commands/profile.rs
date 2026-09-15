@@ -311,34 +311,39 @@ pub async fn run(runtime: &Runtime, command: ProfileSubcommand) -> Result<()> {
                         &bearer_cache_keys,
                         removed_was_current,
                     );
-                    if let Err(rollback_error) = rollback {
-                        let cache_error = error;
-                        drop(cache_plan);
-                        return Err(ReltioError::new(
-                            "profile_remove_rollback_failed",
-                            reltio_client::error::ErrorCategory::Internal,
-                            "imported-bearer cleanup failed and the removed profile could not be restored",
-                        )
-                        .with_details(json!({
-                            "cache_error": cache_error.code,
-                            "config_rollback_error": rollback_error.code,
-                            "local_profile_committed": Value::Null,
-                            "local_cache_committed": false,
-                            "cleanup_pending": true,
-                            "local_state_committed": Value::Null,
-                            "safe_to_replay": false
-                        }))
-                        .with_hint(
-                            "Inspect profile and authentication state before retrying removal.",
-                        )
-                        .with_output_guard(remove_guard));
-                    }
+                    let cleanup_pending = match rollback {
+                        Ok(cleanup_pending) => cleanup_pending,
+                        Err(rollback_error) => {
+                            let cache_error = error;
+                            drop(cache_plan);
+                            return Err(
+                                ReltioError::new(
+                                    "profile_remove_rollback_failed",
+                                    reltio_client::error::ErrorCategory::Internal,
+                                    "imported-bearer cleanup failed and the removed profile could not be restored",
+                                )
+                                .with_details(json!({
+                                    "cache_error": cache_error.code,
+                                    "config_rollback_error": rollback_error.code,
+                                    "local_profile_committed": Value::Null,
+                                    "local_cache_committed": false,
+                                    "cleanup_pending": true,
+                                    "local_state_committed": Value::Null,
+                                    "safe_to_replay": false
+                                }))
+                                .with_hint(
+                                    "Inspect profile and authentication state before retrying removal.",
+                                )
+                                .with_output_guard(remove_guard),
+                            );
+                        }
+                    };
                     drop(cache_plan);
                     return Err(profile_remove_state_error(
                         error,
                         Some(false),
                         Some(false),
-                        Some(false),
+                        Some(cleanup_pending),
                         true,
                         &remove_guard,
                     ));
@@ -455,7 +460,7 @@ fn restore_removed_profile(
     profile: &Profile,
     bearer_cache_keys: &BTreeSet<String>,
     removed_was_current: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if config.profiles.contains_key(name) {
         return Err(ReltioError::profile(
             "profile_remove_rollback_conflict",
@@ -468,12 +473,25 @@ fn restore_removed_profile(
             format!("profile {name:?} cleanup marker changed before rollback completed"),
         ));
     }
-    config.pending_imported_bearer_cleanups.remove(name);
+    // Cache rollback restores every planned token, including older generations.
+    // Reactivate only the profile's bearer; retired tokens must remain queued.
+    let mut retired = bearer_cache_keys.clone();
+    if let Some(active) = stored_imported_bearer_cache_key(&profile.auth)? {
+        retired.remove(active);
+    }
+    let cleanup_pending = !retired.is_empty();
+    if cleanup_pending {
+        config
+            .pending_imported_bearer_cleanups
+            .insert(name.to_owned(), retired);
+    } else {
+        config.pending_imported_bearer_cleanups.remove(name);
+    }
     config.profiles.insert(name.to_owned(), profile.clone());
     if removed_was_current && config.current_profile.is_none() {
         config.current_profile = Some(name.to_owned());
     }
-    Ok(())
+    Ok(cleanup_pending)
 }
 
 fn profile_bearer_cleanup_keys(
@@ -498,7 +516,7 @@ fn compensate_failed_profile_cache_removal(
     profile: &Profile,
     bearer_cache_keys: &BTreeSet<String>,
     removed_was_current: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let deadline = Instant::now()
         .checked_add(PROFILE_REMOVE_COMPENSATION_TIMEOUT)
         .ok_or_else(|| ReltioError::internal("profile-removal compensation deadline overflowed"))?;
@@ -757,7 +775,7 @@ fn update_profile(config: &mut ConfigFile, arguments: &ProfileUpdateArgs) -> Res
         || previous.base_url != profile.base_url
         || previous.tenant != profile.tenant
         || previous.services != profile.services;
-    if routing_changed && previous.auth.method.is_some() && !arguments.clear_auth {
+    if routing_changed && previous.auth != AuthProfile::default() && !arguments.clear_auth {
         return Err(ReltioError::new(
             "profile_reauthentication_required",
             reltio_client::error::ErrorCategory::Safety,
@@ -980,6 +998,74 @@ mod tests {
     }
 
     #[test]
+    fn routing_change_cannot_retain_credentials_without_an_explicit_method() {
+        let mut config = config_with_profile();
+        config.profiles.get_mut("test").unwrap().auth = AuthProfile {
+            client_id: Some("stored-client".to_owned()),
+            secret_file: Some(PathBuf::from("/private/client-secret")),
+            ..AuthProfile::default()
+        };
+        let before = config.profiles.clone();
+        let mut arguments = update_arguments();
+        arguments.service_urls = vec!["auth=https://replacement.example".to_owned()];
+        let error = update_profile(&mut config, &arguments)
+            .expect_err("implicit authentication metadata belongs to the old route");
+        assert_eq!(error.code, "profile_reauthentication_required");
+        assert_eq!(config.profiles, before);
+        arguments.clear_auth = true;
+        let updated =
+            update_profile(&mut config, &arguments).expect("explicitly clear credentials");
+        assert_eq!(updated.auth, AuthProfile::default());
+    }
+
+    #[test]
+    fn removal_rollback_retains_cleanup_for_retired_bearers() {
+        let active = "a".repeat(64);
+        let retired = "b".repeat(64);
+        let profile = Profile {
+            auth: AuthProfile {
+                method: Some(AuthMethod::Bearer),
+                bearer_cache_key: Some(active.clone()),
+                bearer_cache_generation: Some("c".repeat(64)),
+                ..AuthProfile::default()
+            },
+            ..Profile::default()
+        };
+        let keys = BTreeSet::from([active, retired.clone()]);
+        let mut config = ConfigFile {
+            pending_imported_bearer_cleanups: BTreeMap::from([("test".to_owned(), keys.clone())]),
+            ..ConfigFile::default()
+        };
+        assert!(
+            restore_removed_profile(&mut config, "test", &profile, &keys, true)
+                .expect("restore profile after failed cache removal")
+        );
+        assert_eq!(config.profiles.get("test"), Some(&profile));
+        assert_eq!(
+            config.pending_imported_bearer_cleanups.get("test"),
+            Some(&BTreeSet::from([retired]))
+        );
+    }
+
+    #[test]
+    fn removal_rollback_without_an_active_bearer_preserves_all_pending_cleanup() {
+        let keys = BTreeSet::from(["b".repeat(64)]);
+        let mut config = ConfigFile {
+            pending_imported_bearer_cleanups: BTreeMap::from([("test".to_owned(), keys.clone())]),
+            ..ConfigFile::default()
+        };
+        let profile = Profile::default();
+        assert!(
+            restore_removed_profile(&mut config, "test", &profile, &keys, false)
+                .expect("restore profile with previously retired bearer")
+        );
+        assert_eq!(
+            config.pending_imported_bearer_cleanups.get("test"),
+            Some(&keys)
+        );
+    }
+
+    #[test]
     fn duplicate_service_aliases_and_set_remove_conflicts_are_runtime_errors() {
         let duplicate = parse_service_urls(&[
             "physical-config=https://one.example".to_owned(),
@@ -1004,6 +1090,12 @@ mod tests {
         let removed = Profile {
             environment: Some("dev".to_owned()),
             tenant: Some("RemovedTenant".to_owned()),
+            auth: AuthProfile {
+                method: Some(AuthMethod::Bearer),
+                bearer_cache_key: Some("a".repeat(64)),
+                bearer_cache_generation: Some("c".repeat(64)),
+                ..AuthProfile::default()
+            },
             ..Profile::default()
         };
         let mut config = ConfigFile {
@@ -1068,6 +1160,12 @@ mod tests {
         let removed = Profile {
             environment: Some("dev".to_owned()),
             tenant: Some("RemovedTenant".to_owned()),
+            auth: AuthProfile {
+                method: Some(AuthMethod::Bearer),
+                bearer_cache_key: Some("a".repeat(64)),
+                bearer_cache_generation: Some("c".repeat(64)),
+                ..AuthProfile::default()
+            },
             ..Profile::default()
         };
         store

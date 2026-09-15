@@ -60,7 +60,7 @@ The product complements rather than replaces Reltio's MCP offerings. Reltio's MC
 - Reltio's public developer surface spans entity, relation, interaction, reference data, load/export, integration, workflow, system administration, statistics, validation, and hierarchy APIs.
 - Service URLs differ by API family. Data, tasks, physical configuration, jobs/export, workflow, RDM, DTSS, and authentication cannot be treated as one base URL with one prefix.
 - Reltio documents client credentials, password, and authorization-code access. SSO users need an authorization-code path; MFA can introduce a state-token and OTP exchange.
-- Access tokens commonly expire after one hour. Refresh tokens commonly expire after 28 days. Reltio advises caching tokens and documents a token endpoint limit of 10 requests per second.
+- Access tokens commonly expire after one hour. Refresh tokens commonly expire after 28 days. Reltio advises caching tokens and now documents an undisclosed per-source-IP rolling token-request limit. The CLI uses ten requests per second only as a local throttle.
 - Client-credential access tokens come from a centralized auth service and are not tenant-specific at issuance, while tenant API calls still enforce tenant permissions and IP allowlists.
 - Entity and relation scans use cursors, while some searches use offsets. Cursor lifetimes and endpoint limits make pagination an application concern, not just a flag.
 - Reltio exposes both consistent and eventually consistent reads. An immediate object read and an indexed search can legitimately disagree after a write.
@@ -445,7 +445,7 @@ Client-credential setup directs users to one confidential client/secret pair per
 
 - Cache tokens until their documented expiry rather than requesting one per command.
 - Use a cross-process lock and single-flight refresh to prevent concurrent agents from creating a token storm.
-- Keep aggregate token acquisition below Reltio's documented 10 requests-per-second limit; local concurrency controls do not pretend to coordinate unrelated hosts, so `429` remains handled safely.
+- Throttle local token acquisition to ten requests per second per authentication origin and cache directory; the upstream per-source-IP rolling threshold is undisclosed, and unrelated hosts sharing egress require separate coordination. Handle `429` safely with bounded backoff and actionable recovery guidance.
 - Account for clock skew, but do not assume that an early client-credentials request returns a fresh token when multi-token support is disabled.
 - Refresh tokens when supported. Client credentials obtain a new token at expiry or after an explicit authentication rejection.
 - A received `401` may trigger one refresh and one replay because the server explicitly rejected authorization. Ambiguous transport failures on mutations do not trigger automatic replay.
@@ -1123,7 +1123,7 @@ Each slice includes tests, user documentation, agent guidance, error cases, and 
 
 ## 24. Source references
 
-Product research was reviewed on 2026-08-08 and applicable API guidance was re-reviewed on 2026-08-22. Links are included to preserve the assumptions behind the design; implementation agents must re-verify details that can change.
+Product research was reviewed on 2026-08-08 and applicable API guidance was re-reviewed on 2026-09-15. Links are included to preserve the assumptions behind the design; implementation agents must re-verify details that can change.
 
 ### Reltio
 

@@ -47,6 +47,7 @@ const TOKEN_CACHE_METADATA_BUDGET: usize = TOKEN_CACHE_SCHEMA_METADATA_MAX + 52;
 const TOKEN_CACHE_LIMIT: u64 = (AUTH_RESPONSE_LIMIT * MAX_JSON_ESCAPE_BYTES_PER_TOKEN_BYTE
     + TOKEN_CACHE_METADATA_BUDGET) as u64;
 const EXPIRY_SKEW_SECONDS: i64 = 5;
+// Conservative local throttle; Reltio does not disclose its shared-IP threshold.
 const TOKEN_REQUESTS_PER_SECOND: usize = 10;
 const RATE_WINDOW_MILLIS: i64 = 1_000;
 // `{"request_millis":[]}` plus ten 20-byte i64 values and nine commas.
@@ -1951,7 +1952,7 @@ impl TokenManager {
                 }))
                 .retryable(status.as_u16() == 429)
                 .with_hint(if status.as_u16() == 429 {
-                    "Reuse cached tokens and retry after the server-provided delay."
+                    "Reuse cached tokens, reduce token requests across workloads sharing your public IP, and retry with increasing delays while honoring Retry-After. The upstream threshold is undisclosed; separate caches and hosts need shared-egress coordination."
                 } else {
                     "Check the client ID, secret source, and confidential-client configuration."
                 })
