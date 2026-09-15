@@ -82,7 +82,7 @@ openapi:
   - name: data-operation
     url: https://developer.reltio.com/swagger/Data%20Operation
     retrieved_at: 2026-09-15T06:00:00Z
-    sha256: 37c3f54ac2544d3f1358b3000a46a2324d813a837a256631495e92956f4d3f0e
+    sha256: e99a2beb21dd933c093edaa46bea94f4311e8405f6e63d1031b25c2666c6cec1
     info_version: "2020.2"
     operations:
       - endpoint_id: entity.by-crosswalk
@@ -176,4 +176,9 @@ review:
     the conservative 200-entity ceiling and four-option allowlist are unchanged.
     Option transmission requires --allow-unverified-scan-options; raw option
     requests remain partial and the conflicting versioned alias is refused.
+    The hosted secure-curl OpenAPI response adds CloudStorageFile key/bucket
+    metadata and a storageFile reference, and reorders filter properties; all
+    four registered operation definitions are unchanged. Its raw payload is
+    retained in drift artifacts. Browser-header documentation fingerprints and
+    the raw OpenAPI payload remain independently pinned.
     This documentation review is not live-tenant or stable-release verification.
