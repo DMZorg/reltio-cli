@@ -60,10 +60,17 @@ jobs:
           RELTIO_STATE_DIR: /tmp/reltio-${{ github.run_id }}-${{ github.run_attempt }}-state
         run: |
           candidate="$RUNNER_TEMP/practice-coverage.next.json"
-          if cargo run --locked -p reltio-cli -- --compact api practices check --strict > "${candidate}"; then
+          diagnostic="$RUNNER_TEMP/practice-coverage.stderr"
+          if cargo run --locked -p reltio-cli -- --compact api practices check --strict > "${candidate}" 2> "${diagnostic}"; then
             mv "${candidate}" "$RUNNER_TEMP/practice-coverage.json"
           else
             status="$?"
+            cat "${diagnostic}" >&2
+            # Cargo may prefix the CLI's structured error with build diagnostics.
+            # Keep the real failure when available, otherwise retain the placeholder.
+            if tail -n 1 "${diagnostic}" | jq -e 'select(type == "object" and .schema_version == 1 and .ok == false and (.error.code | type == "string"))' > "${candidate}"; then
+              mv "${candidate}" "$RUNNER_TEMP/practice-coverage.json"
+            fi
             rm -f "${candidate}"
             exit "${status}"
           fi

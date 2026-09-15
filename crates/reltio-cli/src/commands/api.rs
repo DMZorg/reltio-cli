@@ -789,13 +789,8 @@ async fn practices(runtime: &Runtime, command: ApiPracticesSubcommand) -> Result
                 }
             }
             let age = registry.review_age_days()?;
-            if (strict || release_ready) && age > 14 {
-                return Err(ReltioError::new(
-                    "practice_review_stale",
-                    ErrorCategory::Conflict,
-                    format!("API-practice review is {age} days old; release maximum is 14"),
-                )
-                .with_hint("Review the current corpus, release notes, and deprecation notices before release."));
+            if strict || release_ready {
+                ensure_fresh_review(age)?;
             }
             let all_reviewed = registry
                 .endpoints()
@@ -859,6 +854,20 @@ async fn practices(runtime: &Runtime, command: ApiPracticesSubcommand) -> Result
     runtime
         .emit_success(&data, &meta, deadline, &runtime.environment_output_guard())
         .await
+}
+
+fn ensure_fresh_review(age: i64) -> Result<()> {
+    if age > 14 {
+        return Err(ReltioError::new(
+            "practice_review_stale",
+            ErrorCategory::Conflict,
+            format!("API-practice review is {age} days old; release maximum is 14"),
+        )
+        .with_hint(
+            "Review the current corpus, release notes, and deprecation notices before release.",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_method(value: &str) -> Result<Method> {
@@ -1942,6 +1951,19 @@ fn require_mutation_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_freshness_gate_accepts_day_fourteen_and_refuses_day_fifteen() {
+        for age in [0, 1, 14] {
+            assert!(ensure_fresh_review(age).is_ok());
+        }
+        for age in [15, 24, 365] {
+            let error = ensure_fresh_review(age).expect_err("stale review must block release");
+            assert_eq!(error.code, "practice_review_stale");
+            assert_eq!(error.category, ErrorCategory::Conflict);
+            assert!(!error.retryable);
+        }
+    }
 
     #[::std::prelude::v1::test]
     fn registered_safety_overrides_http_method_defaults_fail_closed() {

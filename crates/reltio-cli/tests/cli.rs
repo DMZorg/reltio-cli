@@ -4252,19 +4252,62 @@ async fn doctor_online_uses_the_registered_search_contract() {
         .env("RELTIO_ACCESS_TOKEN", "opaque-token")
         .args(["doctor", "--online"]);
 
+    let registry = reltio_client::registry::Registry::embedded().expect("registry");
+    let age_before = registry.review_age_days().expect("review age");
     let output = run_process(command).await;
-    assert_success(&output);
-    let envelope = stdout_json(&output);
-    assert_eq!(envelope["data"]["healthy"], true);
-    assert_eq!(envelope["meta"]["practice_coverage"], "reviewed");
-    assert_eq!(envelope["meta"]["consistency"], "eventual");
-    assert_eq!(envelope["meta"]["request_id"], "doctor-request-1");
-    assert!(
-        envelope["meta"]["practice_ids"]
-            .as_array()
-            .expect("practice IDs")
-            .contains(&Value::String("ENTITY-SEARCH-POST-001".to_owned()))
+    let age_after = registry.review_age_days().expect("review age");
+    // Allow a UTC midnight crossing without accepting an incorrect status.
+    assert!([age_before <= 14, age_after <= 14].contains(&output.status.success()));
+    // Freshness is a live diagnostic, independent of the tenant-read contract.
+    // Assert the read in either envelope, and allow only the documented warning.
+    let envelope;
+    let report = if output.status.success() {
+        assert!(output.stderr.is_empty());
+        envelope = stdout_json(&output);
+        assert_eq!(envelope["data"]["healthy"], true);
+        assert_eq!(envelope["meta"]["practice_coverage"], "reviewed");
+        assert_eq!(envelope["meta"]["consistency"], "eventual");
+        assert_eq!(envelope["meta"]["request_id"], "doctor-request-1");
+        assert!(
+            envelope["meta"]["practice_ids"]
+                .as_array()
+                .expect("practice IDs")
+                .contains(&Value::String("ENTITY-SEARCH-POST-001".to_owned()))
+        );
+        &envelope["data"]
+    } else {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        envelope = serde_json::from_slice::<Value>(&output.stderr).expect("doctor error");
+        assert_eq!(envelope["error"]["code"], "doctor_unhealthy");
+        assert_eq!(envelope["error"]["details"]["healthy"], false);
+        &envelope["error"]["details"]
+    };
+    let checks = report["checks"].as_array().expect("doctor checks");
+    let freshness = checks
+        .iter()
+        .find(|check| check["name"] == "practices.freshness")
+        .expect("freshness check");
+    assert_eq!(
+        freshness["status"],
+        if output.status.success() {
+            "pass"
+        } else {
+            "warn"
+        }
     );
+    assert!(
+        checks
+            .iter()
+            .filter(|check| check["name"] != "practices.freshness")
+            .all(|check| check["status"] == "pass")
+    );
+    let read = checks
+        .iter()
+        .find(|check| check["name"] == "tenant.read")
+        .expect("tenant read check");
+    assert_eq!(read["details"]["request_id"], "doctor-request-1");
+    assert_eq!(read["details"]["attempts"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5620,11 +5663,13 @@ fn release_gate_reports_prd_blockers_and_refuses_stable_readiness() {
     let harness = Harness::new();
     let report = harness
         .command()
-        .args(["--compact", "api", "practices", "check", "--strict"])
+        .args(["--compact", "api", "practices", "check"])
         .output()
         .expect("practice report executes");
     assert_success(&report);
-    let readiness = &stdout_json(&report)["data"]["release_requirements"];
+    let report = stdout_json(&report);
+    assert_eq!(report["data"]["valid"], true);
+    let readiness = &report["data"]["release_requirements"];
     assert_eq!(readiness["required_operation_count"], 50);
     assert_eq!(readiness["command_present_count"], 28);
     assert_eq!(readiness["missing_command_count"], 22);
@@ -5634,6 +5679,21 @@ fn release_gate_reports_prd_blockers_and_refuses_stable_readiness() {
     );
     assert_eq!(readiness["release_ready"], false);
 
+    let strict = harness
+        .command()
+        .args(["--compact", "api", "practices", "check", "--strict"])
+        .output()
+        .expect("strict practice gate executes");
+    if report["data"]["release_fresh"] == true {
+        assert_success(&strict);
+        assert_eq!(stdout_json(&strict)["data"]["valid"], true);
+    } else {
+        assert_eq!(strict.status.code(), Some(5));
+        assert!(strict.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&strict.stderr).expect("strict gate error");
+        assert_eq!(error["error"]["code"], "practice_review_stale");
+    }
+
     let refused = harness
         .command()
         .args(["api", "practices", "check", "--release-ready"])
@@ -5642,9 +5702,14 @@ fn release_gate_reports_prd_blockers_and_refuses_stable_readiness() {
     assert_eq!(refused.status.code(), Some(5));
     assert!(refused.stdout.is_empty());
     let error: Value = serde_json::from_slice(&refused.stderr).expect("release gate error");
-    assert_eq!(error["error"]["code"], "release_operations_incomplete");
-    assert_eq!(error["error"]["details"]["required_operation_count"], 50);
-    assert_eq!(error["error"]["details"]["release_ready"], false);
+    // The freshness gate intentionally precedes the product-readiness gate.
+    if report["data"]["release_fresh"] == true {
+        assert_eq!(error["error"]["code"], "release_operations_incomplete");
+        assert_eq!(error["error"]["details"]["required_operation_count"], 50);
+        assert_eq!(error["error"]["details"]["release_ready"], false);
+    } else {
+        assert_eq!(error["error"]["code"], "practice_review_stale");
+    }
 
     let version_mismatch = harness
         .command()
