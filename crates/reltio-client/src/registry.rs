@@ -378,12 +378,13 @@ impl Registry {
     }
 
     pub fn review_age_days(&self) -> Result<i64> {
-        let reviewed = validated_date(
-            "catalog review",
-            &self.practices.catalog.reviewed_at,
-            Utc::now().date_naive(),
-        )?;
-        Ok((Utc::now().date_naive() - reviewed).num_days())
+        self.review_age_days_at(Utc::now().date_naive())
+    }
+
+    fn review_age_days_at(&self, today: NaiveDate) -> Result<i64> {
+        let reviewed =
+            validated_date("catalog review", &self.practices.catalog.reviewed_at, today)?;
+        Ok((today - reviewed).num_days())
     }
 
     fn parse() -> Result<Self> {
@@ -1328,6 +1329,25 @@ mod tests {
                 &practices
             ),
             PracticeCoverage::Reviewed
+        );
+    }
+
+    #[test]
+    fn review_age_uses_calendar_days_and_rejects_future_reviews() {
+        let registry = Registry::embedded().expect("registry");
+        let reviewed = NaiveDate::parse_from_str(&registry.metadata().reviewed_at, "%Y-%m-%d")
+            .expect("review date");
+        for days in [0, 14, 15, 365] {
+            let today = reviewed + chrono::TimeDelta::days(days);
+            assert_eq!(
+                registry.review_age_days_at(today).expect("review age"),
+                days
+            );
+        }
+        assert!(
+            registry
+                .review_age_days_at(reviewed.pred_opt().unwrap())
+                .is_err()
         );
     }
 

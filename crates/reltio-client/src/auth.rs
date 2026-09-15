@@ -4241,18 +4241,43 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn copy_private_native_executable(source: &Path, destination: &Path) {
-        fs::copy(source, destination).expect("copy native executable");
+    fn private_test_shell(destination: &Path) {
+        #[cfg(not(target_os = "macos"))]
+        fs::copy("/bin/sh", destination).expect("copy native executable");
         #[cfg(target_os = "macos")]
-        assert!(
-            std::process::Command::new("/usr/bin/codesign")
-                .args(["--force", "--sign", "-"])
-                .arg(destination)
-                .status()
-                .expect("run ad-hoc code signing")
-                .success(),
-            "copied macOS executables require a valid ad-hoc signature"
-        );
+        {
+            // Apple's arm64e system shells cannot reliably run after copying
+            // and ad-hoc signing. Build an ordinary native launcher instead;
+            // exec preserves the broker PID, process group, cwd and environment.
+            let source = destination.with_extension("rs");
+            fs::write(
+                &source,
+                r#"
+                use std::os::unix::process::CommandExt;
+                fn main() {
+                    let error = std::process::Command::new("/bin/sh")
+                        .args(std::env::args_os().skip(1))
+                        .exec();
+                    panic!("test shell exec failed: {error}");
+                }
+            "#,
+            )
+            .expect("write native test shell launcher");
+            let output = std::process::Command::new(
+                std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+            )
+            .args(["--edition=2024", "--crate-name", "credential_test_shell"])
+            .arg(&source)
+            .arg("-o")
+            .arg(destination)
+            .output()
+            .expect("compile native test shell launcher");
+            assert!(
+                output.status.success(),
+                "native test shell compilation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         fs::set_permissions(destination, Permissions::from_mode(0o700))
             .expect("secure native executable");
     }
@@ -6272,7 +6297,7 @@ mod tests {
     async fn credential_process_executes_with_the_cache_identity_environment_filter() {
         let directory = tempdir().expect("temporary directory");
         let native_shell = directory.path().join("private-sh");
-        copy_private_native_executable(Path::new("/bin/sh"), &native_shell);
+        private_test_shell(&native_shell);
         let environment = credential_process_environment_from([
             (OsString::from("AWS_PROFILE"), OsString::from("development")),
             (OsString::from("PATH"), OsString::from("injected-path")),
@@ -6338,7 +6363,7 @@ mod tests {
     async fn credential_process_executes_a_private_absolute_file_and_bounds_failures() {
         let directory = tempdir().expect("temp dir");
         let native_shell = directory.path().join("private-sh");
-        copy_private_native_executable(Path::new("/bin/sh"), &native_shell);
+        private_test_shell(&native_shell);
         let expected_working_directory = fs::canonicalize(directory.path()).expect("canonical cwd");
         let command_for = |body: &str| {
             vec![

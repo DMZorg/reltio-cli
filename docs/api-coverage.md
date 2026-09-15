@@ -49,3 +49,9 @@ Potential-match retrieval preserves the dynamic match-group object and unknown n
 `POST /entities/_byUris` remains deferred because current sources do not establish a trustworthy body optionality contract, request limit, response ordering/missing-item correlation, partial-failure model, or replay behavior.
 
 Typed entity writes, relations, business configuration, tasks, SSO, and later families remain planned in the [product contract](PRD.md). The release report currently identifies 28 present command leaves but zero operation-complete leaves because operation-specific release evidence has not yet been approved, plus 22 absent leaves, absent endpoint bindings, the missing authorization-code provider, all 19 unproven MVP scenarios, and unimplemented mutation audit fields/results/runtime support. They must not be described as release-complete or production-supported until their registry, safeguards, documentation, and tests land together.
+
+## Testing review freshness
+
+Use `reltio api practices check` without enforcement flags to inspect coverage and all product-readiness blockers even when a review has expired. `--strict` and `--release-ready` continue to reject reviews older than 14 calendar days; an expired review is a policy failure, not evidence that the network command contract has changed. Ordinary command-contract tests inspect the successful tenant-read diagnostic even when `doctor` also reports a freshness warning. Date-boundary unit tests cover day 14, day 15, and future review dates without changing the system clock or adding a runtime bypass.
+
+The CI coverage artifact preserves the structured policy error when the gate fails, including `practice_review_stale`. A build failure that produces no structured CLI error retains the initialized failure placeholder. Passing the test suite does not renew the recorded review or imply release readiness: refreshing the review requires the source review described in `AGENTS.md`.
