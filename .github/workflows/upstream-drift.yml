@@ -296,7 +296,7 @@ jobs:
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${corpus_slug}/commits/main" | jq -r .sha)"
-          release_url="https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/release-notes-at-a-glance/${reviewed_release_family}-release-notes/${reviewed_release_family}-bi-weekly-release-notes-rn"
+          release_url="https://docs.reltio.com/en/reltio/release-notes-at-a-glance/${reviewed_release_family}-release-notes/${reviewed_release_family}-bi-weekly-release-notes-rn"
           deprecation_url="${reviewed_deprecation_index_url}"
           deprecation_sitemap_url="${reviewed_deprecation_sitemap_url}"
           release_page_path="${RUNNER_TEMP}/reltio-release-notes.html"

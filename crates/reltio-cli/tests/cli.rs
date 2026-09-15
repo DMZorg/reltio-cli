@@ -287,6 +287,64 @@ fn duplicate_service_aliases_are_rejected_without_mutating_config() {
 }
 
 #[test]
+fn routing_update_requires_clearing_auth_metadata_even_without_a_method() {
+    let harness = Harness::new();
+    let added = harness
+        .command()
+        .args([
+            "profile",
+            "add",
+            "implicit",
+            "--environment",
+            "test",
+            "--tenant",
+            "Tenant",
+            "--client-id",
+            "stored-client",
+        ])
+        .output()
+        .expect("add profile with partial auth metadata");
+    assert_success(&added);
+    let before = fs::read(harness.config_path()).expect("config preimage");
+    let refused = harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "implicit",
+            "--service-url",
+            "auth=https://replacement.example",
+        ])
+        .output()
+        .expect("attempt to change auth route");
+    assert_eq!(refused.status.code(), Some(5));
+    assert!(refused.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&refused.stderr).expect("route refusal");
+    assert_eq!(error["error"]["code"], "profile_reauthentication_required");
+    assert_eq!(
+        fs::read(harness.config_path()).expect("unchanged config"),
+        before
+    );
+    let cleared = harness
+        .command()
+        .args([
+            "profile",
+            "update",
+            "implicit",
+            "--service-url",
+            "auth=https://replacement.example",
+            "--clear-auth",
+        ])
+        .output()
+        .expect("explicit clear-auth route update");
+    assert_success(&cleared);
+    let config = ConfigStore::new(harness.config_path())
+        .load()
+        .expect("updated config");
+    assert_eq!(config.profiles["implicit"].auth, AuthProfile::default());
+}
+
+#[test]
 fn profile_update_clear_auth_conflicts_with_every_auth_setter_before_mutation() {
     let harness = Harness::new();
     harness.add_profile(None);

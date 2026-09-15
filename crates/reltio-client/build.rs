@@ -404,7 +404,7 @@ fn main() {
     );
     assert!(
         upstream.deprecations.index_url
-            == "https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance"
+            == "https://docs.reltio.com/en/reltio/deprecation-notices-at-a-glance"
             && valid_sha256(&upstream.deprecations.index_content_sha256)
             && upstream.deprecations.index_link_count > 0
             && valid_sha256(&upstream.deprecations.index_link_url_set_sha256)

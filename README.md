@@ -102,15 +102,9 @@ cargo run -p reltio-cli -- api practices check --strict
 cargo run -p reltio-cli -- api practices check --release-ready
 ```
 
-Trusted maintainers can route a manual Linux CI run to the organization's Nexus runner pool when `NEXUS_RUNS_ON_LINUX` contains a reviewed JSON selector such as `["self-hosted","Linux","X64","nexus-run"]`:
+CI and release-readiness tests run only on GitHub-hosted `ubuntu-latest`. CI runs the debug workspace suite with all features and the complete release workspace suite with default shipped features. Windows-native tests, macOS execution, and ARM execution require separate validation before claiming support on those platforms.
 
-```bash
-gh workflow run ci.yml --ref "$(git branch --show-current)" -f linux_runner=nexus-run
-```
-
-Pull requests continue to use GitHub-hosted runners. A manual Nexus run executes the Linux quality, debug and release test, and dependency gates but intentionally skips hosted macOS and Windows jobs, so it does not replace the full platform release evidence.
-
-The second check is expected to fail during this incomplete alpha and is one mandatory product-MVP gate before a stable `v0.1.0` release. It does not replace platform tests, signing, provenance, packaging, or pilot approval. Stable readiness accepts only an exact `vMAJOR.MINOR.PATCH` tag, runs the default shipped feature set across the platform suites, requires current upstream and dependency-policy evidence, and binds the tag, manifest target, and package version through `--expected-release`. Every required operation also needs independently approved, Cargo-discoverable implementation evidence; a command leaf or endpoint binding alone is insufficient. Every Reltio API operation must update `docs/endpoints.yaml`, `docs/reltio-api-practices.yaml`, `docs/test-evidence.yaml`, `docs/release-requirements.yaml`, command metadata, tests, and user/agent guidance together. Read the [product contract](docs/PRD.md) and [repository agent instructions](AGENTS.md) before implementation work.
+The second check is expected to fail during this incomplete alpha and is one mandatory product-MVP gate before a stable `v0.1.0` release. It does not replace platform tests, signing, provenance, packaging, or pilot approval. Stable readiness accepts only an exact `vMAJOR.MINOR.PATCH` tag, runs the default shipped feature set on Ubuntu, requires current upstream and dependency-policy evidence, and binds the tag, manifest target, and package version through `--expected-release`. Every required operation also needs independently approved, Cargo-discoverable implementation evidence; a command leaf or endpoint binding alone is insufficient. Every Reltio API operation must update `docs/endpoints.yaml`, `docs/reltio-api-practices.yaml`, `docs/test-evidence.yaml`, `docs/release-requirements.yaml`, command metadata, tests, and user/agent guidance together. Read the [product contract](docs/PRD.md) and [repository agent instructions](AGENTS.md) before implementation work.
 
 ## Documentation
 
