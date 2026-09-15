@@ -107,10 +107,10 @@ review:
   release_notes_through: 2026.1.10.0
   practice_source_count: 20
   practice_source_url_set_sha256: 3dce834ad48c6cc4b4b12dc3d828cfe41b299bed8b3c9f2bf03242be9f5122f4
-  practice_source_content_sha256: c51813c97399420690ee51b55f37fb3e0ed6f132f4fb49ab65f013ce4b7deba2
+  practice_source_content_sha256: 602eb3625acdae929aab09a504c5db4a8f38e506e35e0894c2a28becb34cbde4
   practice_content_sources:
     - url: https://developer.reltio.com/swagger/Data%20Operation
-      sha256: c0324e9c6307ec61d13f4befba4db1e7b0563199c8ba158529f9408eabcba0f3
+      sha256: 71da6206f761f92ef18cfee5c7b94917a5b48a32925f150c42d3b77faec8c751
     - url: https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis
       sha256: 8afb683a6a8676fe72265b8dbab15b06194c71efa02fea620818974a3f02cbfc
     - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api
@@ -179,6 +179,6 @@ review:
     The hosted secure-curl OpenAPI response adds CloudStorageFile key/bucket
     metadata and a storageFile reference, and reorders filter properties; all
     four registered operation definitions are unchanged. Its raw payload is
-    retained in drift artifacts. Browser-header documentation fingerprints and
-    the raw OpenAPI payload remain independently pinned.
+    retained in drift artifacts. Raw and normalized OpenAPI fingerprints now
+    use one validated download, preventing mixed versions from separate requests.
     This documentation review is not live-tenant or stable-release verification.

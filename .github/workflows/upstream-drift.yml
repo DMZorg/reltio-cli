@@ -175,7 +175,12 @@ jobs:
               index=$((index + 1))
               local page_path="${RUNNER_TEMP}/reltio-${label}-${index}.source"
               local effective_url
-              if ! effective_url="$(curl "${browser_curl[@]}" --output "${page_path}" --write-out '%{url_effective}' "${source_url}")"; then
+              # Fingerprint the same OpenAPI snapshot whose raw digest and bindings
+              # were checked below; separate requests can return different versions.
+              if [[ "${source_url}" == "${reviewed_openapi_url}" && -s "${current_openapi_path:-}" ]]; then
+                cp "${current_openapi_path}" "${page_path}"
+                effective_url="${current_openapi_effective_url}"
+              elif ! effective_url="$(curl "${browser_curl[@]}" --output "${page_path}" --write-out '%{url_effective}' "${source_url}")"; then
                 echo "failed to retrieve official ${label} source: ${source_url}" >&2
                 return 1
               fi
