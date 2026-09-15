@@ -4,20 +4,25 @@
 //! this crate lives here. Public callers receive only owned Rust values and
 //! path-redacted typed errors.
 
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::fmt;
 use std::fs::File;
-use std::mem::{offset_of, size_of};
-use std::os::windows::ffi::OsStrExt;
+use std::mem::{align_of, offset_of, size_of};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::ptr::{null, null_mut};
 
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0, FILE_RENAME_POSIX_SEMANTICS,
+    FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformationEx, NtSetInformationFile,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES,
     ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    LocalFree,
+    LocalFree, RtlNtStatusToDosError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 #[cfg(test)]
 use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::{
@@ -42,16 +47,21 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES,
-    FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo, FileDispositionInfo, FileStandardInfo,
-    GetDriveTypeW, GetFileInformationByHandleEx, GetFileType, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_ID_INFO, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    FILE_WRITE_EA, FileAttributeTagInfo, FileDispositionInfo, FileIdInfo, FileStandardInfo,
+    GetDriveTypeW, GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW,
+    OPEN_EXISTING, READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    SetFileInformationByHandle, VOLUME_NAME_NT, WRITE_DAC, WRITE_OWNER,
+};
+use windows_sys::Win32::System::Console::{
+    FlushConsoleInputBuffer, GetConsoleMode, INPUT_RECORD, KEY_EVENT,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, IO_STATUS_BLOCK_0};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -59,7 +69,9 @@ use windows_sys::Win32::System::JobObjects::{
 };
 #[cfg(test)]
 use windows_sys::Win32::System::LibraryLoader::GetDllDirectoryW;
-use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
+use windows_sys::Win32::System::LibraryLoader::{
+    GetModuleHandleW, GetProcAddress, SetDllDirectoryW,
+};
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
     ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
@@ -69,6 +81,7 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcessToken,
     OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
@@ -88,6 +101,189 @@ const UNTRUSTED_ANCESTOR_MUTATION: u32 = DELETE
     | GENERIC_ALL;
 const UNTRUSTED_EXECUTABLE_DIRECTORY_MUTATION: u32 =
     UNTRUSTED_ANCESTOR_MUTATION | FILE_WRITE_DATA | FILE_APPEND_DATA;
+const CONSOLE_READ_NOWAIT: u16 = 0x0002;
+const MAX_FINAL_PATH_UNITS: usize = 32_768;
+const _: () = assert!(align_of::<FILE_RENAME_INFORMATION>() <= align_of::<usize>());
+
+type ReadConsoleInputExW =
+    unsafe extern "system" fn(HANDLE, *mut INPUT_RECORD, u32, *mut u32, u16) -> i32;
+
+pub(crate) struct ConsoleInput {
+    handle: OwnedHandle,
+    read_console_input: ReadConsoleInputExW,
+}
+
+impl fmt::Debug for ConsoleInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConsoleInput")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConsoleInputEvent {
+    Key {
+        key_down: bool,
+        repeat_count: u16,
+        virtual_key_code: u16,
+        unicode_char: u16,
+        control_key_state: u32,
+    },
+    Other,
+}
+
+pub(crate) fn open_console_input() -> Result<ConsoleInput> {
+    let name = "CONIN$\0".encode_utf16().collect::<Vec<_>>();
+    // SAFETY: The UTF-16 name is live and NUL-terminated; null security and
+    // template handles request one non-inheritable console input handle.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(console_error(
+            ErrorKind::ConsoleUnavailable,
+            "failed to open native Windows console input",
+        ));
+    }
+    // SAFETY: CreateFileW returned a fresh handle and this is its sole owner.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut mode = 0_u32;
+    // SAFETY: The owned console handle and output pointer remain valid for the
+    // complete synchronous mode query. No mode is modified.
+    if unsafe { GetConsoleMode(raw_owned_handle(&handle), &mut mode) } == 0 {
+        return Err(console_error(
+            ErrorKind::ConsoleUnavailable,
+            "native Windows console input is unavailable",
+        ));
+    }
+
+    let module_name = "kernel32.dll\0".encode_utf16().collect::<Vec<_>>();
+    // SAFETY: The module name is live and NUL-terminated. The returned module
+    // is process-owned and must not be closed by this function.
+    let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
+    if module.is_null() {
+        return Err(last_error("failed to locate the Windows console module"));
+    }
+    // SAFETY: The symbol name is a static NUL-terminated ASCII string and the
+    // module remains loaded for the process lifetime.
+    let procedure = unsafe { GetProcAddress(module, c"ReadConsoleInputExW".as_ptr().cast()) }
+        .ok_or_else(|| last_error("failed to locate bounded Windows console input"))?;
+    // SAFETY: ReadConsoleInputExW has the documented WINAPI signature declared
+    // by ReadConsoleInputExW above. The symbol is resolved from kernel32.dll.
+    let read_console_input = unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, ReadConsoleInputExW>(procedure)
+    };
+    Ok(ConsoleInput {
+        handle,
+        read_console_input,
+    })
+}
+
+impl ConsoleInput {
+    pub(crate) fn wait(&self, milliseconds: u32) -> Result<bool> {
+        // SAFETY: The owned console handle remains open for the wait.
+        match unsafe { WaitForSingleObject(raw_owned_handle(&self.handle), milliseconds) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(last_error("failed to wait for Windows console input")),
+            _ => Err(Error::policy(
+                ErrorKind::Io,
+                "Windows returned an unexpected console wait state",
+            )),
+        }
+    }
+
+    pub(crate) fn read_event_nowait(&self) -> Result<Option<ConsoleInputEvent>> {
+        let mut record = INPUT_RECORD::default();
+        let mut read = 0_u32;
+        // SAFETY: The handle is live, the one-record output buffer and count
+        // pointer are writable, and CONSOLE_READ_NOWAIT prevents a stale wait
+        // signal from turning this call into an unbounded read.
+        let succeeded = unsafe {
+            (self.read_console_input)(
+                raw_owned_handle(&self.handle),
+                &mut record,
+                1,
+                &mut read,
+                CONSOLE_READ_NOWAIT,
+            )
+        };
+        if succeeded == 0 {
+            return Err(last_error("failed to read Windows console input"));
+        }
+        if read == 0 {
+            return Ok(None);
+        }
+        let event = if u32::from(record.EventType) == KEY_EVENT {
+            // SAFETY: EventType identifies the active INPUT_RECORD union member.
+            let key = unsafe { record.Event.KeyEvent };
+            // SAFETY: KEY_EVENT_RECORD always initializes its character union.
+            let unicode_char = unsafe { key.uChar.UnicodeChar };
+            ConsoleInputEvent::Key {
+                key_down: key.bKeyDown != 0,
+                repeat_count: key.wRepeatCount,
+                virtual_key_code: key.wVirtualKeyCode,
+                unicode_char,
+                control_key_state: key.dwControlKeyState,
+            }
+        } else {
+            ConsoleInputEvent::Other
+        };
+        // SAFETY: `record` is no longer read after this point. Clearing the
+        // initialized plain-old-data buffer prevents character remnants from
+        // remaining in the worker thread's stack frame.
+        unsafe { std::ptr::write_bytes(&raw mut record, 0, 1) };
+        Ok(Some(event))
+    }
+
+    pub(crate) fn flush(&self) -> Result<()> {
+        // SAFETY: The owned handle remains a live console input handle.
+        if unsafe { FlushConsoleInputBuffer(raw_owned_handle(&self.handle)) } == 0 {
+            Err(console_error(
+                ErrorKind::InputCleanup,
+                "failed to clear abandoned Windows credential input",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn console_error(kind: ErrorKind, operation: &'static str) -> Error {
+    Error {
+        kind,
+        operation,
+        source: Some(std::io::Error::last_os_error()),
+    }
+}
+
+pub(crate) fn os_str_eq_ordinal_ignore_case(left: &OsStr, right: &OsStr) -> Result<bool> {
+    let left = left.encode_wide().collect::<Vec<_>>();
+    let right = right.encode_wide().collect::<Vec<_>>();
+    let left_len = i32::try_from(left.len())
+        .map_err(|_| Error::policy(ErrorKind::InvalidPath, "a path component is too long"))?;
+    let right_len = i32::try_from(right.len())
+        .map_err(|_| Error::policy(ErrorKind::InvalidPath, "a path component is too long"))?;
+    // SAFETY: Both UTF-16 buffers remain live for the call and their explicit
+    // lengths exactly describe the readable regions. CompareStringOrdinal does
+    // not require NUL termination when nonnegative lengths are supplied.
+    let comparison =
+        unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
+    if comparison == 0 {
+        Err(last_error("failed to compare Windows path components"))
+    } else {
+        Ok(comparison == CSTR_EQUAL)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObjectKind {
@@ -218,8 +414,10 @@ pub(crate) fn assign_credential_process_and_resume(
             "suspended credential process thread changed ownership",
         ));
     }
-    // SAFETY: The revalidated thread belongs to the contained child and was
-    // created with exactly one CREATE_SUSPENDED count by this command.
+    // SAFETY: The revalidated thread belongs to the contained child and the
+    // handle grants THREAD_SUSPEND_RESUME. ResumeThread reports the prior count
+    // only after attempting to decrement it, so a non-1 result cannot prove
+    // that user code has not already started executing inside the Job.
     let previous_count = unsafe { ResumeThread(raw_owned_handle(&thread)) };
     if previous_count == u32::MAX {
         return Err(last_error(
@@ -229,7 +427,7 @@ pub(crate) fn assign_credential_process_and_resume(
     if previous_count != 1 {
         return Err(Error::policy(
             ErrorKind::ProcessContainment,
-            "credential process thread had an unexpected suspend count",
+            "credential process thread had an unexpected suspend count after resume; execution state is uncertain",
         ));
     }
     Ok(())
@@ -537,12 +735,70 @@ pub(crate) fn create_private_directory(path: &Path, context: &SecurityContext) -
 pub(crate) fn open_directory(path: &Path) -> Result<File> {
     open_file(
         path,
-        FILE_READ_ATTRIBUTES | READ_CONTROL,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
         FILE_SHARE_READ,
         OPEN_EXISTING,
         COMMON_OPEN_FLAGS | FILE_FLAG_BACKUP_SEMANTICS,
         None,
         "failed to open a Windows directory",
+    )
+}
+
+pub(crate) fn open_directory_for_replacement(path: &Path) -> Result<File> {
+    open_file(
+        path,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+        COMMON_OPEN_FLAGS | FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+        "failed to prepare the guarded Windows directory for replacement",
+    )
+}
+
+pub(crate) fn require_same_object(first: &File, second: &File) -> Result<()> {
+    let first = file_identity(first)?;
+    let second = file_identity(second)?;
+    if first.VolumeSerialNumber != second.VolumeSerialNumber
+        || first.FileId.Identifier != second.FileId.Identifier
+    {
+        return Err(Error::policy(
+            ErrorKind::InvalidPath,
+            "the guarded Windows parent directory identity changed",
+        ));
+    }
+    Ok(())
+}
+
+fn file_identity(file: &File) -> Result<FILE_ID_INFO> {
+    let mut identity = FILE_ID_INFO::default();
+    // SAFETY: `file` keeps the handle live and the typed output buffer and byte
+    // count exactly match the FileIdInfo contract.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            raw_handle(file),
+            FileIdInfo,
+            std::ptr::from_mut(&mut identity).cast::<c_void>(),
+            u32::try_from(size_of::<FILE_ID_INFO>()).unwrap_or(u32::MAX),
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "failed to inspect the guarded Windows directory identity",
+        ));
+    }
+    Ok(identity)
+}
+
+pub(crate) fn open_path_for_comparison(path: &Path) -> Result<File> {
+    open_file(
+        path,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        OPEN_EXISTING,
+        COMMON_OPEN_FLAGS | FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+        "failed to open a Windows path for identity comparison",
     )
 }
 
@@ -597,7 +853,7 @@ pub(crate) fn open_file_for_read(path: &Path) -> Result<File> {
 pub(crate) fn open_file_for_inspection(path: &Path) -> Result<File> {
     open_file(
         path,
-        FILE_READ_ATTRIBUTES | READ_CONTROL,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
         FILE_SHARE_READ,
         OPEN_EXISTING,
         COMMON_OPEN_FLAGS | FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
@@ -647,9 +903,10 @@ pub(crate) fn set_process_dll_directory_for_test(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 pub(crate) fn process_dll_directory_is_default_for_test() -> bool {
-    // SAFETY: A zero-sized query with a null output buffer is documented and
-    // returns zero when no custom DLL directory is configured.
-    (unsafe { GetDllDirectoryW(0, null_mut()) }) == 0
+    let mut directory = [u16::MAX];
+    // SAFETY: The one-element output buffer remains live and its declared size
+    // is exact. An empty DLL directory fits as one terminating NUL.
+    (unsafe { GetDllDirectoryW(1, directory.as_mut_ptr()) }) == 0 && directory[0] == 0
 }
 
 fn require_fixed_drive_type(drive_type: u32) -> Result<()> {
@@ -753,6 +1010,68 @@ pub(crate) fn handle_information(file: &File) -> Result<HandleInformation> {
         reparse_point: tag_information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || tag_information.ReparseTag != 0,
     })
+}
+
+pub(crate) fn final_normalized_nt_path(file: &File) -> Result<std::ffi::OsString> {
+    let handle = raw_handle(file);
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_NT;
+    // SAFETY: A zero-sized query with a null output buffer asks Windows for the
+    // required UTF-16 capacity while the borrowed file handle remains live.
+    let required = unsafe { GetFinalPathNameByHandleW(handle, null_mut(), 0, flags) };
+    if required == 0 {
+        return Err(last_error("failed to size a normalized Windows path"));
+    }
+    let mut capacity = usize::try_from(required).map_err(|_| {
+        Error::policy(
+            ErrorKind::InvalidPath,
+            "the normalized Windows path length is not representable",
+        )
+    })?;
+    if capacity > MAX_FINAL_PATH_UNITS {
+        return Err(Error::policy(
+            ErrorKind::InvalidPath,
+            "the normalized Windows path exceeds the local path limit",
+        ));
+    }
+
+    loop {
+        let mut buffer = vec![0_u16; capacity];
+        // SAFETY: The file handle remains live and `buffer` exposes exactly the
+        // writable UTF-16 capacity passed to Windows for this synchronous call.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                flags,
+            )
+        };
+        if length == 0 {
+            return Err(last_error("failed to resolve a normalized Windows path"));
+        }
+        let length = usize::try_from(length).map_err(|_| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the normalized Windows path length is not representable",
+            )
+        })?;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(std::ffi::OsString::from_wide(&buffer));
+        }
+        capacity = length.checked_add(1).ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the normalized Windows path length overflowed",
+            )
+        })?;
+        if capacity > MAX_FINAL_PATH_UNITS {
+            return Err(Error::policy(
+                ErrorKind::InvalidPath,
+                "the normalized Windows path exceeds the local path limit",
+            ));
+        }
+    }
 }
 
 pub(crate) fn inspect_private_policy(
@@ -1110,21 +1429,92 @@ fn basic_allowed_ace(dacl: *mut ACL, index: u32) -> Result<Option<AllowedAceView
     }))
 }
 
-pub(crate) fn move_replace(_source_handle: &File, source: &Path, destination: &Path) -> Result<()> {
-    let source = wide_path(source)?;
-    let destination = wide_path(destination)?;
-    // SAFETY: Both paths are NUL-terminated local paths. `_source_handle`
-    // deliberately keeps the verified source object open through this call.
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+pub(crate) fn move_replace(
+    source: &File,
+    destination_parent: &File,
+    destination_name: &OsStr,
+) -> Result<()> {
+    let destination = wide_leaf(destination_name)?;
+    let file_name_bytes = destination
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the Windows replacement path is too long",
+            )
+        })?;
+    let file_name_length = u32::try_from(file_name_bytes).map_err(|_| {
+        Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement path is too long",
         )
-    } == 0
-    {
-        return Err(last_error(
+    })?;
+    let buffer_size = size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(file_name_bytes)
+        .ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the Windows replacement path is too long",
+            )
+        })?;
+    let buffer_size_u32 = u32::try_from(buffer_size).map_err(|_| {
+        Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement path is too long",
+        )
+    })?;
+    let word_size = size_of::<usize>();
+    let word_count = buffer_size
+        .checked_add(word_size - 1)
+        .map(|size| size / word_size)
+        .ok_or_else(|| {
+            Error::policy(
+                ErrorKind::InvalidPath,
+                "the Windows replacement path is too long",
+            )
+        })?;
+    let mut buffer = vec![0_usize; word_count];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: The usize buffer has sufficient size and alignment for the
+    // variable-length FILE_RENAME_INFORMATION. Every fixed field is
+    // initialized, and FileNameLength exactly describes the copied leaf.
+    unsafe {
+        std::ptr::addr_of_mut!((*information).Anonymous).write(FILE_RENAME_INFORMATION_0 {
+            Flags: FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+        });
+        std::ptr::addr_of_mut!((*information).RootDirectory).write(raw_handle(destination_parent));
+        std::ptr::addr_of_mut!((*information).FileNameLength).write(file_name_length);
+        destination.as_ptr().copy_to_nonoverlapping(
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            destination.len(),
+        );
+    }
+    let mut io_status = IO_STATUS_BLOCK {
+        Anonymous: IO_STATUS_BLOCK_0 { Status: 0 },
+        Information: 0,
+    };
+    // SAFETY: `source` remains live and grants DELETE access. The held parent
+    // handle grants traverse and read-attribute access, `io_status` is writable,
+    // and `information` contains one relative leaf name. POSIX replacement
+    // keeps already-open snapshots valid while assigning that name to the
+    // verified source handle.
+    let status = unsafe {
+        NtSetInformationFile(
+            raw_handle(source),
+            &mut io_status,
+            information.cast::<c_void>(),
+            buffer_size_u32,
+            FileRenameInformationEx,
+        )
+    };
+    if status < 0 {
+        // SAFETY: RtlNtStatusToDosError accepts any NTSTATUS value and has no
+        // pointer or lifetime requirements.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(Error::from_win32(
             "failed to atomically install the private Windows file",
+            code,
         ));
     }
     Ok(())
@@ -1312,6 +1702,29 @@ fn wide_path(path: &Path) -> Result<Vec<u16>> {
     wide.extend(encoded);
     wide.push(0);
     Ok(wide)
+}
+
+fn wide_leaf(name: &OsStr) -> Result<Vec<u16>> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(component)) if component == name)
+        || components.next().is_some()
+    {
+        return Err(Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement name is not one file name",
+        ));
+    }
+    let encoded = name.encode_wide().collect::<Vec<_>>();
+    if encoded
+        .iter()
+        .any(|character| *character == 0 || *character == u16::from(b':'))
+    {
+        return Err(Error::policy(
+            ErrorKind::InvalidPath,
+            "the Windows replacement name is invalid",
+        ));
+    }
+    Ok(encoded)
 }
 
 fn raw_handle(file: &File) -> HANDLE {

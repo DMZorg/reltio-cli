@@ -20,6 +20,12 @@ mod streaming_redaction;
 
 pub use error::{ErrorCategory, ReltioError, Result};
 
+#[doc(hidden)]
+pub fn release_evidence_bindings_for_validation()
+-> &'static [(&'static str, &'static str, &'static str, &'static str)] {
+    &release_contract::V0_1_RELEASE_EVIDENCE_BINDINGS
+}
+
 /// Stable structured-output schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 

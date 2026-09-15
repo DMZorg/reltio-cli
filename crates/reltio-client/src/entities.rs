@@ -8,12 +8,15 @@ use serde_json::{Map, Value, json};
 use crate::auth::TokenManager;
 use crate::error::{ErrorCategory, ReltioError, Result, json_parse_details};
 use crate::http::{ApiResponse, HttpClient, RequestSpec};
-use crate::registry::{Consistency, Registry};
+use crate::registry::{Consistency, Registry, ReplayPolicy};
 use crate::service::{Service, ServiceResolver, normalize_entity_uri};
 
 pub const SEARCH_RESULT_BOUNDARY: u32 = 10_000;
 pub const SEARCH_BOUNDARY_WARNING: &str = "the 10,000-result offset boundary was reached; more matching entities may exist, so use entity scan for exhaustive retrieval";
 pub const QUERY_FILTER_CHARACTER_LIMIT: usize = 256;
+pub const ENTITY_SCAN_PAGE_LIMIT: u32 = 200;
+pub const ENTITY_SCAN_OPTIONS: &[&str] = &["sendHidden", "searchByOv", "ovOnly", "nonOvOnly"];
+pub const ENTITY_SCAN_OPTIONS_PROVISIONAL_WARNING: &str = "scan options are documented only for conflicting route variants; verify behavior in a non-production tenant before depending on options for /entities/_scan";
 pub const HISTORY_RESULT_BOUNDARY: u32 = 1_000;
 pub const HISTORY_BOUNDARY_WARNING: &str = "the 1,000-event entity-history boundary was reached; Reltio does not support pagination beyond the most recent 1,000 events";
 pub const HISTORY_CANONICAL_VALUES_WARNING: &str = "entity history contains stored canonical values and does not retranscode them for Accept-Language; values can differ from a current entity read";
@@ -312,9 +315,7 @@ impl EntitiesClient {
         request.practice_ids.clone_from(&endpoint.practice_ids);
         let response = self.http.execute(&self.auth, request).await?;
         let entries = parse_array(&response, "entity.by-crosswalk")?;
-        let id_fallback_detected = entries
-            .iter()
-            .any(|entry| successful_entry_lacks_crosswalk(entry, lookup));
+        let id_fallback_detected = entity_by_crosswalk_id_fallback_detected(&entries, lookup);
         Ok(EntityByCrosswalkResult {
             entries,
             id_fallback_detected,
@@ -516,7 +517,7 @@ impl EntitiesClient {
         let mut request = RequestSpec::new(Method::POST, url, "entity.scan");
         request.headers = json_headers(true);
         request.body = body;
-        request.replay = endpoint.replay;
+        request.replay = scan_replay_policy(scan, endpoint.replay);
         request.practice_ids.clone_from(&endpoint.practice_ids);
         let response = if let Some(deadline) = deadline {
             self.http
@@ -525,7 +526,32 @@ impl EntitiesClient {
         } else {
             self.http.execute(&self.auth, request).await?
         };
-        let parsed: ScanResponse = serde_json::from_value(response.json()?).map_err(|error| {
+        let key_presence = response.unredacted_top_level_key_presence(&["objects", "entities"])?;
+        let has_objects = key_presence.first().copied().unwrap_or(false);
+        let has_entities = key_presence.get(1).copied().unwrap_or(false);
+        if has_entities {
+            return Err(ReltioError::new(
+                "scan_response_route_mismatch",
+                ErrorCategory::Api,
+                "entity scan returned the conflicting v2 response collection",
+            )
+            .with_http_status(response.status)
+            .with_request_id(response.request_id.clone())
+            .with_details(json!({
+                "expected_collection": "objects",
+                "unexpected_collection": "entities",
+                "expected_collection_present": has_objects,
+                "documented_route": "/entities/_scan",
+                "conflicting_route": "/entities/v2/_scan"
+            }))
+            .with_hint("Do not treat this response as cursor exhaustion; verify the tenant route contract before retrying.")
+            .with_output_guard(response.output_guard()));
+        }
+        let response_value = response.json()?;
+        if has_objects && response_value.get("objects").is_none() {
+            return Err(response.redaction_error("entity_scan_objects_key_matched_credential"));
+        }
+        let parsed: ScanResponse = serde_json::from_value(response_value).map_err(|error| {
             ReltioError::new(
                 "api_response_invalid_json",
                 ErrorCategory::Api,
@@ -668,6 +694,15 @@ pub fn validate_matches(entity: &str, matches: &EntityMatchesRequest) -> Result<
     Ok(())
 }
 
+pub fn entity_by_crosswalk_id_fallback_detected(
+    entries: &[Value],
+    lookup: &EntityByCrosswalkRequest,
+) -> bool {
+    entries
+        .iter()
+        .any(|entry| successful_entry_lacks_crosswalk(entry, lookup))
+}
+
 fn successful_entry_lacks_crosswalk(entry: &Value, lookup: &EntityByCrosswalkRequest) -> bool {
     if entry.get("successful").and_then(Value::as_bool) != Some(true) {
         return false;
@@ -681,11 +716,31 @@ fn successful_entry_lacks_crosswalk(entry: &Value, lookup: &EntityByCrosswalkReq
     };
     !crosswalks.iter().any(|crosswalk| {
         crosswalk.get("value").and_then(Value::as_str) == Some(lookup.value.as_str())
-            && crosswalk.get("type").and_then(Value::as_str) == Some(lookup.source_type.as_str())
+            && crosswalk
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|source_type| {
+                    normalized_source_type(source_type)
+                        == normalized_source_type(&lookup.source_type)
+                })
             && lookup.source_table.as_deref().is_none_or(|source_table| {
                 crosswalk.get("sourceTable").and_then(Value::as_str) == Some(source_table)
             })
     })
+}
+
+fn normalized_source_type(source_type: &str) -> &str {
+    source_type
+        .strip_prefix("configuration/sources/")
+        .unwrap_or(source_type)
+}
+
+fn scan_replay_policy(scan: &EntityScanRequest, initial_policy: ReplayPolicy) -> ReplayPolicy {
+    if scan.cursor.is_some() {
+        ReplayPolicy::Unsafe
+    } else {
+        initial_policy
+    }
 }
 
 pub fn validate_search(search: &EntitySearchRequest) -> Result<()> {
@@ -750,6 +805,19 @@ pub fn validate_scan(scan: &EntityScanRequest) -> Result<()> {
             "entity scan page size must be greater than zero",
         ));
     }
+    if scan.max > ENTITY_SCAN_PAGE_LIMIT {
+        return Err(ReltioError::usage(
+            "scan_page_size_too_large",
+            format!(
+                "entity scan page size must not exceed the reviewed {ENTITY_SCAN_PAGE_LIMIT}-entity response ceiling"
+            ),
+        )
+        .with_details(json!({
+            "requested_page_size": scan.max,
+            "maximum_page_size": ENTITY_SCAN_PAGE_LIMIT,
+            "practice_id": "ENTITY-SCAN-PAGE-LIMIT-001"
+        })));
+    }
     if scan.cursor.is_none() && scan.filter.as_deref().is_none_or(str::is_empty) {
         return Err(ReltioError::usage(
             "scan_filter_required",
@@ -778,8 +846,40 @@ pub fn validate_scan(scan: &EntityScanRequest) -> Result<()> {
         validate_optional_text(Some(filter), "filter")?;
     }
     validate_optional_text(scan.select.as_deref(), "select")?;
-    validate_options(&scan.options)?;
+    validate_scan_options(&scan.options)?;
     validate_activeness(scan.activeness.as_deref())
+}
+
+pub fn validate_scan_option_acknowledgement(
+    options: &[String],
+    allow_unverified_options: bool,
+) -> Result<()> {
+    if options.is_empty() {
+        if allow_unverified_options {
+            return Err(ReltioError::usage(
+                "scan_option_acknowledgement_inapplicable",
+                "--allow-unverified-scan-options requires at least one scan option",
+            ));
+        }
+        return Ok(());
+    }
+    if allow_unverified_options {
+        return Ok(());
+    }
+    Err(ReltioError::new(
+        "unverified_scan_options_refused",
+        ErrorCategory::Safety,
+        "entity scan options are not enabled without explicit acknowledgement of the unresolved route contract",
+    )
+    .with_details(json!({
+        "options": options,
+        "documented_route": "/entities/_scan",
+        "option_schema_route": "/entities/v2/_scan",
+        "network_request_sent": false,
+        "local_state_committed": false,
+        "safe_to_replay": true
+    }))
+    .with_hint("Pilot the option against a non-production tenant, then repeat with --allow-unverified-scan-options."))
 }
 
 pub fn validate_query_filter(filter: &str) -> Result<()> {
@@ -876,6 +976,31 @@ fn validate_get_options(options: &[String]) -> Result<()> {
             format!("entity get option {option:?} is not in the reviewed Get Entity contract"),
         )
         .with_details(json!({ "allowed": ENTITY_GET_OPTIONS })));
+    }
+    Ok(())
+}
+
+fn validate_scan_options(options: &[String]) -> Result<()> {
+    validate_options(options)?;
+    if let Some(option) = options
+        .iter()
+        .find(|option| !ENTITY_SCAN_OPTIONS.contains(&option.as_str()))
+    {
+        return Err(ReltioError::usage(
+            "invalid_scan_option",
+            format!(
+                "entity scan option {option:?} is outside the conservative locked-OpenAPI allowlist"
+            ),
+        )
+        .with_details(json!({ "allowed": ENTITY_SCAN_OPTIONS })));
+    }
+    if options.iter().any(|option| option == "ovOnly")
+        && options.iter().any(|option| option == "nonOvOnly")
+    {
+        return Err(ReltioError::usage(
+            "scan_option_conflict",
+            "ovOnly and nonOvOnly are mutually exclusive",
+        ));
     }
     Ok(())
 }
@@ -1017,6 +1142,91 @@ mod tests {
     }
 
     #[test]
+    fn entity_scan_page_limit_is_enforced() {
+        let valid = EntityScanRequest {
+            filter: Some("equals(type,'configuration/entityTypes/Organization')".to_owned()),
+            cursor: None,
+            max: ENTITY_SCAN_PAGE_LIMIT,
+            select: None,
+            options: Vec::new(),
+            activeness: None,
+        };
+        validate_scan(&valid).expect("the reviewed scan ceiling is accepted");
+
+        let invalid = EntityScanRequest {
+            max: ENTITY_SCAN_PAGE_LIMIT + 1,
+            ..valid
+        };
+        let error = validate_scan(&invalid).expect_err("oversized scan pages fail locally");
+        assert_eq!(error.code, "scan_page_size_too_large");
+        assert_eq!(error.details["practice_id"], "ENTITY-SCAN-PAGE-LIMIT-001");
+    }
+
+    #[test]
+    fn entity_scan_options_match_the_reviewed_openapi_intersection() {
+        let valid = EntityScanRequest {
+            filter: Some("equals(type,'configuration/entityTypes/Organization')".to_owned()),
+            cursor: None,
+            max: 100,
+            select: None,
+            options: ENTITY_SCAN_OPTIONS
+                .iter()
+                .map(|option| (*option).to_owned())
+                .collect(),
+            activeness: None,
+        };
+        let mut each_option = valid.clone();
+        for option in ENTITY_SCAN_OPTIONS {
+            each_option.options = vec![(*option).to_owned()];
+            validate_scan(&each_option).expect("reviewed scan option");
+        }
+
+        let mut unknown = valid.clone();
+        unknown.options = vec!["futureOption".to_owned()];
+        assert_eq!(
+            validate_scan(&unknown)
+                .expect_err("unknown option fails")
+                .code,
+            "invalid_scan_option"
+        );
+
+        let mut conflict = valid;
+        conflict.options = vec!["ovOnly".to_owned(), "nonOvOnly".to_owned()];
+        assert_eq!(
+            validate_scan(&conflict)
+                .expect_err("conflicting options fail")
+                .code,
+            "scan_option_conflict"
+        );
+    }
+
+    #[test]
+    fn entity_scan_continuations_are_never_replayed_automatically() {
+        let initial = EntityScanRequest {
+            filter: Some("equals(type,'configuration/entityTypes/Organization')".to_owned()),
+            cursor: None,
+            max: 100,
+            select: None,
+            options: Vec::new(),
+            activeness: None,
+        };
+        assert_eq!(
+            scan_replay_policy(&initial, ReplayPolicy::Conditional),
+            ReplayPolicy::Conditional
+        );
+
+        let continuation = EntityScanRequest {
+            filter: None,
+            cursor: Some("cursor-value".to_owned()),
+            ..initial
+        };
+        assert_eq!(
+            scan_replay_policy(&continuation, ReplayPolicy::Conditional),
+            ReplayPolicy::Unsafe
+        );
+    }
+
+    #[test]
     fn plus_is_percent_encoded_by_url_query_serializer() {
         let mut url = url::Url::parse("https://example.test/").unwrap();
         url.query_pairs_mut()
@@ -1122,6 +1332,28 @@ mod tests {
                 .code,
             "crosswalk_option_conflict"
         );
+    }
+
+    #[test]
+    fn crosswalk_fallback_detection_normalizes_source_type_shorthand() {
+        let lookup = EntityByCrosswalkRequest {
+            value: "customer-123".to_owned(),
+            source_type: "CRM".to_owned(),
+            source_table: Some("contacts".to_owned()),
+            options: Vec::new(),
+        };
+        let entries = vec![json!({
+            "successful": true,
+            "object": {
+                "crosswalks": [{
+                    "value": "customer-123",
+                    "type": "configuration/sources/CRM",
+                    "sourceTable": "contacts"
+                }]
+            }
+        })];
+
+        assert!(!entity_by_crosswalk_id_fallback_detected(&entries, &lookup));
     }
 
     #[test]

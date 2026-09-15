@@ -7,6 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+
 [[bin]]
 name = "reltio"
 path = "src/main.rs"
@@ -30,6 +33,12 @@ sha2.workspace = true
 tokio.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["termios"] }
+
+[target.'cfg(windows)'.dependencies]
+reltio-windows-security = { path = "../reltio-windows-security" }
 
 [dev-dependencies]
 assert_cmd = "2"

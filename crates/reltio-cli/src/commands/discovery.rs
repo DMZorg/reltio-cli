@@ -10,7 +10,7 @@ use crate::cli::{
 };
 use crate::commands::Runtime;
 use crate::metadata;
-use crate::output::{Meta, write_raw_guarded, write_success_guarded};
+use crate::output::Meta;
 
 const SKILLS: &[(&str, &str, &str)] = &[
     (
@@ -35,8 +35,10 @@ const SKILLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-pub fn run_skills(runtime: &Runtime, command: SkillsSubcommand) -> Result<()> {
+pub async fn run_skills(runtime: &Runtime, command: SkillsSubcommand) -> Result<()> {
     let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
+    let output_guard = runtime.environment_output_guard();
     match command {
         SkillsSubcommand::List => {
             let data = Value::Array(
@@ -53,45 +55,69 @@ pub fn run_skills(runtime: &Runtime, command: SkillsSubcommand) -> Result<()> {
             );
             let mut meta = Meta::new("skills.list");
             meta.elapsed_ms = started.elapsed().as_millis();
-            write_success_guarded(&data, &meta, runtime.render, &runtime.local_output_guard())
+            runtime
+                .emit_success(&data, &meta, deadline, &output_guard)
+                .await
         }
         SkillsSubcommand::Get { name } => {
             let (_, _, contents) = skill(&name)?;
-            write_raw_guarded(contents.as_bytes(), false, &runtime.local_output_guard())
+            runtime
+                .emit_raw(contents.as_bytes(), false, deadline, &output_guard)
+                .await
         }
         SkillsSubcommand::Path { name } => {
             skill(&name)?;
-            write_raw_guarded(
-                format!("embedded://skills/{name}.md\n").as_bytes(),
-                false,
-                &runtime.local_output_guard(),
-            )
+            runtime
+                .emit_raw(
+                    format!("embedded://skills/{name}.md\n").as_bytes(),
+                    false,
+                    deadline,
+                    &output_guard,
+                )
+                .await
         }
     }
 }
 
-pub fn run_agent(runtime: &Runtime, command: AgentSubcommand) -> Result<()> {
+pub async fn run_agent(runtime: &Runtime, command: AgentSubcommand) -> Result<()> {
+    let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     match command {
         AgentSubcommand::Guide => {
             let (_, _, guide) = skill("reltio-usage")?;
-            write_raw_guarded(guide.as_bytes(), false, &runtime.local_output_guard())
+            runtime
+                .emit_raw(
+                    guide.as_bytes(),
+                    false,
+                    deadline,
+                    &runtime.environment_output_guard(),
+                )
+                .await
         }
     }
 }
 
-pub fn run_command_metadata(runtime: &Runtime, command: CommandMetadataSubcommand) -> Result<()> {
+pub async fn run_command_metadata(
+    runtime: &Runtime,
+    command: CommandMetadataSubcommand,
+) -> Result<()> {
     match command {
         CommandMetadataSubcommand::Schema { command } => {
             let started = Instant::now();
+            let deadline = runtime.deadline_from(started)?;
             let data = metadata::schema(command.as_deref())?;
             let mut meta = Meta::new("command.schema");
             meta.elapsed_ms = started.elapsed().as_millis();
-            write_success_guarded(&data, &meta, runtime.render, &runtime.local_output_guard())
+            runtime
+                .emit_success(&data, &meta, deadline, &runtime.environment_output_guard())
+                .await
         }
     }
 }
 
-pub fn run_completion(runtime: &Runtime, command: CompletionSubcommand) -> Result<()> {
+pub async fn run_completion(runtime: &Runtime, command: CompletionSubcommand) -> Result<()> {
+    let started = Instant::now();
+    let deadline = runtime.deadline_from(started)?;
     match command {
         CompletionSubcommand::Generate { shell } => {
             let mut command = Cli::command();
@@ -128,7 +154,14 @@ pub fn run_completion(runtime: &Runtime, command: CompletionSubcommand) -> Resul
                     &mut output,
                 ),
             }
-            write_raw_guarded(&output, false, &runtime.local_output_guard())
+            runtime
+                .emit_raw(
+                    &output,
+                    false,
+                    deadline,
+                    &runtime.environment_output_guard(),
+                )
+                .await
         }
     }
 }

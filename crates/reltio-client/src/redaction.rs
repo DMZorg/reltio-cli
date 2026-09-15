@@ -13,6 +13,10 @@ const REDACTED: &str = "[REDACTED]";
 const MAX_CANONICAL_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_TWO_LAYER_SOURCE_EXPANSION: usize = 36;
 const MIN_CANONICAL_WINDOW_RADIUS: usize = 512;
+// Authentication limits active credential values to 1 MiB. Retain enough
+// physical source bytes to cover that value after two canonicalization layers.
+pub const MAX_OUTPUT_GUARD_CONTEXT_BYTES: usize =
+    MAX_CANONICAL_TEXT_BYTES * MAX_TWO_LAYER_SOURCE_EXPANSION + 24;
 
 #[derive(Clone, Default)]
 pub struct OutputGuard {
@@ -68,19 +72,6 @@ impl OutputGuard {
         }
     }
 
-    #[must_use]
-    pub fn excluding_secret(&self, excluded: &str) -> Self {
-        Self {
-            secrets: self
-                .secrets
-                .iter()
-                .filter(|secret| secret.expose_secret() != excluded)
-                .cloned()
-                .collect(),
-            deny_all: self.deny_all,
-        }
-    }
-
     pub fn permits(&self, bytes: &[u8]) -> bool {
         if self.deny_all {
             return false;
@@ -111,6 +102,38 @@ impl OutputGuard {
             .chain(suffix.iter().copied());
         let (sensitive, fully_decoded) = inspect_canonical_iter(&input, &secrets);
         !sensitive && fully_decoded
+    }
+
+    pub fn permits_with_prefix(&self, prefix: &[u8], bytes: &[u8], suffix: &[u8]) -> bool {
+        if !self.permits_with_suffix(bytes, suffix) {
+            return false;
+        }
+        let known_secrets = self.known_secrets();
+        let secrets = ordered_secrets(&known_secrets);
+        if prefix.is_empty() || secrets.is_empty() {
+            return true;
+        }
+        let radius = canonical_source_radius(&secrets);
+        let prefix = &prefix[prefix.len().saturating_sub(radius)..];
+        let bytes = &bytes[..bytes.len().min(radius)];
+        let include_suffix = bytes.len() < radius;
+        let mut boundary = Vec::with_capacity(
+            prefix
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_add(if include_suffix { suffix.len() } else { 0 }),
+        );
+        boundary.extend_from_slice(prefix);
+        boundary.extend_from_slice(bytes);
+        if include_suffix {
+            boundary.extend_from_slice(suffix);
+        }
+        !contains_known_secret(&boundary, &secrets)
+    }
+
+    pub fn required_stream_context_bytes(&self) -> usize {
+        let known_secrets = self.known_secrets();
+        canonical_source_radius(&ordered_secrets(&known_secrets))
     }
 
     pub fn safe_json_fallback(&self) -> Vec<u8> {
@@ -632,11 +655,18 @@ fn inspect_canonical_windows(bytes: &[u8], secrets: &[&str]) -> (bool, bool) {
 }
 
 fn canonical_window_radius(input_len: usize, secrets: &[&str]) -> usize {
+    canonical_source_radius(secrets).min(input_len)
+}
+
+fn canonical_source_radius(secrets: &[&str]) -> usize {
     let maximum_secret = secrets
         .iter()
         .map(|secret| secret.len())
         .max()
         .unwrap_or_default();
+    if maximum_secret == 0 {
+        return 0;
+    }
     // A two-layer JSON/percent/form representation consumes at most 36 source
     // bytes per decoded byte. Any newly decoded match must overlap encoding
     // syntax, so this padding contains the complete source for that match. The
@@ -645,7 +675,6 @@ fn canonical_window_radius(input_len: usize, secrets: &[&str]) -> usize {
         .saturating_mul(MAX_TWO_LAYER_SOURCE_EXPANSION)
         .saturating_add(24)
         .max(MIN_CANONICAL_WINDOW_RADIUS)
-        .min(input_len)
 }
 
 pub(crate) fn sanitize_json_serialization(

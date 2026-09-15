@@ -1,44 +1,171 @@
 schema_version: 1
+content_fingerprint_version: 2
 corpus:
   repository: https://github.com/reltio-ai/reltio-ai-ready-docs
-  commit: 1c290ec16beb53b7754c0aa3195e9918d0d41ef6
-  generated_at: 2026-08-07T02:14:00Z
+  commit: 411a4ab96393ce450fe5d48ec0e1116b1b58660a
+  generated_at: 2026-08-21T18:31:57Z
 deprecations:
   index_url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance
+  index_content_sha256: a77e99ef5a82314dd01773c30698e78235f72027e7f3698bb2eb8d7ade59776b
+  index_link_count: 14
+  index_link_url_set_sha256: 062aaf42eff0833de1c2d8e9cacddbab7ae523a517b1c243cb88ccc782b12e54
+  index_links:
+    - https://docs.reltio.com/en
+    - https://docs.reltio.com/en/applications
+    - https://docs.reltio.com/en/developer-resources
+    - https://docs.reltio.com/en/objectives
+    - https://docs.reltio.com/en/products
+    - https://docs.reltio.com/en/reltio
+    - https://docs.reltio.com/en/reltio/about-reltio
+    - https://docs.reltio.com/en/reltio/what-does-reltio-do
+    - https://docs.reltio.com/en/reltio/whats-in-the-box
+    - https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance
+    - https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance
+    - https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/native-lca-deprecation--oct-2025-and-aug-2026
+    - https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/platform-changes-at-a-glance/enhance-your-security-with-single-sign-on-sso-and-prepare-for-multi-factor-authentication-mfa/enhance-security-with-sso-and-prepare-for-mfa---faq
+    - https://docs.reltio.com/en/roles
   sitemap_url: https://docs.reltio.com/en/reltio/sitemap.xml
   notice_count: 11
   notice_url_set_sha256: dab53d373dbddb1b49bf5990726be1fae1b101c197d4b8ecaab560c9bed18a28
   notice_state_sha256: cd1923e285eeaccf0414ec5ba780eaeb4ecc8742226f94973a53c072f2d0055e
+  notice_content_sha256: 883b9dc95fce89e3bc6dcb6205eedd7c2749105950124326a6bf153cd57f47e1
+  notice_content_sources:
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/aws-access-key-and-secret-in-favor-of-iam-roles-for-reltio-owned-resources
+      sha256: a6b2aab3565f3ba12ab7fc527f0763ad475b7bdf157e2dab4d964faabe8e4bcb
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/classic-ui---feb-2023
+      sha256: cad69908bdd45aee7e67b4820f4625d8a12aa4029f8305c9c1cc2338bb5eefe6
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/custom-workflow-manual-review-replaced-with-automated-bitbucket-process---feb-2025
+      sha256: d0f604692dca304f0be51323a5cba53f69bed95697cd963d9bd218d59d281e26
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/data-loader-feature-deprecation---apr-jun-and-oct-2024
+      sha256: 3e7755a7cfab7a5faf61ad3f57070c93ce0b77c463b4eefcf969dd0413505029
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/internal-api-sign-in-service---oct-2023
+      sha256: 3b0c3465bef3d02728874f8810b0146bb34144e1d3af37cd61ec1b61a6d6848d
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/match-iq---feb-2026
+      sha256: 91ddbd6d8be4b8f2fab2a41e0fd0520d7fdb0fbdce41ce26a421f34f1c3adf22
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/monitoring-statistics--june-2025
+      sha256: c15e7ba6c611ce31b06831b3c412cd819903b34a040e78f2d296d7ce966371f3
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/native-lca-deprecation--oct-2025-and-aug-2026
+      sha256: beacbbc1c850367b610fbc47445f0427a2e513b043301b87d599c68abb12d897
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/reltio-analytics-reporting-data-science-and-connected-data-for-snowflake-deprecation-notice---nov-2023
+      sha256: 51c2c0c4147fce287a2d4556abb1a536a1d1a6b1809006f5eb65774d5536a0d6
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/us-census-replaced-with-census-plus---sep-2024
+      sha256: f5c204847a8a5857edf688f82d38690abf4509db94addffbf8437468bafcf757
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/uuid-format-for-60-minute-authentication-tokens---apr-2024
+      sha256: 3e3d218d0a3e48e7c494f555626b8ca054dd919486403a08264864b059c93c40
 release_notes:
   sitemap_url: https://docs.reltio.com/en/reltio/sitemap.xml
   family: "2026.1"
   page_count: 2
   page_url_set_sha256: 7fd333bd5690ba60d4f67c85dc76f7de88b61618fd5efd38bb5575ce0a5f0f3f
   page_state_sha256: 5e41291996bd615708d9d38ecbb20639ad72a64cf73ad546e9c54b63f7602637
+  page_content_sha256: f0028bcd3b0dbf3ad23646c54312cbd0de10c6ce5c580b863c8bc43b623f35df
+  page_content_sources:
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/release-notes-at-a-glance/2026.1-release-notes/2026.1-bi-weekly-release-notes-rn
+      sha256: c2dc4300d28fb7ffa7989230a482fda30b47ddd25af7e1e18cb33706885e5cde
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/release-notes-at-a-glance/2026.1-release-notes/2026.1-major-release-notes
+      sha256: 7bcee297ede7c8767b0aff5a8a4c404a29842eaddd21f865d15fce3e0b0d619f
 openapi:
   - name: data-operation
     url: https://developer.reltio.com/swagger/Data%20Operation
-    retrieved_at: 2026-08-11T13:59:32Z
-    last_modified: "Fri, 07 Aug 2026 00:00:08 GMT"
-    etag: 'W/"24001f-19fd985208c"'
-    content_type: text/yaml; charset=UTF-8
-    sha256: b40a9b7d5f38de9ac116c58ea298b40d968e01745fd8f9e0f425c22ffa0252a7
+    retrieved_at: 2026-08-22T01:27:58Z
+    sha256: f4541fd303480f24d695d9a1d4bdebb9308bec33dad369817ea180e92158ee81
     info_version: "2020.2"
-    operation_ids: [getEntityByCrosswalk, getChangesByTenant, getPotentialMatchesByTenant]
+    operations:
+      - endpoint_id: entity.by-crosswalk
+        method: GET
+        path: /services/reltio/api/{tenantId}/entities/_byCrosswalk/{crosswalkValue}
+        operation_id: getEntityByCrosswalk
+      - endpoint_id: entity.history
+        method: GET
+        path: /services/reltio/api/{tenantId}/entities/{id}/_changes
+        operation_id: getChangesByTenant
+      - endpoint_id: entity.matches
+        method: GET
+        path: /services/reltio/api/{tenantId}/entities/{id}/_matches
+        operation_id: getPotentialMatchesByTenantPerEntity
+      - endpoint_id: entity.scan
+        method: POST
+        path: /services/reltio/api/{tenantId}/entities/v2/_scan
+        operation_id: getEntitiesByScanSearch
 review:
-  reviewed_at: 2026-08-11
+  reviewed_at: 2026-08-22
   language: en
-  release_notes_through: 2026.1.8.0
+  release_notes_through: 2026.1.9.0
+  practice_source_count: 19
+  practice_source_url_set_sha256: 73e65d5b8046f7beb30b9fdb8c8fb78795f632d0f5cd7b529a49a701410a8f7b
+  practice_source_content_sha256: aa2513a83397d630fad3f3b639e36bc064829ecaafbc102572e452a1d86bd65e
+  practice_content_sources:
+    - url: https://developer.reltio.com/swagger/Data%20Operation
+      sha256: e084d21575bf2b51faee031b57d41d61d12b5a926cb7e27f320e12cfeaa3246c
+    - url: https://docs.reltio.com/en/developer-resources/about-developer-resources/developer-resources-at-a-glance/reltio-rest-apis-at-a-glance/consistency-of-data-retrieval-in-reltio-apis
+      sha256: 8afb683a6a8676fe72265b8dbab15b06194c71efa02fea620818974a3f02cbfc
+    - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api
+      sha256: 2385c7bde531044551b68cf98dbdf17571a5a1d8c7339afd0ebd19eb7b5a6acb
+    - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity
+      sha256: 98220bd2691b640f7f209f8624f059e244517005bea96b824e8f2c25db83e4b9
+    - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-history
+      sha256: f2486f82cb4e3f29a5471b8322fcbea8cf6effaebaae39b4d07707b753d8231d
+    - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/entity-search
+      sha256: eb5f2274a9e316f1a73f4755bc278eb4eb16f19c26a8463b519857a207b13fa5
+    - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/filtering-entities
+      sha256: ff7ff9e00515ee4a3a58fb347b378d8c7490b9ddf5ea5c0a0d6557cf74e2ecd1
+    - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/get-entity-by-crosswalk
+      sha256: b095c47e0fc28ee484fb2ca71bca0635e5a3ef4d6e55c09736b954f0ef82f7f7
+    - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/entities-api/get-entity/search-entity-with-cursor
+      sha256: e3d6ce9b85f6d3b1ae1f52c387b0d8b451fa00c5cfc8c3cab6ac15de99b9f183
+    - url: https://docs.reltio.com/en/developer-resources/entity-management-apis/entity-management-apis-at-a-glance/potential-matches-api
+      sha256: c0d2fd884e3d3b89a6076452ee0eaba97c8d6ecf2f1d3f66b2835c2515130b3f
+    - url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/access-reltio-apis
+      sha256: ab07259623168b450631e55dfd7eb1cb4b92175d8a99510487f776566140960b
+    - url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/multi-token-support
+      sha256: 3b3d8f8d39716d365561cd60ffa85206f91ef2713468ef87d1f90fbd8f60f712
+    - url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/authentication-api/obtaining-access-tokens-with-client-credentials-grant-type
+      sha256: 294eec1dd77a1bfa48e03b398e93cad28b73e1a9c11d1c0329581cb6209284d5
+    - url: https://docs.reltio.com/en/developer-resources/system-administration-apis/system-administration-apis-at-a-glance/search-using-activity-log-api/api-error-codes
+      sha256: 68b9cc060aec67a1eca5aa9153b77794b60cb488419cb1367ff932d6c19f3e83
+    - url: https://docs.reltio.com/en/reltio/what-does-reltio-do/what-reltio-does-at-a-glance/data-unification-and-mdm-at-a-glance/data-unification-and-mdm-in-detail/reltio-match-and-merge/additional-topics-on-matching
+      sha256: 7a0a99a740c0eca818ff264a0d1ec2a0b80f5734fbf6b6916b9149f1891beb8e
+    - url: https://docs.reltio.com/en/reltio/whats-in-the-box/whats-in-the-box-at-a-glance/implementation-assistance-overview/implementation-assistance-operation/identify-performance-factors/quota-and-limits/api-request-limits
+      sha256: 98f0830f00bd34d6e8c9401bbcf5d4bfa578760b028fac22ce04b73a6a8f89c1
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/internal-api-sign-in-service---oct-2023
+      sha256: 3b0c3465bef3d02728874f8810b0146bb34144e1d3af37cd61ec1b61a6d6848d
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/deprecation-notices-at-a-glance/uuid-format-for-60-minute-authentication-tokens---apr-2024
+      sha256: 3e3d218d0a3e48e7c494f555626b8ca054dd919486403a08264864b059c93c40
+    - url: https://docs.reltio.com/en/reltio/whats-new-and-notable/whats-new-at-a-glance/release-notes-at-a-glance/2026.1-release-notes/2026.1-bi-weekly-release-notes-rn
+      sha256: c2dc4300d28fb7ffa7989230a482fda30b47ddd25af7e1e18cb33706885e5cde
   notes: >-
-    Reviewed the official AI-ready corpus, current English documentation,
-    2026.1 release notes, and current deprecation notices for the operations
-    registered in endpoints.yaml. Rechecked the complete Get Entity parameter
-    contract and the Preview introduction status of reverseTranscodeLookups.
-    Added exact narrowed reviews for GET entity by crosswalk, Entity History,
-    and stored direct potential-match retrieval, including their response shapes,
-    consistency/freshness caveats, parameter conflicts, and pagination bounds.
-    The reviewed live Data Operation OpenAPI payload is locked above with its
-    reproducible URL, response metadata, operation IDs, and content digest.
-    Rechecked current authentication token lifetime, same-token original-validity,
-    caching, request-limit, retry, response-shape, and opaque JWT guidance for
-    the auth hardening change.
+    Reviewed the official AI-ready corpus through its 2026-08-21 synchronization,
+    current English documentation, 2026.1 release notes through 2026.1.9.0,
+    current deprecation notices, and the live Data Operation OpenAPI for every
+    operation registered in endpoints.yaml. The API request limits page moved
+    from Implementation assistance at a glance to Implementation assistance
+    overview without changing its reviewed limits or semantic fingerprint.
+    Release-note pages, deprecation
+    notices, and every distinct practice source are locked by per-URL effective
+    URL, normalized visible text, and resolved HTTP(S) link targets, as well as
+    aggregate URL/index position and canonical index links. The version 2
+    migration revalidated every prior visible-text digest before adding the URL
+    and link-target inputs. The scoped corpus drift clarified
+    Entity Search sorting and does not change the implemented request contract.
+    Rechecked authentication token lifetime, same-token original-validity,
+    caching, request limits, retry guidance, response shape, and opaque-token
+    handling. The 2026.1.9.0 potential-match change truncates selected returned
+    relevance values to two decimal places instead of rounding them; the CLI
+    preserves server values, order, and matchActionLabel without local score or
+    action derivation. DEV/TEST rollout is scheduled for 2026-08-21 and PRD for
+    2026-08-28, so tenant behavior remains deployment-dependent. Exact CLI 429
+    ceilings are recorded as conservative local policy, not as upstream limits.
+    The live OpenAPI payload and corrected potential-match and cursor-scan
+    endpoint, method, path, and operation ID bindings are locked above. English documentation still
+    specifies POST /entities/_scan while the legacy 2020.2 OpenAPI exposes only
+    /entities/v2/_scan; the reviewed English route remains selected, while the
+    schema's conservative 200-entity response ceiling is applied to the selected
+    documented route. Its four-value options enum is used only as a conservative
+    allowlist; transmission requires --allow-unverified-scan-options and raw
+    option-bearing requests remain partial coverage. The English and canonical
+    AI-ready cursor topic omits options, so applicability to the unversioned route
+    is not claimed as live-tenant verified. A connector-specific corpus topic describes the options
+    with incompatible route and cursor details and is not treated as route
+    authority. The conflicting /entities/v2/_scan alias remains unregistered and
+    is refused until live-tenant pilot verification resolves the mismatch before
+    stable release.

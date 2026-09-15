@@ -18,6 +18,7 @@ const READ_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK)
     .union(OFlags::CLOEXEC);
+const COMPARISON_FLAGS: OFlags = READ_FLAGS;
 const WRITE_FLAGS: OFlags = OFlags::RDWR
     .union(OFlags::CREATE)
     .union(OFlags::EXCL)
@@ -485,6 +486,183 @@ fn resolve_trusted_path(path: &Path) -> Result<PathBuf> {
     resolve_trusted_root_alias(absolute)
 }
 
+pub(super) fn normalize_storage_path(path: &Path) -> Result<PathBuf> {
+    resolve_trusted_path(path)
+}
+
+#[derive(Debug)]
+struct StoragePathComponent {
+    name: OsString,
+    // Missing components remain lexical because there is no inode to compare.
+    identity: Option<(u128, u128)>,
+}
+
+#[derive(Debug)]
+struct StoragePathKey {
+    components: Vec<StoragePathComponent>,
+}
+
+pub(super) fn storage_path_is_same_or_descendant(path: &Path, ancestor: &Path) -> Result<bool> {
+    let path = storage_path_key(path)?;
+    let ancestor = storage_path_key(ancestor)?;
+    storage_keys_are_same_or_descendant(&path, &ancestor)
+}
+
+fn storage_path_key(path: &Path) -> Result<StoragePathKey> {
+    let resolved = resolve_trusted_path(path)?;
+    let names = resolved
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let root = File::from(
+        rfs::open("/", DIRECTORY_FLAGS, Mode::empty())
+            .map_err(|error| rustix_error("failed to open the filesystem root", error))?,
+    );
+    let root_stat = rfs::fstat(&root)
+        .map_err(|error| rustix_error("failed to inspect the filesystem root", error))?;
+    let mut components = Vec::with_capacity(names.len().saturating_add(1));
+    components.push(StoragePathComponent {
+        name: OsString::new(),
+        identity: Some(stat_identity(&root_stat)),
+    });
+
+    let mut parent = root;
+    let mut current_path = PathBuf::from("/");
+    let mut missing = false;
+    for (index, name) in names.iter().enumerate() {
+        if missing {
+            components.push(StoragePathComponent {
+                name: name.clone(),
+                identity: None,
+            });
+            continue;
+        }
+        let child = match rfs::openat(&parent, name, COMPARISON_FLAGS, Mode::empty()) {
+            Ok(child) => File::from(child),
+            Err(Errno::NOENT) => {
+                missing = true;
+                components.push(StoragePathComponent {
+                    name: name.clone(),
+                    identity: None,
+                });
+                continue;
+            }
+            Err(error) => {
+                return Err(map_storage_comparison_open_error(
+                    &parent,
+                    &current_path.join(name),
+                    name,
+                    error,
+                ));
+            }
+        };
+        let stat = rfs::fstat(&child)
+            .map_err(|error| rustix_error("failed to inspect a storage path component", error))?;
+        if index + 1 < names.len() && !FileType::from_raw_mode(stat.st_mode).is_dir() {
+            return Err(ReltioError::usage(
+                "local_file_not_regular",
+                "a storage path ancestor is not a directory",
+            ));
+        }
+        current_path.push(name);
+        components.push(StoragePathComponent {
+            name: name.clone(),
+            identity: Some(stat_identity(&stat)),
+        });
+        parent = child;
+    }
+    Ok(StoragePathKey { components })
+}
+
+fn map_storage_comparison_open_error(
+    parent: &File,
+    path: &Path,
+    name: &std::ffi::OsStr,
+    error: Errno,
+) -> ReltioError {
+    if matches!(error, Errno::LOOP | Errno::NOTDIR)
+        && rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode).is_symlink())
+    {
+        symlink_error(path)
+    } else if error == Errno::NOTDIR {
+        ReltioError::usage(
+            "local_file_not_regular",
+            "a storage path ancestor is not a directory",
+        )
+    } else {
+        rustix_error("failed to inspect a storage path component", error)
+    }
+}
+
+fn storage_keys_are_same_or_descendant(
+    path: &StoragePathKey,
+    ancestor: &StoragePathKey,
+) -> Result<bool> {
+    // Firmlinks and bind mounts can reach one inode through different-length
+    // lexical chains, so align every shared physical ancestor before matching.
+    for (ancestor_index, ancestor_component) in ancestor.components.iter().enumerate().rev() {
+        let Some(ancestor_identity) = ancestor_component.identity else {
+            continue;
+        };
+        for (path_index, path_component) in path.components.iter().enumerate().rev() {
+            if path_component.identity != Some(ancestor_identity) {
+                continue;
+            }
+            let path_tail = &path.components[path_index + 1..];
+            let ancestor_tail = &ancestor.components[ancestor_index + 1..];
+            if ancestor_tail.len() > path_tail.len() {
+                continue;
+            }
+            let mut matches = true;
+            for (path_component, ancestor_component) in path_tail.iter().zip(ancestor_tail.iter()) {
+                if !storage_components_match(path_component, ancestor_component)? {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn storage_components_match(
+    path: &StoragePathComponent,
+    ancestor: &StoragePathComponent,
+) -> Result<bool> {
+    match (path.identity, ancestor.identity) {
+        (Some(path), Some(ancestor)) => Ok(path == ancestor),
+        _ => storage_component_names_equal(&path.name, &ancestor.name),
+    }
+}
+
+fn storage_component_names_equal(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if left == right {
+        return Ok(true);
+    }
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.is_ascii() && right.is_ascii() {
+        return Ok(left.eq_ignore_ascii_case(right));
+    }
+    Err(ReltioError::new(
+        "storage_path_comparison_ambiguous",
+        ErrorCategory::Safety,
+        "Unix storage paths with distinct non-ASCII missing component spellings cannot be proven isolated",
+    )
+    .with_hint(
+        "Use identical parent spelling and distinct ASCII names for config, cache, and state storage.",
+    ))
+}
+
 fn resolve_trusted_root_alias(path: PathBuf) -> Result<PathBuf> {
     let mut names = path
         .components()
@@ -811,6 +989,20 @@ fn stat_identity(stat: &Stat) -> (u128, u128) {
 mod tests {
     use super::*;
 
+    fn existing_component(name: &str, inode: u128) -> StoragePathComponent {
+        StoragePathComponent {
+            name: OsString::from(name),
+            identity: Some((1, inode)),
+        }
+    }
+
+    fn missing_component(name: &str) -> StoragePathComponent {
+        StoragePathComponent {
+            name: OsString::from(name),
+            identity: None,
+        }
+    }
+
     #[test]
     fn bare_file_resolves_under_the_current_directory() {
         let expected = std::env::current_dir()
@@ -843,6 +1035,104 @@ mod tests {
                 .expect_err("descriptor traversal must refuse the link")
                 .code,
             "symlink_refused"
+        );
+        assert_eq!(
+            storage_path_is_same_or_descendant(&input, &target)
+                .expect_err("storage comparison must not follow the link")
+                .code,
+            "symlink_refused"
+        );
+    }
+
+    #[test]
+    fn storage_comparison_aligns_physical_alias_ancestors() {
+        let path = StoragePathKey {
+            components: vec![
+                existing_component("", 1),
+                existing_component("mount", 2),
+                existing_component("alias", 40),
+                missing_component("cache"),
+                missing_component("tokens"),
+            ],
+        };
+        let ancestor = StoragePathKey {
+            components: vec![
+                existing_component("", 1),
+                existing_component("real", 40),
+                missing_component("cache"),
+            ],
+        };
+
+        assert!(
+            storage_keys_are_same_or_descendant(&path, &ancestor)
+                .expect("synthetic mount identity comparison")
+        );
+    }
+
+    #[test]
+    fn storage_comparison_treats_missing_ascii_case_aliases_conservatively() {
+        let path = StoragePathKey {
+            components: vec![
+                existing_component("", 1),
+                existing_component("secure", 2),
+                missing_component("cache"),
+                missing_component("tokens"),
+            ],
+        };
+        let ancestor = StoragePathKey {
+            components: vec![
+                existing_component("", 1),
+                existing_component("secure", 2),
+                missing_component("Cache"),
+            ],
+        };
+
+        assert!(
+            storage_keys_are_same_or_descendant(&path, &ancestor)
+                .expect("missing case aliases compare conservatively")
+        );
+    }
+
+    #[test]
+    fn storage_comparison_recognizes_hard_linked_existing_paths() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let original = directory.path().join("original");
+        let alias = directory.path().join("alias");
+        fs::write(&original, b"storage identity").expect("write original");
+        fs::hard_link(&original, &alias).expect("create hard link");
+
+        assert!(
+            storage_path_is_same_or_descendant(&alias, &original)
+                .expect("hard-link identity comparison")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn storage_comparison_detects_users_firmlink_when_available() {
+        let users = Path::new("/Users");
+        let data_users = Path::new("/System/Volumes/Data/Users");
+        let (Ok(users_metadata), Ok(data_metadata)) =
+            (fs::metadata(users), fs::metadata(data_users))
+        else {
+            return;
+        };
+        if users_metadata.dev() != data_metadata.dev()
+            || users_metadata.ino() != data_metadata.ino()
+        {
+            return;
+        }
+        let missing = "__reltio_storage_path_identity_test_missing__";
+        if users.join(missing).exists() || data_users.join(missing).exists() {
+            return;
+        }
+
+        assert!(
+            storage_path_is_same_or_descendant(
+                &users.join(missing).join("cache/tokens"),
+                &data_users.join(missing).join("cache"),
+            )
+            .expect("APFS firmlink identity comparison")
         );
     }
 

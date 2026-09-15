@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -12,7 +12,8 @@ use url::Url;
 
 use crate::error::{ErrorCategory, ReltioError, Result};
 use crate::fs::{
-    atomic_write_private, open_private_lock, private_file_status, read_bounded_optional,
+    atomic_write_private, is_lock_contended, open_private_lock, private_file_status,
+    read_bounded_optional, storage_path_is_same_or_descendant,
 };
 use crate::service::{Service, validate_service_url};
 
@@ -115,15 +116,71 @@ impl ConfigPaths {
         let state_dir = environment
             .get("RELTIO_STATE_DIR")
             .map_or_else(|| project.data_local_dir().join("state"), PathBuf::from);
-        Ok(Self {
-            config_file,
-            cache_dir,
-            state_dir,
-        })
+        let paths = Self {
+            config_file: normalized_absolute_path(&config_file)?,
+            cache_dir: normalized_absolute_path(&cache_dir)?,
+            state_dir: normalized_absolute_path(&state_dir)?,
+        };
+        validate_distinct_storage_paths(&paths)?;
+        Ok(paths)
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
+    crate::fs::normalize_storage_path(path)
+}
+
+fn validate_distinct_storage_paths(paths: &ConfigPaths) -> Result<()> {
+    let config_lock = config_lock_path(&paths.config_file);
+    let config_in_cache = storage_path_is_same_or_descendant(&paths.config_file, &paths.cache_dir)?;
+    let cache_in_config = storage_path_is_same_or_descendant(&paths.cache_dir, &paths.config_file)?;
+    let config_in_state = storage_path_is_same_or_descendant(&paths.config_file, &paths.state_dir)?;
+    let state_in_config = storage_path_is_same_or_descendant(&paths.state_dir, &paths.config_file)?;
+    let lock_in_cache = storage_path_is_same_or_descendant(&config_lock, &paths.cache_dir)?;
+    let cache_in_lock = storage_path_is_same_or_descendant(&paths.cache_dir, &config_lock)?;
+    let lock_in_state = storage_path_is_same_or_descendant(&config_lock, &paths.state_dir)?;
+    let state_in_lock = storage_path_is_same_or_descendant(&paths.state_dir, &config_lock)?;
+    let cache_and_state_overlap =
+        storage_path_is_same_or_descendant(&paths.cache_dir, &paths.state_dir)?
+            || storage_path_is_same_or_descendant(&paths.state_dir, &paths.cache_dir)?;
+    if config_in_cache
+        || cache_in_config
+        || config_in_state
+        || state_in_config
+        || lock_in_cache
+        || cache_in_lock
+        || lock_in_state
+        || state_in_lock
+        || cache_and_state_overlap
+    {
+        return Err(ReltioError::profile(
+            "storage_path_conflict",
+            "configuration, configuration lock, cache, and state locations must not overlap",
+        )
+        .with_details(serde_json::json!({
+            "config_in_cache": config_in_cache,
+            "cache_in_config": cache_in_config,
+            "config_in_state": config_in_state,
+            "state_in_config": state_in_config,
+            "lock_in_cache": lock_in_cache,
+            "cache_in_lock": cache_in_lock,
+            "lock_in_state": lock_in_state,
+            "state_in_lock": state_in_lock,
+            "cache_and_state_overlap": cache_and_state_overlap,
+            "local_state_committed": false,
+            "safe_to_replay": true
+        })));
+    }
+    Ok(())
+}
+
+fn config_lock_path(config_file: &Path) -> PathBuf {
+    let mut lock_name = config_file.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    PathBuf::from(lock_name)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     #[serde(default = "config_version")]
@@ -132,6 +189,8 @@ pub struct ConfigFile {
     pub current_profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_imported_bearer_cleanups: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Default for ConfigFile {
@@ -140,6 +199,7 @@ impl Default for ConfigFile {
             version: CONFIG_VERSION,
             current_profile: None,
             profiles: BTreeMap::new(),
+            pending_imported_bearer_cleanups: BTreeMap::new(),
         }
     }
 }
@@ -172,6 +232,10 @@ pub struct AuthProfile {
     pub secret_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_process: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_cache_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +283,26 @@ pub struct ConfigStore {
     path: PathBuf,
 }
 
+pub struct ConfigReadLease {
+    _lock: std::fs::File,
+    config: Option<ConfigFile>,
+}
+
+impl fmt::Debug for ConfigReadLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigReadLease")
+            .field("config_available", &self.config.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConfigReadLease {
+    pub fn config(&self) -> Option<&ConfigFile> {
+        self.config.as_ref()
+    }
+}
+
 impl ConfigStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -253,21 +337,69 @@ impl ConfigStore {
         Ok(config)
     }
 
+    pub fn read_lease_until(
+        &self,
+        deadline: Instant,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<ConfigReadLease> {
+        let lock = open_private_lock(&self.lock_path())?;
+        loop {
+            ensure_config_operation_active(deadline, &is_cancelled, "config_read_lock", false)?;
+            match FileExt::try_lock_shared(&lock) {
+                Ok(()) => break,
+                Err(error) if is_lock_contended(&error) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    thread::sleep(CONFIG_LOCK_POLL_INTERVAL.min(remaining));
+                }
+                Err(error) => {
+                    return Err(ReltioError::io(
+                        "failed to lock configuration for output",
+                        &error,
+                    ));
+                }
+            }
+        }
+        ensure_config_operation_active(deadline, &is_cancelled, "config_read", false)?;
+        // Invalid configuration cannot activate a profile credential. Retain the
+        // lock so a repair cannot activate one until the guarded output finishes.
+        let config = self.load().ok();
+        ensure_config_operation_active(deadline, &is_cancelled, "config_read", false)?;
+        Ok(ConfigReadLease {
+            _lock: lock,
+            config,
+        })
+    }
+
+    pub fn try_read_lease(&self) -> Result<Option<ConfigReadLease>> {
+        let lock = open_private_lock(&self.lock_path())?;
+        match FileExt::try_lock_shared(&lock) {
+            Ok(()) => {}
+            Err(error) if is_lock_contended(&error) => return Ok(None),
+            Err(error) => {
+                return Err(ReltioError::io(
+                    "failed to lock configuration for output",
+                    &error,
+                ));
+            }
+        }
+        Ok(Some(ConfigReadLease {
+            _lock: lock,
+            config: self.load().ok(),
+        }))
+    }
+
     pub fn modify_until<T>(
         &self,
         deadline: Instant,
         is_cancelled: impl Fn() -> bool,
         update: impl FnOnce(&mut ConfigFile) -> Result<T>,
     ) -> Result<T> {
-        let mut lock_name = self.path.as_os_str().to_os_string();
-        lock_name.push(".lock");
-        let lock_path = PathBuf::from(lock_name);
-        let lock = open_private_lock(&lock_path)?;
+        let lock = open_private_lock(&self.lock_path())?;
         loop {
             ensure_config_operation_active(deadline, &is_cancelled, "config_lock", false)?;
             match FileExt::try_lock_exclusive(&lock) {
                 Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if is_lock_contended(&error) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     thread::sleep(CONFIG_LOCK_POLL_INTERVAL.min(remaining));
                 }
@@ -302,6 +434,10 @@ impl ConfigStore {
 
     pub fn permissions_are_private(&self) -> Result<Option<bool>> {
         private_file_status(&self.path)
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        config_lock_path(&self.path)
     }
 }
 
@@ -821,6 +957,33 @@ fn validate_config(config: &ConfigFile) -> Result<()> {
             ));
         }
     }
+    for (pending, cache_keys) in &config.pending_imported_bearer_cleanups {
+        validate_profile_name(pending)?;
+        if cache_keys.is_empty()
+            || cache_keys.iter().any(|cache_key| {
+                cache_key.len() != 64
+                    || !cache_key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            return Err(ReltioError::profile(
+                "pending_bearer_cleanup_invalid",
+                format!("profile {pending:?} has an invalid bearer cleanup key set"),
+            ));
+        }
+        if config
+            .profiles
+            .get(pending)
+            .and_then(|profile| profile.auth.bearer_cache_key.as_ref())
+            .is_some_and(|active| cache_keys.contains(active))
+        {
+            return Err(ReltioError::profile(
+                "pending_bearer_cleanup_conflict",
+                format!("profile {pending:?} cannot actively reference a pending cleanup key"),
+            ));
+        }
+    }
     for (name, profile) in &config.profiles {
         validate_profile_name(name)?;
         if let Some(tenant) = profile.tenant.as_deref() {
@@ -868,6 +1031,48 @@ fn validate_config(config: &ConfigFile) -> Result<()> {
                 "invalid_client_id",
                 format!("profile {name:?} client ID is empty or contains a control character"),
             ));
+        }
+        if let Some(cache_key) = profile.auth.bearer_cache_key.as_deref() {
+            if cache_key.len() != 64
+                || !cache_key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ReltioError::profile(
+                    "bearer_cache_key_invalid",
+                    format!("profile {name:?} has an invalid imported-bearer cache key"),
+                ));
+            }
+            if profile.auth.method != Some(AuthMethod::Bearer) {
+                return Err(ReltioError::profile(
+                    "bearer_cache_key_conflict",
+                    format!(
+                        "profile {name:?} retains an imported-bearer key without bearer authentication"
+                    ),
+                ));
+            }
+        }
+        if let Some(generation) = profile.auth.bearer_cache_generation.as_deref() {
+            if generation.len() != 64
+                || !generation
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ReltioError::profile(
+                    "bearer_cache_generation_invalid",
+                    format!("profile {name:?} has an invalid imported-bearer generation"),
+                ));
+            }
+            if profile.auth.method != Some(AuthMethod::Bearer)
+                || profile.auth.bearer_cache_key.is_none()
+            {
+                return Err(ReltioError::profile(
+                    "bearer_cache_generation_conflict",
+                    format!(
+                        "profile {name:?} retains an imported-bearer generation without a complete bearer cache identity"
+                    ),
+                ));
+            }
         }
         if profile
             .auth
@@ -994,11 +1199,239 @@ mod tests {
                     client_id: Some("profile-client".to_owned()),
                     secret_file: Some(PathBuf::from("/profile/secret")),
                     credential_process: None,
+                    bearer_cache_key: None,
+                    bearer_cache_generation: None,
                 },
                 ..Profile::default()
             },
         );
         config
+    }
+
+    #[test]
+    fn storage_paths_reject_config_cache_and_state_aliases() {
+        let current = std::env::current_dir().expect("current test directory");
+        let directory = tempfile::Builder::new()
+            .prefix(".reltio-config-")
+            .tempdir_in(current)
+            .expect("temporary directory without an inherited 8.3 alias");
+        let cache_dir = directory.path().join("cache");
+        let state_dir = directory.path().join("state");
+        let environment = Environment::from_pairs([
+            (
+                "RELTIO_CONFIG".to_owned(),
+                cache_dir
+                    .join("tokens/cache-maintenance")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RELTIO_CACHE_DIR".to_owned(),
+                cache_dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "RELTIO_STATE_DIR".to_owned(),
+                state_dir.to_string_lossy().into_owned(),
+            ),
+        ]);
+
+        let error = ConfigPaths::discover(&environment)
+            .expect_err("configuration inside the cache must fail before locking");
+        assert_eq!(error.code, "storage_path_conflict");
+        assert_eq!(error.details["config_in_cache"], true);
+
+        let overlapping = Environment::from_pairs([
+            (
+                "RELTIO_CONFIG".to_owned(),
+                directory
+                    .path()
+                    .join("config.toml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RELTIO_CACHE_DIR".to_owned(),
+                cache_dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "RELTIO_STATE_DIR".to_owned(),
+                cache_dir.join("state").to_string_lossy().into_owned(),
+            ),
+        ]);
+        let error = ConfigPaths::discover(&overlapping)
+            .expect_err("cache and state ancestry must be rejected");
+        assert_eq!(error.code, "storage_path_conflict");
+        assert_eq!(error.details["cache_and_state_overlap"], true);
+
+        let config_parent = directory.path().join("configuration-root");
+        let reverse = Environment::from_pairs([
+            (
+                "RELTIO_CONFIG".to_owned(),
+                config_parent.to_string_lossy().into_owned(),
+            ),
+            (
+                "RELTIO_CACHE_DIR".to_owned(),
+                config_parent.join("cache").to_string_lossy().into_owned(),
+            ),
+            (
+                "RELTIO_STATE_DIR".to_owned(),
+                state_dir.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let error = ConfigPaths::discover(&reverse)
+            .expect_err("cache ancestry beneath the config path must be rejected");
+        assert_eq!(error.code, "storage_path_conflict");
+        assert_eq!(error.details["cache_in_config"], true);
+
+        let config_file = directory.path().join("lock-collision.toml");
+        let lock_path = config_lock_path(&config_file);
+        for (variable, detail) in [
+            ("RELTIO_CACHE_DIR", "lock_in_cache"),
+            ("RELTIO_STATE_DIR", "lock_in_state"),
+        ] {
+            let mut pairs = vec![
+                (
+                    "RELTIO_CONFIG".to_owned(),
+                    config_file.to_string_lossy().into_owned(),
+                ),
+                (
+                    "RELTIO_CACHE_DIR".to_owned(),
+                    directory
+                        .path()
+                        .join("separate-cache")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                (
+                    "RELTIO_STATE_DIR".to_owned(),
+                    directory
+                        .path()
+                        .join("separate-state")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ];
+            pairs
+                .iter_mut()
+                .find(|(name, _)| name == variable)
+                .expect("storage variable")
+                .1 = lock_path.to_string_lossy().into_owned();
+            let error = ConfigPaths::discover(&Environment::from_pairs(pairs))
+                .expect_err("the configuration lock cannot be a storage root");
+            assert_eq!(error.code, "storage_path_conflict");
+            assert_eq!(error.details[detail], true);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn storage_paths_reject_case_aliased_cache_names_on_macos() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let environment = Environment::from_pairs([
+            (
+                "RELTIO_CONFIG".to_owned(),
+                directory
+                    .path()
+                    .join("Cache/tokens/cache-maintenance.lock")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RELTIO_CACHE_DIR".to_owned(),
+                directory
+                    .path()
+                    .join("cache")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RELTIO_STATE_DIR".to_owned(),
+                directory
+                    .path()
+                    .join("state")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ]);
+
+        let error = ConfigPaths::discover(&environment)
+            .expect_err("case-aliased cache ancestry must be rejected on macOS");
+        assert_eq!(error.code, "storage_path_conflict");
+        assert_eq!(error.details["config_in_cache"], true);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn storage_paths_reject_users_firmlink_alias_when_available() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let users = Path::new("/Users");
+        let data_users = Path::new("/System/Volumes/Data/Users");
+        let (Ok(users_metadata), Ok(data_metadata)) =
+            (std::fs::metadata(users), std::fs::metadata(data_users))
+        else {
+            return;
+        };
+        if users_metadata.dev() != data_metadata.dev()
+            || users_metadata.ino() != data_metadata.ino()
+        {
+            return;
+        }
+        let missing = "__reltio_config_firmlink_test_missing__";
+        if users.join(missing).exists() || data_users.join(missing).exists() {
+            return;
+        }
+        let environment = Environment::from_pairs([
+            (
+                "RELTIO_CONFIG".to_owned(),
+                users
+                    .join(missing)
+                    .join("cache/config.toml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RELTIO_CACHE_DIR".to_owned(),
+                data_users
+                    .join(missing)
+                    .join("cache")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RELTIO_STATE_DIR".to_owned(),
+                users
+                    .join(missing)
+                    .join("state")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ]);
+
+        let error = ConfigPaths::discover(&environment)
+            .expect_err("APFS firmlink aliases must not bypass storage isolation");
+        assert_eq!(error.code, "storage_path_conflict");
+        assert_eq!(error.details["config_in_cache"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_path_normalization_does_not_follow_untrusted_deep_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).expect("real directory");
+        let alias = directory.path().join("alias");
+        symlink(&real, &alias).expect("deep symlink");
+
+        let expected_alias = normalized_absolute_path(&alias).expect("normalized alias");
+        let expected_real = normalized_absolute_path(&real).expect("normalized target");
+        let normalized = normalized_absolute_path(&alias.join("config.toml"))
+            .expect("storage normalization is lexical below trusted roots");
+
+        assert!(normalized.starts_with(&expected_alias));
+        assert!(!normalized.starts_with(&expected_real));
     }
 
     #[test]

@@ -1,5 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
 use std::fs;
+#[cfg(unix)]
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
@@ -22,10 +26,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::MAX_OPERATION_TIMEOUT;
 use crate::cancellation::CancellationToken;
-use crate::config::{AuthMethod, Environment, ResolvedTarget};
+use crate::config::{AuthMethod, AuthProfile, ConfigFile, Environment, ResolvedTarget};
 use crate::error::{ErrorCategory, ReltioError, Result, json_parse_details};
 use crate::fs::{
-    atomic_write_private, open_private_lock, read_bounded_optional_with_limit,
+    atomic_write_private, is_lock_contended, open_private_lock, read_bounded_optional_with_limit,
     read_bounded_with_limit, remove_private_file, validate_private_executable,
 };
 use crate::redaction::{
@@ -49,11 +53,19 @@ const RATE_WINDOW_MILLIS: i64 = 1_000;
 const TOKEN_RATE_STATE_LIMIT: u64 = 21 + (TOKEN_REQUESTS_PER_SECOND as u64 * 20) + 9;
 const AUTH_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_LOCAL_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const CREDENTIAL_PROCESS_REMOVED_ENVIRONMENT: &[&str] =
+    &["PATH", "RELTIO_ACCESS_TOKEN", "RELTIO_CLIENT_SECRET"];
+const CREDENTIAL_PROCESS_REMOVED_ENVIRONMENT_PREFIXES: &[&str] =
+    &["CORECLR_", "COR_", "COMPLUS_", "DOTNET_", "DYLD_", "LD_"];
+#[cfg(unix)]
+const UNIX_CREDENTIAL_PROCESS_REMOVED_ENVIRONMENT: &[&str] =
+    &["BASH_ENV", "ENV", "GLIBC_TUNABLES", "LIBPATH", "SHLIB_PATH"];
 
 #[derive(Clone)]
 pub struct AccessToken {
     secret: SecretString,
     output_guard: OutputGuard,
+    disclosure_output_guard: OutputGuard,
     pub expires_at: Option<DateTime<Utc>>,
     pub provider: String,
     pub cache_hit: bool,
@@ -68,6 +80,10 @@ impl AccessToken {
     pub fn output_guard(&self) -> &OutputGuard {
         &self.output_guard
     }
+
+    pub fn disclosure_output_guard(&self) -> &OutputGuard {
+        &self.disclosure_output_guard
+    }
 }
 
 impl fmt::Debug for AccessToken {
@@ -76,6 +92,7 @@ impl fmt::Debug for AccessToken {
             .debug_struct("AccessToken")
             .field("secret", &"[REDACTED]")
             .field("output_guard", &self.output_guard)
+            .field("disclosure_output_guard", &self.disclosure_output_guard)
             .field("expires_at", &self.expires_at)
             .field("provider", &self.provider)
             .field("cache_hit", &self.cache_hit)
@@ -102,10 +119,81 @@ pub struct TokenManagerOptions {
 
 pub struct LoginCachePlan {
     _maintenance: fs::File,
+    cache_dir: PathBuf,
     changes: Vec<CacheEntryChange>,
     output_guard: OutputGuard,
     deadline: Instant,
     state: LoginCachePlanState,
+}
+
+/// An authoritative token-cache snapshot whose maintenance lock remains held.
+///
+/// Retaining the lease through output prevents a concurrent cache writer from
+/// installing credential material after the final guard check.
+pub struct CacheOutputGuardLease {
+    maintenance: fs::File,
+    output_guard: OutputGuard,
+}
+
+/// A completed token-cache clear whose exclusive maintenance lock is retained.
+pub struct CacheClearLease {
+    maintenance: fs::File,
+    removed: usize,
+    output_guard: OutputGuard,
+}
+
+impl fmt::Debug for CacheOutputGuardLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CacheOutputGuardLease")
+            .field("output_guard", &self.output_guard)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CacheOutputGuardLease {
+    pub fn output_guard(&self) -> &OutputGuard {
+        &self.output_guard
+    }
+
+    pub fn release(self) -> Result<OutputGuard> {
+        FileExt::unlock(&self.maintenance).map_err(|error| {
+            ReltioError::io("failed to unlock token cache maintenance", &error)
+                .with_output_guard(self.output_guard.clone())
+        })?;
+        Ok(self.output_guard)
+    }
+}
+
+impl fmt::Debug for CacheClearLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CacheClearLease")
+            .field("removed", &self.removed)
+            .field("output_guard", &self.output_guard)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CacheClearLease {
+    pub fn removed(&self) -> usize {
+        self.removed
+    }
+
+    pub fn output_guard(&self) -> &OutputGuard {
+        &self.output_guard
+    }
+
+    pub fn release(self) -> Result<OutputGuard> {
+        FileExt::unlock(&self.maintenance).map_err(|error| {
+            cache_cleanup_error(
+                ReltioError::io("failed to unlock token cache maintenance", &error),
+                self.removed,
+                &self.output_guard,
+            )
+        })?;
+        Ok(self.output_guard)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +222,7 @@ struct CacheEntryChange {
 impl LoginCachePlan {
     fn new(
         maintenance: fs::File,
+        cache_dir: PathBuf,
         updates: Vec<(PathBuf, Option<Zeroizing<Vec<u8>>>)>,
         mut output_guard: OutputGuard,
         deadline: Instant,
@@ -163,6 +252,7 @@ impl LoginCachePlan {
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
         Ok(Self {
             _maintenance: maintenance,
+            cache_dir,
             changes,
             output_guard,
             deadline,
@@ -172,6 +262,21 @@ impl LoginCachePlan {
 
     pub fn output_guard(&self) -> &OutputGuard {
         &self.output_guard
+    }
+
+    pub fn profile_output_guard(
+        &self,
+        target: &ResolvedTarget,
+        environment: &Environment,
+    ) -> Result<OutputGuard> {
+        TokenManager::profile_output_guard_inner(
+            target,
+            environment,
+            &self.cache_dir,
+            self.deadline,
+            None,
+            true,
+        )
     }
 
     pub fn commit(&mut self) -> Result<()> {
@@ -299,6 +404,7 @@ impl fmt::Debug for TokenManagerOptions {
 pub struct TokenManager {
     source: CredentialSource,
     environment_output_guard: OutputGuard,
+    non_disclosable_output_guard: OutputGuard,
     cache_dir: PathBuf,
     client: reqwest::Client,
     timeout: Duration,
@@ -336,6 +442,7 @@ enum CredentialSource {
     CredentialProcess {
         cache_key: String,
         command: Vec<String>,
+        environment: Vec<(OsString, OsString)>,
     },
 }
 
@@ -358,19 +465,48 @@ impl CredentialSource {
     }
 }
 
-fn environment_credential_guard(environment: &Environment) -> OutputGuard {
-    OutputGuard::from_known_secrets(
+pub fn environment_credential_output_guard(environment: &Environment) -> OutputGuard {
+    let mut guard = OutputGuard::from_known_secrets(
         &["RELTIO_ACCESS_TOKEN", "RELTIO_CLIENT_SECRET"]
             .into_iter()
             .filter_map(|name| environment.get(name))
             .collect::<Vec<_>>(),
-    )
+    );
+    merge_environment_basic_credential(&mut guard, environment);
+    guard
+}
+
+pub fn environment_non_disclosable_output_guard(environment: &Environment) -> OutputGuard {
+    let mut guard = OutputGuard::from_known_secrets(
+        &environment
+            .get("RELTIO_CLIENT_SECRET")
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+    merge_environment_basic_credential(&mut guard, environment);
+    guard
+}
+
+fn merge_environment_basic_credential(guard: &mut OutputGuard, environment: &Environment) {
+    if let (Some(client_id), Some(secret)) = (
+        environment.get("RELTIO_CLIENT_ID"),
+        environment.get("RELTIO_CLIENT_SECRET"),
+    ) {
+        let basic_credential = basic_credential(client_id, secret);
+        guard.merge(&OutputGuard::from_known_secrets(&[&basic_credential]));
+    }
+}
+
+fn basic_credential(client_id: &str, client_secret: &str) -> Zeroizing<String> {
+    let plaintext = Zeroizing::new(format!("{client_id}:{client_secret}"));
+    Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(plaintext.as_bytes()))
 }
 
 fn resolve_credential_source(
     target: &ResolvedTarget,
     environment: &Environment,
     client_secret: Option<SecretString>,
+    config_file: &Path,
 ) -> Result<CredentialSource> {
     if let Some(token) = environment.secret("RELTIO_ACCESS_TOKEN") {
         validate_token(token.expose_secret())?;
@@ -393,18 +529,21 @@ fn resolve_credential_source(
         })?;
     match method {
         AuthMethod::Bearer => {
-            let identity = target.profile.as_deref().ok_or_else(|| {
-                ReltioError::auth(
-                    "bearer_profile_required",
-                    "persisted bearer authentication requires a named profile",
+            let expected = imported_bearer_cache_key(config_file, target)?;
+            let stored = stored_imported_bearer_cache_key(&target.auth)?
+                .expect("the selected authentication method is bearer");
+            validate_cache_key(stored)?;
+            if stored != expected {
+                return Err(ReltioError::auth(
+                    "bearer_cache_identity_mismatch",
+                    "the imported-bearer cache identity does not match the selected config and route",
                 )
-            })?;
+                .with_hint(
+                    "Run `reltio auth login --method bearer --token-stdin --expires-in <duration>` for the current target.",
+                ));
+            }
             Ok(CredentialSource::ImportedBearer {
-                cache_key: cache_identity(&json!({
-                    "version": 2,
-                    "provider": "bearer",
-                    "profile": identity
-                })),
+                cache_key: stored.to_owned(),
             })
         }
         AuthMethod::ClientCredentials => {
@@ -454,25 +593,51 @@ fn resolve_credential_source(
                 )
             })?;
             validate_process_command(&command)?;
+            let config_file = crate::config::normalized_absolute_path(config_file)?;
+            let process_environment = credential_process_environment();
             Ok(CredentialSource::CredentialProcess {
                 cache_key: cache_identity(&json!({
-                    "version": 2,
+                    "version": 3,
                     "provider": "credential_process",
+                    "config_scope": config_path_scope(&config_file),
                     "profile": target.profile,
                     "environment": target.environment,
                     "tenant": target.tenant,
+                    "base_url": target.base_url.as_ref().map(url::Url::as_str),
+                    "service_urls": target.service_urls,
+                    "process_environment_scope": credential_process_environment_scope(&process_environment),
                     "command": command
                 })),
                 command,
+                environment: process_environment,
             })
         }
     }
 }
 
 impl TokenManager {
+    #[cfg(test)]
     pub fn from_target(
         target: &ResolvedTarget,
         environment: &Environment,
+        cache_dir: PathBuf,
+        options: TokenManagerOptions,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::from_target_scoped(
+            target,
+            environment,
+            Path::new("test-config.toml"),
+            cache_dir,
+            options,
+            timeout,
+        )
+    }
+
+    pub fn from_target_scoped(
+        target: &ResolvedTarget,
+        environment: &Environment,
+        config_file: &Path,
         cache_dir: PathBuf,
         options: TokenManagerOptions,
         timeout: Duration,
@@ -481,7 +646,8 @@ impl TokenManager {
             client_secret,
             no_retry,
         } = options;
-        let environment_output_guard = environment_credential_guard(environment);
+        let environment_output_guard = environment_credential_output_guard(environment);
+        let non_disclosable_output_guard = environment_non_disclosable_output_guard(environment);
         if timeout.is_zero() || timeout > MAX_OPERATION_TIMEOUT {
             return Err(ReltioError::usage(
                 "invalid_timeout",
@@ -489,7 +655,7 @@ impl TokenManager {
             )
             .with_output_guard(environment_output_guard));
         }
-        let source = resolve_credential_source(target, environment, client_secret)
+        let source = resolve_credential_source(target, environment, client_secret, config_file)
             .map_err(|error| error.with_output_guard(environment_output_guard.clone()))?;
 
         let client = reqwest::Client::builder()
@@ -503,6 +669,7 @@ impl TokenManager {
         Ok(Self {
             source,
             environment_output_guard,
+            non_disclosable_output_guard,
             cache_dir,
             client,
             timeout,
@@ -560,7 +727,7 @@ impl TokenManager {
         persist: bool,
         deadline: Instant,
     ) -> Result<AccessToken> {
-        let output_guard = self.output_guard()?;
+        let output_guard = self.credential_output_guard()?;
         let mut timeout_output_guard = output_guard.clone();
         if matches!(
             self.source,
@@ -593,6 +760,7 @@ impl TokenManager {
         if let CredentialSource::SuppliedEnvironment { token } = &self.source {
             return Ok(AccessToken {
                 output_guard: OutputGuard::from_known_secrets(&[token.expose_secret()]),
+                disclosure_output_guard: OutputGuard::default(),
                 secret: token.clone(),
                 expires_at: None,
                 provider: "bearer".to_owned(),
@@ -676,8 +844,7 @@ impl TokenManager {
                 ..
             } => {
                 let secret = resolve_client_secret(client_secret.clone(), secret_file.as_deref())?;
-                let basic_credential = base64::engine::general_purpose::STANDARD
-                    .encode(format!("{client_id}:{}", secret.expose_secret()));
+                let basic_credential = basic_credential(client_id, secret.expose_secret());
                 let mut output_guard = OutputGuard::from_known_secrets(&[
                     secret.expose_secret(),
                     basic_credential.as_str(),
@@ -690,57 +857,73 @@ impl TokenManager {
                 acquired.output_guard.merge(&output_guard);
                 acquired
             }
-            CredentialSource::CredentialProcess { command, .. } => self
-                .acquire_credential_process(command, deadline)
+            CredentialSource::CredentialProcess {
+                command,
+                environment,
+                ..
+            } => self
+                .acquire_credential_process(command, environment, deadline)
                 .await
                 .map_err(|error| error.with_output_guard(cache_guard.clone()))?,
             CredentialSource::SuppliedEnvironment { .. } => unreachable!("handled above"),
         };
-        let mut token = acquired.token;
-        let mut output_guard = acquired.output_guard;
-        output_guard.merge(&cache_guard);
-        ensure_auth_deadline(deadline, "credential_processing")
-            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        if matches!(self.source, CredentialSource::ClientCredentials { .. }) {
-            if let Some(cached) = prior_cached.as_ref() {
-                if token.access_token.expose_secret() == cached.access_token.expose_secret() {
-                    token.obtained_at = cached.obtained_at;
-                    if let (Some(acquired_expiry), Some(cached_expiry)) =
-                        (token.expires_at, cached.expires_at)
-                    {
-                        token.expires_at = Some(acquired_expiry.min(cached_expiry));
+        let credential_process_executed = self.uses_credential_process();
+        let completed = (|| {
+            let mut token = acquired.token;
+            let mut output_guard = acquired.output_guard;
+            let disclosure_output_guard = acquired.disclosure_output_guard;
+            output_guard.merge(&cache_guard);
+            ensure_auth_deadline(deadline, "credential_processing")
+                .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+            if matches!(self.source, CredentialSource::ClientCredentials { .. }) {
+                if let Some(cached) = prior_cached.as_ref() {
+                    if token.access_token.expose_secret() == cached.access_token.expose_secret() {
+                        token.obtained_at = cached.obtained_at;
+                        if let (Some(acquired_expiry), Some(cached_expiry)) =
+                            (token.expires_at, cached.expires_at)
+                        {
+                            token.expires_at = Some(acquired_expiry.min(cached_expiry));
+                        }
                     }
                 }
             }
-        }
-        validate_token_expiry(token.expires_at, Utc::now())
-            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        if let TokenAcquisition::AfterRejection(rejected) = mode {
-            if token.access_token.expose_secret() == rejected.expose_secret() {
-                token.reissued_after_rejection = true;
+            validate_token_expiry(token.expires_at, Utc::now())
+                .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+            if let TokenAcquisition::AfterRejection(rejected) = mode {
+                if token.access_token.expose_secret() == rejected.expose_secret() {
+                    token.reissued_after_rejection = true;
+                    self.write_cache_until(key, &token, deadline, "token_cache_commit")
+                        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+                    FileExt::unlock(&lock).map_err(|error| {
+                        ReltioError::io("failed to unlock token cache", &error)
+                            .with_output_guard(output_guard.clone())
+                    })?;
+                    return Err(unchanged_rejected_token_error().with_output_guard(output_guard));
+                }
+            }
+            if persist {
                 self.write_cache_until(key, &token, deadline, "token_cache_commit")
                     .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-                FileExt::unlock(&lock).map_err(|error| {
-                    ReltioError::io("failed to unlock token cache", &error)
-                        .with_output_guard(output_guard.clone())
-                })?;
-                return Err(unchanged_rejected_token_error().with_output_guard(output_guard));
+            } else {
+                ensure_auth_deadline(deadline, "credential_processing")
+                    .map_err(|error| error.with_output_guard(output_guard.clone()))?;
             }
-        }
-        if persist {
-            self.write_cache_until(key, &token, deadline, "token_cache_commit")
-                .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+            FileExt::unlock(&lock).map_err(|error| {
+                ReltioError::io("failed to unlock token cache", &error)
+                    .with_output_guard(output_guard.clone())
+            })?;
+            let mut access_token = token.into_access_token(false);
+            access_token.output_guard.merge(&output_guard);
+            access_token
+                .disclosure_output_guard
+                .merge(&disclosure_output_guard);
+            Ok(access_token)
+        })();
+        if credential_process_executed {
+            completed.map_err(credential_process_execution_error)
         } else {
-            ensure_auth_deadline(deadline, "credential_processing")
-                .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+            completed
         }
-        FileExt::unlock(&lock).map_err(|error| {
-            ReltioError::io("failed to unlock token cache", &error)
-                .with_output_guard(output_guard.clone())
-        })?;
-        let mut access_token = token.into_access_token(false);
-        access_token.output_guard.merge(&output_guard);
-        Ok(access_token)
     }
 
     pub async fn persist_access_token(&self, token: &AccessToken) -> Result<()> {
@@ -808,6 +991,7 @@ impl TokenManager {
         let managed_path = self.cache_path(key);
         LoginCachePlan::new(
             maintenance,
+            self.cache_dir.clone(),
             vec![(managed_path, Some(encoded))],
             output_guard,
             deadline,
@@ -816,17 +1000,27 @@ impl TokenManager {
 
     pub async fn prepare_bearer_login(
         cache_dir: &Path,
-        profile: &str,
+        config_file: &Path,
+        target: &ResolvedTarget,
         token: SecretString,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<LoginCachePlan> {
         let deadline = auth_deadline_after(DEFAULT_LOCAL_AUTH_TIMEOUT)?;
-        Self::prepare_bearer_login_until(cache_dir, profile, token, expires_at, deadline).await
+        Self::prepare_bearer_login_until(
+            cache_dir,
+            config_file,
+            target,
+            token,
+            expires_at,
+            deadline,
+        )
+        .await
     }
 
     pub async fn prepare_bearer_login_until(
         cache_dir: &Path,
-        profile: &str,
+        config_file: &Path,
+        target: &ResolvedTarget,
         token: SecretString,
         expires_at: Option<DateTime<Utc>>,
         deadline: Instant,
@@ -856,15 +1050,31 @@ impl TokenManager {
             reissued_after_rejection: false,
         })
         .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        LoginCachePlan::new(
+        let cache_key = imported_bearer_cache_key(config_file, target)
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        let plan = LoginCachePlan::new(
             maintenance,
-            vec![(
-                manager.cache_path(&imported_bearer_key(profile)),
-                Some(encoded),
-            )],
+            cache_dir.to_path_buf(),
+            vec![(manager.cache_path(&cache_key), Some(encoded))],
             output_guard,
             deadline,
-        )
+        )?;
+        if target.auth.bearer_cache_generation.is_some()
+            && plan.changes.iter().any(|change| change.before.is_some())
+        {
+            return Err(ReltioError::new(
+                "auth_login_cache_generation_conflict",
+                ErrorCategory::Conflict,
+                "the generated imported-bearer cache path already exists",
+            )
+            .with_details(json!({
+                "local_cache_committed": false,
+                "local_state_committed": false,
+                "safe_to_replay": true
+            }))
+            .with_output_guard(plan.output_guard.clone()));
+        }
+        Ok(plan)
     }
 
     pub fn can_reacquire(&self) -> bool {
@@ -874,12 +1084,33 @@ impl TokenManager {
         )
     }
 
+    pub fn uses_credential_process(&self) -> bool {
+        matches!(self.source, CredentialSource::CredentialProcess { .. })
+    }
+
     pub fn status(&self) -> Result<TokenStatus> {
         let deadline = auth_deadline_after(self.timeout)?;
         self.status_until(deadline)
     }
 
     pub fn status_until(&self, deadline: Instant) -> Result<TokenStatus> {
+        self.status_until_inner(deadline, None)
+    }
+
+    pub fn status_until_controlled(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<TokenStatus> {
+        self.status_until_inner(deadline, Some(cancellation))
+    }
+
+    fn status_until_inner(
+        &self,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<TokenStatus> {
+        ensure_login_plan_active(deadline, cancellation, "token_cache_status")?;
         if matches!(self.source, CredentialSource::SuppliedEnvironment { .. }) {
             return Ok(TokenStatus {
                 provider: "bearer".to_owned(),
@@ -892,9 +1123,11 @@ impl TokenManager {
         }
         let key = self.source.cache_key().expect("source has cache key");
         let maintenance_path = self.maintenance_lock_path();
-        let maintenance = acquire_shared_lock_until_sync(&maintenance_path, deadline)?;
+        let maintenance =
+            acquire_shared_lock_until_sync_controlled(&maintenance_path, deadline, cancellation)?;
         let cached = self.read_cache(key);
-        let deadline_result = ensure_auth_deadline(deadline, "token_cache");
+        let deadline_result =
+            ensure_login_plan_active(deadline, cancellation, "token_cache_status");
         let unlock = FileExt::unlock(&maintenance)
             .map_err(|error| ReltioError::io("failed to unlock token cache maintenance", &error));
         let cached = cached?;
@@ -939,6 +1172,20 @@ impl TokenManager {
     /// Credentials already available locally that must not be recreated by
     /// command metadata or other generated output.
     pub fn output_guard(&self) -> Result<OutputGuard> {
+        let deadline = auth_deadline_after(self.timeout)?;
+        self.output_guard_until(deadline, None)
+    }
+
+    pub fn output_guard_until(
+        &self,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<OutputGuard> {
+        self.output_guard_lease_until(deadline, cancellation)
+            .map(|lease| lease.output_guard.clone())
+    }
+
+    pub fn credential_output_guard(&self) -> Result<OutputGuard> {
         let mut guard = self.environment_output_guard.clone();
         match &self.source {
             CredentialSource::SuppliedEnvironment { token } => {
@@ -954,8 +1201,7 @@ impl TokenManager {
                     let secret =
                         resolve_client_secret(client_secret.clone(), secret_file.as_deref())
                             .map_err(|error| error.with_output_guard(guard.clone()))?;
-                    let basic_credential = base64::engine::general_purpose::STANDARD
-                        .encode(format!("{client_id}:{}", secret.expose_secret()));
+                    let basic_credential = basic_credential(client_id, secret.expose_secret());
                     guard.merge(&OutputGuard::from_known_secrets(&[
                         secret.expose_secret(),
                         basic_credential.as_str(),
@@ -965,26 +1211,309 @@ impl TokenManager {
             CredentialSource::ImportedBearer { .. }
             | CredentialSource::CredentialProcess { .. } => {}
         }
+        Ok(guard)
+    }
+
+    pub fn non_disclosable_credential_output_guard(&self) -> Result<OutputGuard> {
+        let mut guard = self.non_disclosable_output_guard.clone();
+        if let CredentialSource::ClientCredentials {
+            client_id,
+            client_secret,
+            secret_file,
+            ..
+        } = &self.source
+        {
+            if client_secret.is_some() || secret_file.is_some() {
+                let secret = resolve_client_secret(client_secret.clone(), secret_file.as_deref())
+                    .map_err(|error| error.with_output_guard(guard.clone()))?;
+                let basic_credential = basic_credential(client_id, secret.expose_secret());
+                guard.merge(&OutputGuard::from_known_secrets(&[
+                    secret.expose_secret(),
+                    basic_credential.as_str(),
+                ]));
+            }
+        }
+        Ok(guard)
+    }
+
+    pub fn profile_credential_output_guard(
+        target: &ResolvedTarget,
+        environment: &Environment,
+    ) -> Result<OutputGuard> {
+        let mut guard = environment_credential_output_guard(environment);
+        let inferred_client_credentials = environment.contains("RELTIO_CLIENT_ID")
+            || environment.contains("RELTIO_CLIENT_SECRET");
+        if target
+            .auth
+            .method
+            .or(inferred_client_credentials.then_some(AuthMethod::ClientCredentials))
+            != Some(AuthMethod::ClientCredentials)
+        {
+            return Ok(guard);
+        }
+        let client_id = environment
+            .get("RELTIO_CLIENT_ID")
+            .or(target.auth.client_id.as_deref());
+        let secret = environment
+            .secret("RELTIO_CLIENT_SECRET")
+            .map(Ok)
+            .or_else(|| {
+                target
+                    .auth
+                    .secret_file
+                    .as_deref()
+                    .map(|path| resolve_client_secret(None, Some(path)))
+            })
+            .transpose()
+            .map_err(|error| error.with_output_guard(guard.clone()))?;
+        if let Some(secret) = secret {
+            guard.merge(&OutputGuard::from_known_secrets(&[secret.expose_secret()]));
+            if let Some(client_id) = client_id {
+                let basic_credential = basic_credential(client_id, secret.expose_secret());
+                guard.merge(&OutputGuard::from_known_secrets(&[&basic_credential]));
+            }
+        }
+        Ok(guard)
+    }
+
+    pub fn output_guard_lease_until(
+        &self,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<CacheOutputGuardLease> {
+        let mut lease =
+            Self::cache_output_guard_lease_until(&self.cache_dir, deadline, cancellation)?;
+        let credential_guard = self
+            .credential_output_guard()
+            .map_err(|error| error.with_output_guard(lease.output_guard.clone()))?;
+        lease.output_guard.merge(&credential_guard);
         if let Some(key) = self.source.cache_key() {
             if let Some(token) = self
                 .read_cache(key)
-                .map_err(|error| error.with_output_guard(guard.clone()))?
+                .map_err(|error| error.with_output_guard(lease.output_guard.clone()))?
             {
-                guard.merge(&OutputGuard::from_known_secrets(&[token
-                    .access_token
-                    .expose_secret()]));
+                lease.output_guard.merge(&token.output_guard());
             }
         }
-        let cache_guard = Self::cache_output_guard(&self.cache_dir)
+        ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard")
+            .map_err(|error| error.with_output_guard(lease.output_guard.clone()))?;
+        Ok(lease)
+    }
+
+    pub fn access_token_disclosure_guard_lease_until(
+        &self,
+        token: &AccessToken,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<CacheOutputGuardLease> {
+        let mut guard = self.non_disclosable_credential_output_guard()?;
+        ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard")
             .map_err(|error| error.with_output_guard(guard.clone()))?;
-        guard.merge(&cache_guard);
+        let token_dir = self.cache_dir.join("tokens");
+        let maintenance = acquire_exclusive_lock_until_sync_controlled(
+            &token_dir.join("cache-maintenance.lock"),
+            deadline,
+            cancellation,
+        )
+        .map_err(|error| {
+            guard.merge(&OutputGuard::deny_all());
+            error.with_output_guard(guard.clone())
+        })?;
+        let excluded_path = self.source.cache_key().map(|key| self.cache_path(key));
+        merge_all_cached_token_guards(
+            &self.cache_dir,
+            &mut guard,
+            deadline,
+            cancellation,
+            true,
+            excluded_path
+                .as_deref()
+                .map(|path| (path, token.expose_secret(), self.source.provider())),
+        )
+        .map_err(|error| {
+            guard.merge(&OutputGuard::deny_all());
+            error.with_output_guard(guard.clone())
+        })?;
+        ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard")
+            .map_err(|error| error.with_output_guard(guard.clone()))?;
+        Ok(CacheOutputGuardLease {
+            maintenance,
+            output_guard: guard,
+        })
+    }
+
+    pub fn configured_profile_credential_output_guard(
+        auth: &AuthProfile,
+        environment: &Environment,
+        strict: bool,
+    ) -> Result<OutputGuard> {
+        let mut guard = OutputGuard::default();
+        let mut client_ids = Vec::new();
+        if let Some(client_id) = environment.get("RELTIO_CLIENT_ID") {
+            client_ids.push(client_id.to_owned());
+        }
+        if let Some(client_id) = auth.client_id.as_deref() {
+            if !client_ids.iter().any(|current| current == client_id) {
+                client_ids.push(client_id.to_owned());
+            }
+        }
+        let mut secrets = environment
+            .secret("RELTIO_CLIENT_SECRET")
+            .into_iter()
+            .collect::<Vec<_>>();
+        for secret in &secrets {
+            guard.merge(&OutputGuard::from_known_secrets(&[secret.expose_secret()]));
+            for client_id in &client_ids {
+                let basic_credential = basic_credential(client_id, secret.expose_secret());
+                guard.merge(&OutputGuard::from_known_secrets(&[&basic_credential]));
+            }
+        }
+        if let Some(secret_file) = auth.secret_file.as_deref() {
+            let bytes = read_bounded_optional_with_limit(
+                secret_file,
+                true,
+                u64::try_from(AUTH_RESPONSE_LIMIT).expect("authentication limit fits in u64"),
+            );
+            let bytes = match bytes {
+                Ok(Some(bytes)) => Some(bytes),
+                Ok(None) => None,
+                Err(_) if !strict => None,
+                Err(error) => return Err(error.with_output_guard(guard)),
+            };
+            if let Some(bytes) = bytes {
+                if !bytes.is_empty() || strict {
+                    let bytes = Zeroizing::new(bytes);
+                    let text = std::str::from_utf8(&bytes).map_err(|_| {
+                        ReltioError::auth(
+                            "client_secret_not_utf8",
+                            "client secret file is not UTF-8",
+                        )
+                    })?;
+                    let secret = text.trim_end_matches(['\r', '\n']);
+                    validate_client_secret(secret)?;
+                    if !secrets
+                        .iter()
+                        .any(|current| current.expose_secret() == secret)
+                    {
+                        secrets.push(SecretString::from(secret.to_owned()));
+                    }
+                }
+            }
+        }
+        for secret in &secrets {
+            guard.merge(&OutputGuard::from_known_secrets(&[secret.expose_secret()]));
+            for client_id in &client_ids {
+                let basic_credential = basic_credential(client_id, secret.expose_secret());
+                guard.merge(&OutputGuard::from_known_secrets(&[&basic_credential]));
+            }
+        }
+        Ok(guard)
+    }
+
+    pub fn configured_config_credential_output_guard(
+        config: &ConfigFile,
+        environment: &Environment,
+        strict: bool,
+    ) -> Result<OutputGuard> {
+        let deadline = auth_deadline_after(DEFAULT_LOCAL_AUTH_TIMEOUT)?;
+        Self::configured_config_credential_output_guard_until(
+            config,
+            environment,
+            strict,
+            deadline,
+            None,
+        )
+    }
+
+    pub fn configured_config_credential_output_guard_until(
+        config: &ConfigFile,
+        environment: &Environment,
+        strict: bool,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<OutputGuard> {
+        let mut guard = OutputGuard::default();
+        for profile in config.profiles.values() {
+            ensure_login_plan_active(deadline, cancellation, "configured_credential_guard")
+                .map_err(|error| error.with_output_guard(guard.clone()))?;
+            let profile_guard = Self::configured_profile_credential_output_guard(
+                &profile.auth,
+                environment,
+                strict,
+            )
+            .map_err(|error| error.with_output_guard(guard.clone()))?;
+            guard.merge(&profile_guard);
+        }
+        ensure_login_plan_active(deadline, cancellation, "configured_credential_guard")
+            .map_err(|error| error.with_output_guard(guard.clone()))?;
         Ok(guard)
     }
 
     pub fn cache_output_guard(cache_dir: &Path) -> Result<OutputGuard> {
+        let deadline = auth_deadline_after(DEFAULT_LOCAL_AUTH_TIMEOUT)?;
+        Self::cache_output_guard_until(cache_dir, deadline, None)
+    }
+
+    pub fn cache_output_guard_snapshot(cache_dir: &Path) -> Result<OutputGuard> {
+        let deadline = auth_deadline_after(DEFAULT_LOCAL_AUTH_TIMEOUT)?;
+        Self::cache_output_guard_snapshot_until(cache_dir, deadline, None)
+    }
+
+    pub fn cache_output_guard_snapshot_until(
+        cache_dir: &Path,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<OutputGuard> {
         let mut guard = OutputGuard::default();
-        merge_all_cached_token_guards(cache_dir, &mut guard)?;
+        // Atomic writers may still be filling temporary images. A final locked
+        // lease is required before output; this snapshot only preflights stable
+        // committed generations without serializing configuration updates.
+        merge_all_cached_token_guards(cache_dir, &mut guard, deadline, cancellation, false, None)?;
         Ok(guard)
+    }
+
+    pub fn cache_output_guard_until(
+        cache_dir: &Path,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<OutputGuard> {
+        Self::cache_output_guard_lease_until(cache_dir, deadline, cancellation)
+            .map(|lease| lease.output_guard)
+    }
+
+    pub fn cache_output_guard_lease_until(
+        cache_dir: &Path,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<CacheOutputGuardLease> {
+        let mut guard = OutputGuard::default();
+        ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard")
+            .map_err(|error| error.with_output_guard(guard.clone()))?;
+        let token_dir = cache_dir.join("tokens");
+        let maintenance = acquire_exclusive_lock_until_sync_controlled(
+            &token_dir.join("cache-maintenance.lock"),
+            deadline,
+            cancellation,
+        )
+        .map_err(|error| {
+            guard.merge(&OutputGuard::deny_all());
+            error.with_output_guard(guard.clone())
+        })?;
+        merge_all_cached_token_guards(cache_dir, &mut guard, deadline, cancellation, true, None)
+            .map_err(|error| {
+                guard.merge(&OutputGuard::deny_all());
+                error.with_output_guard(guard.clone())
+            })?;
+        ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard").map_err(
+            |error| {
+                guard.merge(&OutputGuard::deny_all());
+                error.with_output_guard(guard.clone())
+            },
+        )?;
+        Ok(CacheOutputGuardLease {
+            maintenance,
+            output_guard: guard,
+        })
     }
 
     pub fn profile_output_guard(
@@ -992,10 +1521,58 @@ impl TokenManager {
         environment: &Environment,
         cache_dir: &Path,
     ) -> Result<OutputGuard> {
-        let mut guard = environment_credential_guard(environment);
-        let manager = Self::cache_only(cache_dir.to_path_buf())
+        let deadline = auth_deadline_after(DEFAULT_LOCAL_AUTH_TIMEOUT)?;
+        Self::profile_output_guard_inner(target, environment, cache_dir, deadline, None, false)
+    }
+
+    pub fn profile_output_guard_until(
+        target: &ResolvedTarget,
+        environment: &Environment,
+        cache_dir: &Path,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OutputGuard> {
+        Self::profile_output_guard_inner(
+            target,
+            environment,
+            cache_dir,
+            deadline,
+            Some(cancellation),
+            false,
+        )
+    }
+
+    fn profile_output_guard_inner(
+        target: &ResolvedTarget,
+        environment: &Environment,
+        cache_dir: &Path,
+        deadline: Instant,
+        cancellation: Option<&CancellationToken>,
+        maintenance_lock_held: bool,
+    ) -> Result<OutputGuard> {
+        let mut guard = environment_credential_output_guard(environment);
+        ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard")
             .map_err(|error| error.with_output_guard(guard.clone()))?;
-        let mut cache_keys = Vec::new();
+        let _cache_lease = if maintenance_lock_held {
+            merge_all_cached_token_guards(
+                cache_dir,
+                &mut guard,
+                deadline,
+                cancellation,
+                true,
+                None,
+            )
+            .map_err(|error| {
+                guard.merge(&OutputGuard::deny_all());
+                error.with_output_guard(guard.clone())
+            })?;
+            None
+        } else {
+            let lease = Self::cache_output_guard_lease_until(cache_dir, deadline, cancellation)
+                .map_err(|error| error.with_output_guard(guard.clone()))?;
+            guard.merge(lease.output_guard());
+            Some(lease)
+        };
         let inferred_client_credentials = environment.contains("RELTIO_CLIENT_ID")
             || environment.contains("RELTIO_CLIENT_SECRET");
         match target
@@ -1003,11 +1580,6 @@ impl TokenManager {
             .method
             .or(inferred_client_credentials.then_some(AuthMethod::ClientCredentials))
         {
-            Some(AuthMethod::Bearer) => {
-                if let Some(profile) = target.profile.as_deref() {
-                    cache_keys.push(imported_bearer_key(profile));
-                }
-            }
             Some(AuthMethod::ClientCredentials) => {
                 let mut client_ids = Vec::new();
                 if let Some(client_id) = environment.get("RELTIO_CLIENT_ID") {
@@ -1034,56 +1606,13 @@ impl TokenManager {
                 for secret in &secrets {
                     guard.merge(&OutputGuard::from_known_secrets(&[secret.expose_secret()]));
                     for client_id in &client_ids {
-                        let basic_credential = base64::engine::general_purpose::STANDARD
-                            .encode(format!("{client_id}:{}", secret.expose_secret()));
+                        let basic_credential = basic_credential(client_id, secret.expose_secret());
                         guard.merge(&OutputGuard::from_known_secrets(&[&basic_credential]));
                     }
                 }
-                if !client_ids.is_empty() {
-                    let auth_base = ServiceResolver::new(target.clone())
-                        .base_url(Service::Auth)
-                        .map_err(|error| error.with_output_guard(guard.clone()))?;
-                    let token_url = auth_base.join("oauth/token").map_err(|error| {
-                        ReltioError::internal(format!("failed to build token URL: {error}"))
-                            .with_output_guard(guard.clone())
-                    })?;
-                    validate_auth_token_url(&token_url)
-                        .map_err(|error| error.with_output_guard(guard.clone()))?;
-                    for client_id in client_ids {
-                        cache_keys.push(cache_identity(&json!({
-                            "version": 2,
-                            "provider": "client_credentials",
-                            "token_url": token_url,
-                            "client_id": client_id
-                        })));
-                    }
-                }
             }
-            Some(AuthMethod::CredentialProcess) => {
-                if let Some(command) = target.auth.credential_process.as_ref() {
-                    cache_keys.push(cache_identity(&json!({
-                        "version": 2,
-                        "provider": "credential_process",
-                        "profile": target.profile,
-                        "environment": target.environment,
-                        "tenant": target.tenant,
-                        "command": command
-                    })));
-                }
-            }
-            None => {}
+            Some(AuthMethod::Bearer | AuthMethod::CredentialProcess) | None => {}
         }
-        cache_keys.sort_unstable();
-        cache_keys.dedup();
-        for cache_key in cache_keys {
-            if let Some(token) = manager
-                .read_cache_any(&cache_key)
-                .map_err(|error| error.with_output_guard(guard.clone()))?
-            {
-                guard.merge(&token.output_guard());
-            }
-        }
-        merge_all_cached_token_guards(cache_dir, &mut guard)?;
         Ok(guard)
     }
 
@@ -1141,13 +1670,15 @@ impl TokenManager {
 
     pub fn import_bearer(
         cache_dir: &Path,
-        profile: &str,
+        config_file: &Path,
+        target: &ResolvedTarget,
         token: SecretString,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
         Self::import_bearer_with_timeout(
             cache_dir,
-            profile,
+            config_file,
+            target,
             token,
             expires_at,
             DEFAULT_LOCAL_AUTH_TIMEOUT,
@@ -1156,7 +1687,8 @@ impl TokenManager {
 
     pub fn import_bearer_with_timeout(
         cache_dir: &Path,
-        profile: &str,
+        config_file: &Path,
+        target: &ResolvedTarget,
         token: SecretString,
         expires_at: Option<DateTime<Utc>>,
         timeout: Duration,
@@ -1173,7 +1705,8 @@ impl TokenManager {
         validate_token_expiry(Some(expires_at), Utc::now())
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
         let manager = Self::cache_only(cache_dir.to_path_buf())?;
-        let key = imported_bearer_key(profile);
+        let key = imported_bearer_cache_key(config_file, target)
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
         let maintenance_path = manager.maintenance_lock_path();
         let maintenance = acquire_shared_lock_until_sync(&maintenance_path, deadline)
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
@@ -1200,24 +1733,24 @@ impl TokenManager {
 
     pub fn prepare_imported_bearer_removal(
         cache_dir: &Path,
-        profile: &str,
+        cache_keys: &BTreeSet<String>,
     ) -> Result<LoginCachePlan> {
         Self::prepare_imported_bearer_removal_with_timeout(
             cache_dir,
-            profile,
+            cache_keys,
             DEFAULT_LOCAL_AUTH_TIMEOUT,
         )
     }
 
     pub fn prepare_imported_bearer_removal_with_timeout(
         cache_dir: &Path,
-        profile: &str,
+        cache_keys: &BTreeSet<String>,
         timeout: Duration,
     ) -> Result<LoginCachePlan> {
         let deadline = auth_deadline_after(timeout)?;
         Self::prepare_imported_bearer_removal_until(
             cache_dir,
-            profile,
+            cache_keys,
             deadline,
             &CancellationToken::new(),
         )
@@ -1225,10 +1758,13 @@ impl TokenManager {
 
     pub fn prepare_imported_bearer_removal_until(
         cache_dir: &Path,
-        profile: &str,
+        cache_keys: &BTreeSet<String>,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<LoginCachePlan> {
+        for cache_key in cache_keys {
+            validate_cache_key(cache_key)?;
+        }
         let token_dir = cache_dir.join("tokens");
         let maintenance = acquire_exclusive_lock_until_sync_cancellable(
             &token_dir.join("cache-maintenance.lock"),
@@ -1237,16 +1773,25 @@ impl TokenManager {
         )
         .map_err(|error| error.with_output_guard(OutputGuard::deny_all()))?;
         let mut output_guard = OutputGuard::default();
-        merge_all_cached_token_guards(cache_dir, &mut output_guard)
-            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        merge_all_cached_token_guards(
+            cache_dir,
+            &mut output_guard,
+            deadline,
+            Some(cancellation),
+            true,
+            None,
+        )
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
         ensure_auth_deadline(deadline, "token_cache_snapshot")
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        let updates = cache_keys
+            .iter()
+            .map(|cache_key| (token_dir.join(format!("{cache_key}.json")), None))
+            .collect();
         let plan = LoginCachePlan::new(
             maintenance,
-            vec![(
-                token_dir.join(format!("{}.json", imported_bearer_key(profile))),
-                None,
-            )],
+            cache_dir.to_path_buf(),
+            updates,
             output_guard,
             deadline,
         )?;
@@ -1262,14 +1807,17 @@ impl TokenManager {
         timeout: Duration,
     ) -> Result<(usize, OutputGuard)> {
         let deadline = auth_deadline_after(timeout)?;
-        clear_token_cache(cache_dir, deadline, None)
+        let lease = clear_token_cache(cache_dir, deadline, None)?;
+        let removed = lease.removed();
+        let output_guard = lease.release()?;
+        Ok((removed, output_guard))
     }
 
     pub fn clear_local_cache_until(
         cache_dir: &Path,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<(usize, OutputGuard)> {
+    ) -> Result<CacheClearLease> {
         clear_token_cache(cache_dir, deadline, Some(cancellation))
     }
 
@@ -1283,6 +1831,7 @@ impl TokenManager {
                 cache_key: String::new(),
             },
             environment_output_guard: OutputGuard::default(),
+            non_disclosable_output_guard: OutputGuard::default(),
             cache_dir,
             client,
             timeout: DEFAULT_LOCAL_AUTH_TIMEOUT,
@@ -1298,8 +1847,7 @@ impl TokenManager {
         deadline: Instant,
     ) -> Result<AcquiredToken> {
         ensure_auth_deadline(deadline, "token_request")?;
-        let basic_credential = base64::engine::general_purpose::STANDARD
-            .encode(format!("{client_id}:{}", client_secret.expose_secret()));
+        let basic_credential = basic_credential(client_id, client_secret.expose_secret());
         let mut attempts = 0_u32;
         let mut prior_response_guard = OutputGuard::default();
         let (bytes, attempts, prior_response_guard) = loop {
@@ -1434,6 +1982,10 @@ impl TokenManager {
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
         validate_refresh_token(parsed.refresh_token.as_ref())
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        validate_token_provenance(&parsed.access_token, parsed.refresh_token.as_ref())
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        validate_oauth_extension_provenance(&parsed)
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
         if parsed
             .token_type
             .as_deref()
@@ -1450,6 +2002,8 @@ impl TokenManager {
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
         validate_token_expiry(Some(expires_at), now)
             .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+        let mut disclosure_output_guard = prior_response_guard;
+        disclosure_output_guard.merge(&parsed.non_disclosable_output_guard());
         Ok(AcquiredToken {
             token: CachedToken {
                 version: 1,
@@ -1460,6 +2014,7 @@ impl TokenManager {
                 reissued_after_rejection: false,
             },
             output_guard,
+            disclosure_output_guard,
         })
     }
 
@@ -1555,6 +2110,7 @@ impl TokenManager {
     async fn acquire_credential_process(
         &self,
         command: &[String],
+        environment: &[(OsString, OsString)],
         deadline: Instant,
     ) -> Result<AcquiredToken> {
         validate_process_command(command)?;
@@ -1573,163 +2129,43 @@ impl TokenManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .current_dir(working_directory)
-            .env_remove("RELTIO_ACCESS_TOKEN")
-            .env_remove("RELTIO_CLIENT_SECRET")
-            .env_remove("PATH")
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .env_clear()
+            .envs(environment.iter().map(|(name, value)| (name, value)));
         #[cfg(unix)]
         process.process_group(0);
-        #[cfg(unix)]
-        for variable in [
-            "BASH_ENV",
-            "DYLD_FALLBACK_FRAMEWORK_PATH",
-            "DYLD_FALLBACK_LIBRARY_PATH",
-            "DYLD_FRAMEWORK_PATH",
-            "DYLD_IMAGE_SUFFIX",
-            "DYLD_INSERT_LIBRARIES",
-            "DYLD_LIBRARY_PATH",
-            "DYLD_PRINT_TO_FILE",
-            "DYLD_ROOT_PATH",
-            "ENV",
-            "GLIBC_TUNABLES",
-            "LD_AUDIT",
-            "LD_DEBUG",
-            "LD_DEBUG_OUTPUT",
-            "LD_LIBRARY_PATH",
-            "LD_ORIGIN_PATH",
-            "LD_PRELOAD",
-            "LD_PROFILE",
-            "LIBPATH",
-            "SHLIB_PATH",
-        ] {
-            process.env_remove(variable);
-        }
         #[cfg(windows)]
         let windows_job = reltio_windows_security::CredentialProcessJob::prepare(&mut process)
-            .map_err(|error| credential_process_containment_error(&error))?;
+            .map_err(|error| credential_process_containment_error(&error, false))?;
         let spawned = {
             let _executable_guard = validate_private_executable(executable)?;
             ensure_auth_deadline(deadline, "credential_process")?;
             process.spawn()
         };
-        let mut child = spawned
+        let child = spawned
             .map_err(|error| ReltioError::io("failed to execute credential process", &error))?;
-        let mut process_group = CredentialProcessGroup::new(&child);
+        let process_group = CredentialProcessGroup::new(&child);
         #[cfg(windows)]
-        if let Err(error) = process_group.assign_windows_job_and_resume(windows_job, &child) {
-            terminate_and_reap_credential_process(&mut child, &mut process_group).await;
-            return Err(credential_process_containment_error(&error));
-        }
-        let Some(stdout) = child.stdout.take() else {
-            terminate_and_reap_credential_process(&mut child, &mut process_group).await;
-            return Err(
-                ReltioError::internal("credential process stdout pipe was not created")
-                    .with_output_guard(OutputGuard::deny_all()),
-            );
-        };
-        let remaining = match auth_remaining(deadline, "credential_process") {
-            Ok(remaining) => remaining,
-            Err(error) => {
-                terminate_and_reap_credential_process(&mut child, &mut process_group).await;
-                return Err(error.with_output_guard(OutputGuard::deny_all()));
+        let (child, process_group) = {
+            let mut child = child;
+            let mut process_group = process_group;
+            if let Err(error) = process_group.assign_windows_job_and_resume(windows_job, &child) {
+                if let Err(cleanup_error) =
+                    terminate_and_reap_credential_process(&mut child, &mut process_group).await
+                {
+                    return Err(credential_process_cleanup_error(&cleanup_error, None));
+                }
+                return Err(credential_process_containment_error(&error, true));
             }
+            (child, process_group)
         };
-        let completed = tokio::time::timeout(remaining, async {
-            let wait = child.wait();
-            let read = async move {
-                let mut bounded =
-                    stdout.take(u64::try_from(AUTH_RESPONSE_LIMIT).unwrap_or(u64::MAX) + 1);
-                let mut bytes = Vec::new();
-                bounded.read_to_end(&mut bytes).await.map_err(|error| {
-                    ReltioError::io("failed to read credential process", &error)
-                })?;
-                Ok::<Vec<u8>, ReltioError>(bytes)
-            };
-            tokio::try_join!(
-                async {
-                    wait.await.map_err(|error| {
-                        ReltioError::io("failed to wait for credential process", &error)
-                    })
-                },
-                read
-            )
-        })
-        .await;
-        let (status, bytes) = match completed {
-            Ok(Ok(completed)) => completed,
-            Ok(Err(error)) => {
-                terminate_and_reap_credential_process(&mut child, &mut process_group).await;
-                return Err(error.with_output_guard(OutputGuard::deny_all()));
-            }
-            Err(_) => {
-                terminate_and_reap_credential_process(&mut child, &mut process_group).await;
-                return Err(auth_timeout_error("credential_process")
-                    .with_output_guard(OutputGuard::deny_all()));
-            }
-        };
-        process_group.disarm();
-        let response_guard = untrusted_json_output_guard(&bytes);
-        ensure_auth_deadline(deadline, "credential_processing")
-            .map_err(|error| error.with_output_guard(response_guard.clone()))?;
-        if bytes.len() > AUTH_RESPONSE_LIMIT {
-            return Err(ReltioError::auth(
-                "credential_process_output_too_large",
-                "credential process output exceeded 1 MB",
-            )
-            .with_output_guard(response_guard));
-        }
-        if !status.success() {
-            return Err(ReltioError::auth(
-                "credential_process_failed",
-                format!("credential process exited with {status}"),
-            )
-            .with_hint("Inspect the credential process directly; its output is withheld to protect secrets.")
-            .with_output_guard(response_guard));
-        }
-        let parsed: CredentialProcessResponse =
-            serde_json::from_slice(&bytes).map_err(|error| {
-                ReltioError::auth(
-                    "credential_process_output_invalid",
-                    "credential process did not return the required JSON contract",
-                )
-                .with_details(json_parse_details(&error))
-                .with_output_guard(response_guard.clone())
-            })?;
-        let mut output_guard = parsed.output_guard();
-        output_guard.merge(&response_guard);
-        validate_token(parsed.access_token.expose_secret())
-            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        validate_refresh_token(parsed.refresh_token.as_ref())
-            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        let now = Utc::now();
-        let expires_at = parsed
-            .expires_at
-            .map_or_else(
-                || checked_expiry(now, parsed.expires_in.unwrap_or(3_600)),
-                Ok,
-            )
-            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        validate_token_expiry(Some(expires_at), now)
-            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
-        Ok(AcquiredToken {
-            token: CachedToken {
-                version: 1,
-                provider: "credential_process".to_owned(),
-                access_token: parsed.access_token,
-                expires_at: Some(expires_at),
-                obtained_at: now,
-                reissued_after_rejection: false,
-            },
-            output_guard,
-        })
+        complete_credential_process(child, process_group, deadline)
+            .await
+            .map_err(credential_process_execution_error)
     }
 
     fn read_cache(&self, key: &str) -> Result<Option<CachedToken>> {
         self.read_cache_for_provider(key, Some(self.source.provider()))
-    }
-
-    fn read_cache_any(&self, key: &str) -> Result<Option<CachedToken>> {
-        self.read_cache_for_provider(key, None)
     }
 
     fn read_cache_for_provider(
@@ -1819,15 +2255,34 @@ impl CredentialProcessGroup {
             .assign_and_resume(child)
     }
 
-    fn terminate(&self) {
+    fn terminate(&self) -> Result<()> {
         #[cfg(unix)]
         if let Some(leader) = self.leader {
-            let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
+            match rustix::process::kill_process_group(leader, rustix::process::Signal::KILL) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(error) => {
+                    let error = io::Error::from(error);
+                    return Err(ReltioError::new(
+                        "credential_process_group_termination_failed",
+                        ErrorCategory::Safety,
+                        "failed to terminate the credential process group",
+                    )
+                    .with_details(json!({ "kind": format!("{:?}", error.kind()) })));
+                }
+            }
         }
         #[cfg(windows)]
         if let Some(job) = &self.windows_job {
-            let _ = job.terminate();
+            job.terminate().map_err(|error| {
+                ReltioError::new(
+                    "credential_process_group_termination_failed",
+                    ErrorCategory::Internal,
+                    "failed to terminate the credential process Job",
+                )
+                .with_details(json!({ "reason": format!("{:?}", error.kind()) }))
+            })?;
         }
+        Ok(())
     }
 
     fn disarm(&mut self) {
@@ -1842,39 +2297,325 @@ impl CredentialProcessGroup {
     }
 }
 
+async fn complete_credential_process(
+    mut child: tokio::process::Child,
+    mut process_group: CredentialProcessGroup,
+    deadline: Instant,
+) -> Result<AcquiredToken> {
+    let Some(stdout) = child.stdout.take() else {
+        if let Err(cleanup_error) =
+            terminate_and_reap_credential_process(&mut child, &mut process_group).await
+        {
+            return Err(credential_process_cleanup_error(&cleanup_error, None));
+        }
+        return Err(
+            ReltioError::internal("credential process stdout pipe was not created")
+                .with_output_guard(OutputGuard::deny_all()),
+        );
+    };
+    let remaining = match auth_remaining(deadline, "credential_process") {
+        Ok(remaining) => remaining,
+        Err(error) => {
+            if let Err(cleanup_error) =
+                terminate_and_reap_credential_process(&mut child, &mut process_group).await
+            {
+                return Err(credential_process_cleanup_error(&cleanup_error, None));
+            }
+            debug_assert_eq!(error.code, "auth_timeout");
+            return Err(credential_process_timeout_error("credential_process"));
+        }
+    };
+    let completed = tokio::time::timeout(remaining, async {
+        let wait = child.wait();
+        let read = async move {
+            let mut bounded =
+                stdout.take(u64::try_from(AUTH_RESPONSE_LIMIT).unwrap_or(u64::MAX) + 1);
+            let mut bytes = Vec::new();
+            bounded
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| ReltioError::io("failed to read credential process", &error))?;
+            Ok::<Vec<u8>, ReltioError>(bytes)
+        };
+        tokio::pin!(wait);
+        tokio::pin!(read);
+        let mut status = None;
+        let mut bytes = None;
+        loop {
+            tokio::select! {
+                result = &mut wait, if status.is_none() => {
+                    status = Some(result.map_err(|error| {
+                        ReltioError::io("failed to wait for credential process", &error)
+                    })?);
+                    process_group
+                        .terminate()
+                        .map_err(|error| {
+                            credential_process_post_execution_cleanup_error(&error)
+                        })?;
+                }
+                result = &mut read, if bytes.is_none() => {
+                    let output = result?;
+                    if output.len() > AUTH_RESPONSE_LIMIT {
+                        return Err(ReltioError::auth(
+                            "credential_process_output_too_large",
+                            "credential process output exceeded 1 MB",
+                        )
+                        .with_output_guard(untrusted_json_output_guard(&output)));
+                    }
+                    bytes = Some(output);
+                }
+            }
+            if status.is_some() && bytes.is_some() {
+                break Ok((
+                    status.take().expect("credential process status is present"),
+                    bytes.take().expect("credential process output is present"),
+                ));
+            }
+        }
+    })
+    .await;
+    let (status, bytes) = match completed {
+        Ok(Ok(completed)) => completed,
+        Ok(Err(error)) => {
+            if let Err(cleanup_error) =
+                terminate_and_reap_credential_process(&mut child, &mut process_group).await
+            {
+                return Err(credential_process_cleanup_error(&cleanup_error, None));
+            }
+            return Err(error.with_output_guard(OutputGuard::deny_all()));
+        }
+        Err(_) => {
+            if let Err(cleanup_error) =
+                terminate_and_reap_credential_process(&mut child, &mut process_group).await
+            {
+                return Err(credential_process_cleanup_error(&cleanup_error, None));
+            }
+            return Err(credential_process_timeout_error("credential_process"));
+        }
+    };
+    process_group.disarm();
+    let response_guard = untrusted_json_output_guard(&bytes);
+    ensure_auth_deadline(deadline, "credential_processing").map_err(|error| {
+        debug_assert_eq!(error.code, "auth_timeout");
+        credential_process_timeout_error("credential_processing")
+            .with_output_guard(response_guard.clone())
+    })?;
+    if !status.success() {
+        return Err(ReltioError::auth(
+            "credential_process_failed",
+            format!("credential process exited with {status}"),
+        )
+        .with_hint(
+            "Inspect the credential process directly; its output is withheld to protect secrets.",
+        )
+        .with_output_guard(response_guard));
+    }
+    let parsed: CredentialProcessResponse = serde_json::from_slice(&bytes).map_err(|error| {
+        ReltioError::auth(
+            "credential_process_output_invalid",
+            "credential process did not return the required JSON contract",
+        )
+        .with_details(json_parse_details(&error))
+        .with_output_guard(response_guard.clone())
+    })?;
+    let mut output_guard = parsed.output_guard();
+    output_guard.merge(&response_guard);
+    validate_token(parsed.access_token.expose_secret())
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    validate_refresh_token(parsed.refresh_token.as_ref())
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    validate_token_provenance(&parsed.access_token, parsed.refresh_token.as_ref())
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    validate_credential_process_metadata_provenance(&parsed.access_token, parsed.metadata.as_ref())
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    let now = Utc::now();
+    let expires_at = parsed
+        .expires_at
+        .map_or_else(
+            || checked_expiry(now, parsed.expires_in.unwrap_or(3_600)),
+            Ok,
+        )
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    validate_token_expiry(Some(expires_at), now)
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
+    let disclosure_output_guard = parsed.non_disclosable_output_guard();
+    Ok(AcquiredToken {
+        token: CachedToken {
+            version: 1,
+            provider: "credential_process".to_owned(),
+            access_token: parsed.access_token,
+            expires_at: Some(expires_at),
+            obtained_at: now,
+            reissued_after_rejection: false,
+        },
+        output_guard,
+        disclosure_output_guard,
+    })
+}
+
 #[cfg(windows)]
-fn credential_process_containment_error(error: &reltio_windows_security::Error) -> ReltioError {
+fn credential_process_containment_error(
+    error: &reltio_windows_security::Error,
+    process_started: bool,
+) -> ReltioError {
     ReltioError::new(
         "credential_process_containment_failed",
         ErrorCategory::Safety,
-        "the credential process could not be contained before execution",
+        "the credential process could not be contained safely",
     )
-    .with_details(json!({
-        "platform": "windows",
-        "reason": format!("{:?}", error.kind()),
-        "network_request_sent": false,
-        "local_state_committed": false,
-        "safe_to_replay": true
-    }))
+    .with_details(credential_process_containment_details(
+        &format!("{:?}", error.kind()),
+        process_started,
+    ))
     .with_hint(
         "An enclosing Windows Job may prohibit nested containment. Update the host policy; the CLI will not run the broker uncontained.",
     )
 }
 
+#[cfg(any(windows, test))]
+fn credential_process_containment_details(reason: &str, process_started: bool) -> Value {
+    json!({
+        "platform": "windows",
+        "reason": reason,
+        "credential_process_started": process_started,
+        "credential_process_side_effects": if process_started { Value::String("unknown".to_owned()) } else { Value::Null },
+        "network_request_sent": if process_started { Value::Null } else { Value::Bool(false) },
+        "local_state_committed": false,
+        "safe_to_replay": !process_started
+    })
+}
+
+fn credential_process_cleanup_error(error: &ReltioError, root_exited: Option<bool>) -> ReltioError {
+    ReltioError::new(
+        "credential_process_cleanup_failed",
+        ErrorCategory::Safety,
+        "credential process-tree cleanup could not be confirmed",
+    )
+    .with_details(json!({
+        "cause": error.code,
+        "cause_details": error.details,
+        "phase": "credential_process_post_execution_cleanup",
+        "credential_process_started": true,
+        "credential_process_root_exited": root_exited,
+        "credential_process_side_effects": "unknown",
+        "network_request_sent": Value::Null,
+        "local_state_committed": false,
+        "safe_to_replay": false
+    }))
+    .with_hint(
+        "Terminate any remaining broker processes and inspect host policy before a deliberate retry.",
+    )
+    .with_output_guard(OutputGuard::deny_all())
+}
+
+fn credential_process_post_execution_cleanup_error(error: &ReltioError) -> ReltioError {
+    credential_process_cleanup_error(error, Some(true))
+}
+
+fn credential_process_timeout_error(stage: &'static str) -> ReltioError {
+    let mut error = auth_timeout_error(stage);
+    error.details["credential_process_started"] = Value::Bool(true);
+    error.details["credential_process_side_effects"] = Value::String("unknown".to_owned());
+    error.details["network_request_sent"] = Value::Null;
+    error.details["local_state_committed"] = Value::Bool(false);
+    error.details["safe_to_replay"] = Value::Bool(false);
+    error.with_output_guard(OutputGuard::deny_all())
+}
+
+fn credential_process_execution_error(mut error: ReltioError) -> ReltioError {
+    error.retryable = false;
+    let mut details = match std::mem::take(&mut error.details) {
+        Value::Object(details) => details,
+        cause => serde_json::Map::from_iter([("cause_details".to_owned(), cause)]),
+    };
+    details
+        .entry("credential_process_started".to_owned())
+        .or_insert(Value::Bool(true));
+    details
+        .entry("credential_process_side_effects".to_owned())
+        .or_insert_with(|| Value::String("unknown".to_owned()));
+    details
+        .entry("network_request_sent".to_owned())
+        .or_insert(Value::Null);
+    details
+        .entry("local_state_committed".to_owned())
+        .or_insert(Value::Null);
+    details.insert("safe_to_replay".to_owned(), Value::Bool(false));
+    error.details = Value::Object(details);
+    error
+}
+
 impl Drop for CredentialProcessGroup {
     fn drop(&mut self) {
-        self.terminate();
+        let _ = self.terminate();
     }
 }
 
 async fn terminate_and_reap_credential_process(
     child: &mut tokio::process::Child,
     process_group: &mut CredentialProcessGroup,
-) {
-    process_group.terminate();
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-    process_group.disarm();
+) -> Result<()> {
+    let mut cleanup_error = process_group.terminate().err();
+    let mut inspection_error = None;
+    let already_reaped = match child.try_wait() {
+        Ok(status) => status.is_some(),
+        Err(error) => {
+            inspection_error = Some(
+                ReltioError::new(
+                    "credential_process_cleanup_inspection_failed",
+                    ErrorCategory::Safety,
+                    "failed to inspect the credential process during cleanup",
+                )
+                .with_details(json!({ "kind": format!("{:?}", error.kind()) })),
+            );
+            false
+        }
+    };
+    let mut reaped = already_reaped;
+    if !already_reaped {
+        let kill_error = child.start_kill().err().map(|error| {
+            ReltioError::new(
+                "credential_process_root_termination_failed",
+                ErrorCategory::Safety,
+                "failed to terminate the credential process",
+            )
+            .with_details(json!({ "kind": format!("{:?}", error.kind()) }))
+        });
+        match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+            Ok(Ok(_)) => reaped = true,
+            Ok(Err(error)) => {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(inspection_error.or(kill_error).unwrap_or_else(|| {
+                        ReltioError::new(
+                            "credential_process_reap_failed",
+                            ErrorCategory::Safety,
+                            "failed to reap the credential process",
+                        )
+                        .with_details(json!({ "kind": format!("{:?}", error.kind()) }))
+                    }));
+                }
+            }
+            Err(_) => {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(inspection_error.or(kill_error).unwrap_or_else(|| {
+                        ReltioError::new(
+                            "credential_process_reap_timeout",
+                            ErrorCategory::Safety,
+                            "the credential process did not exit during bounded cleanup",
+                        )
+                    }));
+                }
+            }
+        }
+    }
+    if cleanup_error.is_none() && reaped {
+        process_group.disarm();
+        Ok(())
+    } else {
+        Err(cleanup_error.unwrap_or_else(|| {
+            ReltioError::internal("credential process cleanup ended without reaping the process")
+        }))
+    }
 }
 
 async fn read_auth_response(response: reqwest::Response) -> Result<Vec<u8>> {
@@ -1916,12 +2657,30 @@ struct TokenResponse {
     )]
     refresh_token: Option<SecretString>,
     #[serde(default)]
-    _scope: Option<String>,
+    scope: Option<String>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, Value>,
 }
 
 impl TokenResponse {
     fn output_guard(&self) -> OutputGuard {
         response_output_guard(&self.access_token, self.refresh_token.as_ref())
+    }
+
+    fn non_disclosable_output_guard(&self) -> OutputGuard {
+        let mut values = Vec::new();
+        if let Some(refresh_token) = &self.refresh_token {
+            values.push(refresh_token.expose_secret());
+        }
+        if let Some(token_type) = self.token_type.as_deref() {
+            values.push(token_type);
+        }
+        if let Some(scope) = self.scope.as_deref() {
+            values.push(scope);
+        }
+        let mut guard = OutputGuard::from_known_secrets(&values);
+        guard.merge(&json_map_output_guard(&self.extensions));
+        guard
     }
 }
 
@@ -1939,12 +2698,25 @@ struct CredentialProcessResponse {
     refresh_token: Option<SecretString>,
     #[serde(default)]
     #[serde(rename = "metadata")]
-    _metadata: Option<Value>,
+    metadata: Option<Value>,
 }
 
 impl CredentialProcessResponse {
     fn output_guard(&self) -> OutputGuard {
         response_output_guard(&self.access_token, self.refresh_token.as_ref())
+    }
+
+    fn non_disclosable_output_guard(&self) -> OutputGuard {
+        let mut guard = self
+            .refresh_token
+            .as_ref()
+            .map_or_else(OutputGuard::default, |token| {
+                OutputGuard::from_known_secrets(&[token.expose_secret()])
+            });
+        if let Some(metadata) = &self.metadata {
+            guard.merge(&json_value_output_guard(metadata));
+        }
+        guard
     }
 }
 
@@ -1962,6 +2734,7 @@ fn response_output_guard(
 struct AcquiredToken {
     token: CachedToken,
     output_guard: OutputGuard,
+    disclosure_output_guard: OutputGuard,
 }
 
 #[derive(Deserialize)]
@@ -1993,6 +2766,7 @@ impl CachedToken {
         AccessToken {
             secret: self.access_token,
             output_guard,
+            disclosure_output_guard: OutputGuard::default(),
             expires_at: self.expires_at,
             provider: self.provider,
             cache_hit,
@@ -2088,13 +2862,46 @@ fn acquire_exclusive_lock_until_sync_cancellable(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<std::fs::File> {
-    ensure_login_plan_active(deadline, Some(cancellation), "token_cache_maintenance_lock")?;
+    acquire_exclusive_lock_until_sync_controlled(path, deadline, Some(cancellation))
+}
+
+fn acquire_shared_lock_until_sync_controlled(
+    path: &Path,
+    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+) -> Result<std::fs::File> {
+    ensure_login_plan_active(deadline, cancellation, "token_cache_maintenance_lock")?;
     let lock = open_private_lock(path)?;
     loop {
-        ensure_login_plan_active(deadline, Some(cancellation), "token_cache_maintenance_lock")?;
+        ensure_login_plan_active(deadline, cancellation, "token_cache_maintenance_lock")?;
+        match FileExt::try_lock_shared(&lock) {
+            Ok(()) => return Ok(lock),
+            Err(error) if is_lock_contended(&error) => {
+                let remaining = auth_remaining(deadline, "token_cache_maintenance_lock")?;
+                thread::sleep(AUTH_LOCK_POLL_INTERVAL.min(remaining));
+            }
+            Err(error) => {
+                return Err(ReltioError::io(
+                    "failed to lock token cache maintenance",
+                    &error,
+                ));
+            }
+        }
+    }
+}
+
+fn acquire_exclusive_lock_until_sync_controlled(
+    path: &Path,
+    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+) -> Result<std::fs::File> {
+    ensure_login_plan_active(deadline, cancellation, "token_cache_maintenance_lock")?;
+    let lock = open_private_lock(path)?;
+    loop {
+        ensure_login_plan_active(deadline, cancellation, "token_cache_maintenance_lock")?;
         match FileExt::try_lock_exclusive(&lock) {
             Ok(()) => return Ok(lock),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contended(&error) => {
                 let remaining = auth_remaining(deadline, "token_cache_maintenance_lock")?;
                 thread::sleep(AUTH_LOCK_POLL_INTERVAL.min(remaining));
             }
@@ -2136,7 +2943,7 @@ async fn acquire_file_lock_until(
         };
         match result {
             Ok(()) => return Ok(lock),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contended(&error) => {
                 sleep_with_auth_deadline(AUTH_LOCK_POLL_INTERVAL, deadline, timeout_stage).await?;
             }
             Err(error) => return Err(ReltioError::io(io_context, &error)),
@@ -2161,7 +2968,7 @@ fn acquire_file_lock_until_sync(
         };
         match result {
             Ok(()) => return Ok(lock),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contended(&error) => {
                 sleep_with_auth_deadline_sync(AUTH_LOCK_POLL_INTERVAL, deadline, timeout_stage)?;
             }
             Err(error) => return Err(ReltioError::io(io_context, &error)),
@@ -2624,6 +3431,102 @@ fn validate_refresh_token(token: Option<&SecretString>) -> Result<()> {
     }
 }
 
+fn validate_token_provenance(
+    access_token: &SecretString,
+    refresh_token: Option<&SecretString>,
+) -> Result<()> {
+    if refresh_token
+        .is_some_and(|refresh_token| refresh_token.expose_secret() == access_token.expose_secret())
+    {
+        Err(ReltioError::auth(
+            "auth_token_provenance_conflict",
+            "credential provider returned identical access and refresh token material",
+        )
+        .with_hint(
+            "Refuse this provider response because access-token disclosure cannot preserve refresh-token confidentiality.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_oauth_extension_provenance(response: &TokenResponse) -> Result<()> {
+    let access_token = response.access_token.expose_secret();
+    let collision = response.token_type.as_deref() == Some(access_token)
+        || response.scope.as_deref() == Some(access_token)
+        || response.extensions.iter().any(|(key, value)| {
+            key == access_token || json_contains_exact_string(value, access_token)
+        });
+    if collision {
+        Err(token_provenance_conflict(
+            "token endpoint repeated access-token material in a non-disclosable response field",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_credential_process_metadata_provenance(
+    access_token: &SecretString,
+    metadata: Option<&Value>,
+) -> Result<()> {
+    fn contains(value: &Value, secret: &str) -> bool {
+        match value {
+            Value::String(value) => value == secret,
+            Value::Array(values) => values.iter().any(|value| contains(value, secret)),
+            Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| key == secret || contains(value, secret)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    if metadata.is_some_and(|metadata| contains(metadata, access_token.expose_secret())) {
+        Err(ReltioError::auth(
+            "auth_token_provenance_conflict",
+            "credential process repeated access-token material in non-disclosable metadata",
+        )
+        .with_hint(
+            "Refuse this provider response because access-token disclosure cannot preserve metadata confidentiality.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn token_provenance_conflict(message: &'static str) -> ReltioError {
+    ReltioError::auth("auth_token_provenance_conflict", message).with_hint(
+        "Refuse this provider response because access-token disclosure cannot preserve the confidentiality of other provider fields.",
+    )
+}
+
+fn json_contains_exact_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_exact_string(value, expected)),
+        Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key == expected || json_contains_exact_string(value, expected)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn json_map_output_guard(values: &BTreeMap<String, Value>) -> OutputGuard {
+    serde_json::to_vec(values).map_or_else(
+        |_| OutputGuard::deny_all(),
+        |bytes| untrusted_json_output_guard(&bytes),
+    )
+}
+
+fn json_value_output_guard(value: &Value) -> OutputGuard {
+    serde_json::to_vec(value).map_or_else(
+        |_| OutputGuard::deny_all(),
+        |bytes| untrusted_json_output_guard(&bytes),
+    )
+}
+
 fn checked_expiry(now: DateTime<Utc>, seconds: i64) -> Result<DateTime<Utc>> {
     let duration = TimeDelta::try_seconds(seconds).ok_or_else(|| {
         ReltioError::auth(
@@ -2686,7 +3589,22 @@ fn validate_process_command(command: &[String]) -> Result<()> {
 }
 
 fn cache_key(identity: &str) -> String {
-    let digest = Sha256::digest(identity.as_bytes());
+    cache_key_bytes(identity.as_bytes())
+}
+
+fn validate_cache_key(cache_key: &str) -> Result<()> {
+    if cache_key.len() == 64 && cache_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ReltioError::auth(
+            "token_cache_key_invalid",
+            "the requested token cache identity is invalid",
+        ))
+    }
+}
+
+fn cache_key_bytes(identity: &[u8]) -> String {
+    let digest = Sha256::digest(identity);
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
@@ -2698,15 +3616,283 @@ fn cache_identity(identity: &Value) -> String {
     cache_key(&serde_json::to_string(identity).expect("JSON value serialization cannot fail"))
 }
 
-fn imported_bearer_key(profile: &str) -> String {
+fn credential_process_environment() -> Vec<(OsString, OsString)> {
+    credential_process_environment_from(std::env::vars_os())
+}
+
+fn credential_process_environment_from(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut effective = Vec::<(OsString, OsString)>::new();
+    for (name, value) in variables {
+        if credential_process_environment_variable_removed(&name) {
+            continue;
+        }
+        if let Some(existing) = effective
+            .iter_mut()
+            .find(|(existing, _)| environment_variable_names_equal(existing, &name))
+        {
+            *existing = (name, value);
+        } else {
+            effective.push((name, value));
+        }
+    }
+    effective.sort_unstable();
+    effective
+}
+
+#[cfg(test)]
+fn credential_process_environment_scope_from(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> String {
+    let variables = credential_process_environment_from(variables);
+    credential_process_environment_scope(&variables)
+}
+
+fn credential_process_environment_scope(variables: &[(OsString, OsString)]) -> String {
+    let mut encoded = Zeroizing::new(Vec::new());
+    encoded.extend_from_slice(b"reltio-credential-process-environment-v1\0");
+    for (name, value) in variables {
+        append_os_string_identity(&mut encoded, name);
+        append_os_string_identity(&mut encoded, value);
+    }
+    cache_key_bytes(&encoded)
+}
+
+fn environment_variable_names_equal(left: &OsStr, right: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        left.encode_wide()
+            .map(|unit| char::from_u32(u32::from(unit)).map(|value| value.to_ascii_uppercase()))
+            .eq(right.encode_wide().map(|unit| {
+                char::from_u32(u32::from(unit)).map(|value| value.to_ascii_uppercase())
+            }))
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn credential_process_environment_variable_removed(name: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        if name.encode_wide().any(|unit| unit > u16::from(u8::MAX)) {
+            // Windows environment keys are case-insensitive. Refuse unusual
+            // names that cannot be normalized with the ASCII policy below.
+            return true;
+        }
+    }
+    if CREDENTIAL_PROCESS_REMOVED_ENVIRONMENT
+        .iter()
+        .any(|expected| environment_variable_name_eq(name, expected))
+    {
+        return true;
+    }
+    if CREDENTIAL_PROCESS_REMOVED_ENVIRONMENT_PREFIXES
+        .iter()
+        .any(|prefix| environment_variable_name_starts_with(name, prefix))
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        UNIX_CREDENTIAL_PROCESS_REMOVED_ENVIRONMENT
+            .iter()
+            .any(|expected| environment_variable_name_eq(name, expected))
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+#[cfg(windows)]
+fn environment_variable_name_eq(actual: &OsStr, expected: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    actual
+        .encode_wide()
+        .map(|unit| {
+            u8::try_from(unit)
+                .ok()
+                .map(|byte| byte.to_ascii_uppercase())
+        })
+        .eq(expected.bytes().map(|byte| Some(byte.to_ascii_uppercase())))
+}
+
+#[cfg(windows)]
+fn environment_variable_name_starts_with(actual: &OsStr, expected: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut actual = actual.encode_wide();
+    expected.bytes().all(|expected| {
+        actual
+            .next()
+            .and_then(|unit| u8::try_from(unit).ok())
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected))
+    })
+}
+
+#[cfg(not(windows))]
+fn environment_variable_name_eq(actual: &OsStr, expected: &str) -> bool {
+    actual == OsStr::new(expected)
+}
+
+#[cfg(unix)]
+fn environment_variable_name_starts_with(actual: &OsStr, expected: &str) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    actual
+        .as_bytes()
+        .get(..expected.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected.as_bytes()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn environment_variable_name_starts_with(actual: &OsStr, expected: &str) -> bool {
+    actual
+        .to_string_lossy()
+        .to_ascii_uppercase()
+        .starts_with(expected)
+}
+
+fn append_os_string_identity(encoded: &mut Vec<u8>, value: &OsStr) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        append_identity_bytes(encoded, value.as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let mut bytes = Zeroizing::new(Vec::new());
+        for unit in value.encode_wide() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        append_identity_bytes(encoded, &bytes);
+    }
+    #[cfg(not(any(unix, windows)))]
+    append_identity_bytes(encoded, value.to_string_lossy().as_bytes());
+}
+
+fn append_identity_bytes(encoded: &mut Vec<u8>, value: &[u8]) {
+    encoded.extend_from_slice(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    encoded.extend_from_slice(value);
+}
+
+pub fn imported_bearer_cache_key(config_file: &Path, target: &ResolvedTarget) -> Result<String> {
+    let profile = target.profile.as_deref().ok_or_else(|| {
+        ReltioError::auth(
+            "bearer_profile_required",
+            "persisted bearer authentication requires a named profile",
+        )
+    })?;
+    let config_file = crate::config::normalized_absolute_path(config_file)?;
+    match target.auth.bearer_cache_generation.as_deref() {
+        Some(generation) => {
+            validate_cache_key(generation)?;
+            Ok(imported_bearer_key_v4(
+                &config_file,
+                target,
+                profile,
+                generation,
+            ))
+        }
+        None => Ok(imported_bearer_key_v3(&config_file, target, profile)),
+    }
+}
+
+pub fn new_imported_bearer_cache_generation() -> String {
+    cache_key_bytes(&rand::random::<[u8; 32]>())
+}
+
+pub fn stored_imported_bearer_cache_key(auth: &AuthProfile) -> Result<Option<&str>> {
+    let Some(cache_key) = auth.bearer_cache_key.as_deref() else {
+        if auth.method == Some(AuthMethod::Bearer) {
+            return Err(ReltioError::auth(
+                "bearer_cache_migration_required",
+                "the imported-bearer profile predates target-scoped cache ownership",
+            )
+            .with_hint(
+                "Run `reltio auth logout` to clear the ambiguous legacy cache, then authenticate again or remove the profile.",
+            ));
+        }
+        return Ok(None);
+    };
+    validate_cache_key(cache_key)?;
+    Ok(Some(cache_key))
+}
+
+fn imported_bearer_key_v3(config_file: &Path, target: &ResolvedTarget, profile: &str) -> String {
     cache_identity(&json!({
-        "version": 2,
+        "version": 3,
         "provider": "bearer",
-        "profile": profile
+        "config_scope": config_path_scope(config_file),
+        "profile": profile,
+        "environment": target.environment,
+        "tenant": target.tenant,
+        "base_url": target.base_url.as_ref().map(url::Url::as_str),
+        "service_urls": target.service_urls
     }))
 }
 
-fn merge_all_cached_token_guards(cache_dir: &Path, output_guard: &mut OutputGuard) -> Result<()> {
+fn imported_bearer_key_v4(
+    config_file: &Path,
+    target: &ResolvedTarget,
+    profile: &str,
+    generation: &str,
+) -> String {
+    cache_identity(&json!({
+        "version": 4,
+        "provider": "bearer",
+        "config_scope": config_path_scope(config_file),
+        "profile": profile,
+        "environment": target.environment,
+        "tenant": target.tenant,
+        "base_url": target.base_url.as_ref().map(url::Url::as_str),
+        "service_urls": target.service_urls,
+        "generation": generation
+    }))
+}
+
+#[cfg(unix)]
+fn config_path_scope(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    cache_key_bytes(path.as_os_str().as_bytes())
+}
+
+#[cfg(windows)]
+fn config_path_scope(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut bytes = Zeroizing::new(Vec::new());
+    for unit in path.as_os_str().encode_wide() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    cache_key_bytes(&bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn config_path_scope(path: &Path) -> String {
+    cache_key(&path.to_string_lossy())
+}
+
+fn merge_all_cached_token_guards(
+    cache_dir: &Path,
+    output_guard: &mut OutputGuard,
+    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+    include_temporary_files: bool,
+    excluded: Option<(&Path, &str, &str)>,
+) -> Result<()> {
+    ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard")
+        .map_err(|error| error.with_output_guard(output_guard.clone()))?;
     let token_dir = cache_dir.join("tokens");
     let entries = match fs::read_dir(&token_dir) {
         Ok(entries) => entries,
@@ -2718,6 +3904,8 @@ fn merge_all_cached_token_guards(cache_dir: &Path, output_guard: &mut OutputGuar
         }
     };
     for entry in entries {
+        ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard")
+            .map_err(|error| error.with_output_guard(output_guard.clone()))?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -2731,7 +3919,9 @@ fn merge_all_cached_token_guards(cache_dir: &Path, output_guard: &mut OutputGuar
             continue;
         };
         if is_private_temporary_name(name) {
-            collect_cached_token_guard(&entry.path(), output_guard)?;
+            if include_temporary_files {
+                collect_cached_token_guard_except(&entry.path(), output_guard, excluded)?;
+            }
             continue;
         }
         let Some(stem) = name.strip_suffix(".json") else {
@@ -2740,9 +3930,10 @@ fn merge_all_cached_token_guards(cache_dir: &Path, output_guard: &mut OutputGuar
         if stem.len() != 64 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             continue;
         }
-        collect_cached_token_guard(&entry.path(), output_guard)?;
+        collect_cached_token_guard_except(&entry.path(), output_guard, excluded)?;
     }
-    Ok(())
+    ensure_login_plan_active(deadline, cancellation, "token_cache_output_guard")
+        .map_err(|error| error.with_output_guard(output_guard.clone()))
 }
 
 fn is_private_temporary_name(name: &str) -> bool {
@@ -2755,7 +3946,7 @@ fn clear_token_cache(
     cache_dir: &Path,
     deadline: Instant,
     cancellation: Option<&CancellationToken>,
-) -> Result<(usize, OutputGuard)> {
+) -> Result<CacheClearLease> {
     let token_dir = cache_dir.join("tokens");
     let maintenance_path = token_dir.join("cache-maintenance.lock");
     let mut output_guard = OutputGuard::default();
@@ -2846,14 +4037,11 @@ fn clear_token_cache(
             return Err(cache_cleanup_error(error, removed, &output_guard));
         }
     }
-    if let Err(error) = FileExt::unlock(&maintenance) {
-        return Err(cache_cleanup_error(
-            ReltioError::io("failed to unlock token cache maintenance", &error),
-            removed,
-            &output_guard,
-        ));
-    }
-    Ok((removed, output_guard))
+    Ok(CacheClearLease {
+        maintenance,
+        removed,
+        output_guard,
+    })
 }
 
 fn cache_cleanup_error(
@@ -2880,6 +4068,14 @@ fn cache_cleanup_error(
 }
 
 fn collect_cached_token_guard(path: &Path, output_guard: &mut OutputGuard) -> Result<()> {
+    collect_cached_token_guard_except(path, output_guard, None)
+}
+
+fn collect_cached_token_guard_except(
+    path: &Path,
+    output_guard: &mut OutputGuard,
+    excluded: Option<(&Path, &str, &str)>,
+) -> Result<()> {
     let bytes = match read_bounded_optional_with_limit(path, true, TOKEN_CACHE_LIMIT) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Ok(()),
@@ -2890,6 +4086,12 @@ fn collect_cached_token_guard(path: &Path, output_guard: &mut OutputGuard) -> Re
     };
     let bytes = Zeroizing::new(bytes);
     match decode_cached_token(&bytes) {
+        Ok(cached)
+            if excluded.is_some_and(|(excluded_path, disclosed, provider)| {
+                path == excluded_path
+                    && cached.provider == provider
+                    && cached.access_token.expose_secret() == disclosed
+            }) => {}
         Ok(cached) => output_guard.merge(&cached.output_guard()),
         Err(error) => {
             if let Some(guard) = error.output_guard() {
@@ -3055,6 +4257,51 @@ mod tests {
             .expect("secure native executable");
     }
 
+    #[cfg(unix)]
+    async fn read_test_process_pid(path: &Path) -> rustix::process::Pid {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(value) = fs::read_to_string(path) {
+                    if let Ok(raw) = value.parse::<i32>() {
+                        if let Some(pid) = rustix::process::Pid::from_raw(raw) {
+                            return pid;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("credential-process PID barrier timed out")
+    }
+
+    #[cfg(unix)]
+    async fn assert_test_process_cannot_execute(pid: rustix::process::Pid) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                #[cfg(target_os = "linux")]
+                if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_pid())) {
+                    if stat
+                        .rsplit_once(") ")
+                        .and_then(|(_, fields)| fields.chars().next())
+                        .is_some_and(|state| matches!(state, 'Z' | 'X'))
+                    {
+                        return;
+                    }
+                }
+                match rustix::process::test_kill_process(pid) {
+                    Err(rustix::io::Errno::SRCH) => return,
+                    Ok(()) | Err(rustix::io::Errno::PERM) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("failed to inspect credential descendant: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("credential-process descendant remained executable after cleanup");
+    }
+
     #[test]
     fn local_credential_redactor_covers_provider_and_additional_secrets() {
         let directory = tempdir().expect("temporary directory");
@@ -3180,6 +4427,212 @@ mod tests {
     }
 
     #[test]
+    fn cache_output_guard_waits_for_active_atomic_token_images() {
+        let directory = tempdir().expect("temporary directory");
+        let token_dir = directory.path().join("tokens");
+        let maintenance =
+            open_private_lock(&token_dir.join("cache-maintenance.lock")).expect("maintenance lock");
+        FileExt::try_lock_shared(&maintenance).expect("hold maintenance lock as cache writer");
+        let temporary = token_dir.join(".reltio-0123456789abcdef0123456789abcdef.tmp");
+        atomic_write_private(&temporary, br#"{"version":1,"access_token":"partial"#)
+            .expect("partial active cache image");
+        let cache_dir = directory.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let scanner = thread::spawn(move || {
+            started_tx.send(()).expect("signal guard scan start");
+            TokenManager::cache_output_guard(&cache_dir)
+        });
+        started_rx.recv().expect("guard scan starts");
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !scanner.is_finished(),
+            "guard scan must wait for the writer"
+        );
+
+        fs::write(
+            &temporary,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "provider": "client_credentials",
+                "access_token": "completed-active-token",
+                "expires_at": Utc::now() + TimeDelta::hours(1),
+                "obtained_at": Utc::now(),
+                "reissued_after_rejection": false
+            }))
+            .expect("encode completed cache image"),
+        )
+        .expect("complete active cache image");
+        fs::rename(
+            &temporary,
+            token_dir.join(format!("{}.json", "0".repeat(64))),
+        )
+        .expect("install completed cache image");
+        FileExt::unlock(&maintenance).expect("release maintenance lock");
+
+        let guard = scanner
+            .join()
+            .expect("guard scanner completes")
+            .expect("active cache image is guarded after commit");
+        assert!(!guard.permits(b"completed-active-token"));
+        assert!(guard.permits(b"ordinary-output"));
+    }
+
+    #[test]
+    fn cache_output_guard_lease_blocks_writers_until_emission_finishes() {
+        let directory = tempdir().expect("temporary directory");
+        let cache_dir = directory.path().to_path_buf();
+        let lease = TokenManager::cache_output_guard_lease_until(
+            &cache_dir,
+            Instant::now() + Duration::from_secs(2),
+            None,
+        )
+        .expect("cache guard lease");
+        let maintenance_path = cache_dir.join("tokens/cache-maintenance.lock");
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(0);
+        let writer = thread::spawn(move || {
+            let maintenance =
+                open_private_lock(&maintenance_path).expect("writer maintenance lock");
+            attempted_tx.send(()).expect("signal writer attempt");
+            FileExt::lock_shared(&maintenance).expect("writer acquires shared lock");
+            FileExt::unlock(&maintenance).expect("writer releases shared lock");
+        });
+        attempted_rx.recv().expect("writer attempts its lock");
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !writer.is_finished(),
+            "the output lease must exclude writers"
+        );
+
+        drop(lease);
+        writer
+            .join()
+            .expect("writer completes after emission lease");
+    }
+
+    #[test]
+    fn cache_clear_lease_blocks_writers_until_its_owner_releases_it() {
+        let directory = tempdir().expect("temporary directory");
+        let manager = TokenManager::cache_only(directory.path().to_path_buf()).expect("manager");
+        let key = "a".repeat(64);
+        let cache_path = manager.cache_path(&key);
+        manager
+            .write_cache_until(
+                &key,
+                &CachedToken {
+                    version: 1,
+                    provider: "bearer".to_owned(),
+                    access_token: "cleared-token-material".to_owned().into(),
+                    expires_at: Some(Utc::now() + TimeDelta::hours(1)),
+                    obtained_at: Utc::now(),
+                    reissued_after_rejection: false,
+                },
+                Instant::now() + Duration::from_secs(2),
+                "test_cache_seed",
+            )
+            .expect("seed token cache");
+        let lease = TokenManager::clear_local_cache_until(
+            directory.path(),
+            Instant::now() + Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .expect("clear cache while retaining the maintenance lease");
+        assert_eq!(lease.removed(), 1);
+        assert!(!cache_path.exists());
+        assert!(!lease.output_guard().permits(b"cleared-token-material"));
+
+        let maintenance_path = manager.maintenance_lock_path();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(0);
+        let writer = thread::spawn(move || {
+            let maintenance =
+                open_private_lock(&maintenance_path).expect("writer maintenance lock");
+            attempted_tx.send(()).expect("signal writer attempt");
+            FileExt::lock_shared(&maintenance).expect("writer acquires shared lock");
+            FileExt::unlock(&maintenance).expect("writer releases shared lock");
+        });
+        attempted_rx.recv().expect("writer attempts its lock");
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !writer.is_finished(),
+            "the clear lease must exclude a new cache writer"
+        );
+
+        lease.release().expect("release cache-clear lease");
+        writer
+            .join()
+            .expect("writer completes after cache-clear lease");
+    }
+
+    #[test]
+    fn cache_output_guard_wait_observes_deadline_and_cancellation() {
+        let directory = tempdir().expect("temporary directory");
+        let maintenance =
+            open_private_lock(&directory.path().join("tokens/cache-maintenance.lock"))
+                .expect("maintenance lock");
+        FileExt::try_lock_shared(&maintenance).expect("hold writer lock");
+
+        let timeout = TokenManager::cache_output_guard_lease_until(
+            directory.path(),
+            Instant::now() + Duration::from_millis(40),
+            None,
+        )
+        .expect_err("guard wait reaches its deadline");
+        assert_eq!(timeout.code, "auth_timeout");
+        assert!(
+            timeout
+                .output_guard()
+                .is_some_and(|guard| !guard.permits(b"anything"))
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let canceled = TokenManager::cache_output_guard_lease_until(
+            directory.path(),
+            Instant::now() + Duration::from_secs(1),
+            Some(&cancellation),
+        )
+        .expect_err("guard wait observes cancellation");
+        assert_eq!(canceled.code, "request_canceled");
+    }
+
+    #[test]
+    fn held_login_cache_plan_can_rescan_atomic_token_images() {
+        let directory = tempdir().expect("temporary directory");
+        let token_dir = directory.path().join("tokens");
+        let maintenance =
+            open_private_lock(&token_dir.join("cache-maintenance.lock")).expect("maintenance lock");
+        FileExt::try_lock_exclusive(&maintenance).expect("hold login maintenance lock");
+        let plan = LoginCachePlan::new(
+            maintenance,
+            directory.path().to_path_buf(),
+            Vec::new(),
+            OutputGuard::default(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("login cache plan");
+        let temporary = token_dir.join(".reltio-0123456789abcdef0123456789abcdef.tmp");
+        atomic_write_private(
+            &temporary,
+            serde_json::to_string(&json!({
+                "version": 1,
+                "provider": "client_credentials",
+                "access_token": "transaction-token",
+                "expires_at": Utc::now() + TimeDelta::hours(1),
+                "obtained_at": Utc::now(),
+                "reissued_after_rejection": false
+            }))
+            .expect("encode transaction cache image")
+            .as_bytes(),
+        )
+        .expect("transaction cache image");
+
+        let guard = plan
+            .profile_output_guard(&target("https://auth.reltio.com"), &Environment::default())
+            .expect("held plan rescans without reacquiring its lock");
+
+        assert!(!guard.permits(b"transaction-token"));
+    }
+
+    #[test]
     fn cache_output_guard_continues_past_malformed_generations() {
         let directory = tempdir().expect("temporary directory");
         let token_dir = directory.path().join("tokens");
@@ -3243,6 +4696,20 @@ mod tests {
             br#"{"version":1,"provider":"client_credentials","access_token":"auth.login","expires_at":null,"obtained_at":"2026-08-10T00:00:00Z","future_secret":"credential_output_refused"}"#,
         )
         .expect("malformed future cache image");
+        atomic_write_private(
+            &manager.cache_path(&"f".repeat(64)),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "provider": "bearer",
+                "access_token": "later-generation-secret",
+                "expires_at": Utc::now() + TimeDelta::hours(1),
+                "obtained_at": Utc::now(),
+                "reissued_after_rejection": false
+            }))
+            .expect("encode later cache generation")
+            .as_bytes(),
+        )
+        .expect("later cache generation");
 
         let error = manager
             .output_guard()
@@ -3253,6 +4720,7 @@ mod tests {
         assert!(!guard.permits(b"token_cache_invalid"));
         assert!(!guard.permits(b"auth.login"));
         assert!(!guard.permits(b"credential_output_refused"));
+        assert!(!guard.permits(b"later-generation-secret"));
     }
 
     #[test]
@@ -3292,11 +4760,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn access_token_provenance_rejects_oauth_extensions_and_metadata_keys() {
+        let response: TokenResponse = serde_json::from_value(json!({
+            "access_token": "shared-provider-token",
+            "token_type": "bearer",
+            "expires_in": 3600,
+            "id_token": "shared-provider-token"
+        }))
+        .expect("OAuth response parses");
+        assert_eq!(
+            validate_oauth_extension_provenance(&response)
+                .expect_err("an OAuth extension cannot repeat the access token")
+                .code,
+            "auth_token_provenance_conflict"
+        );
+
+        let metadata = json!({"shared-provider-token": "ordinary-value"});
+        assert_eq!(
+            validate_credential_process_metadata_provenance(
+                &SecretString::from("shared-provider-token".to_owned()),
+                Some(&metadata),
+            )
+            .expect_err("metadata keys cannot repeat the access token")
+            .code,
+            "auth_token_provenance_conflict"
+        );
+    }
+
+    #[test]
+    fn imported_bearer_identity_is_scoped_to_config_and_route() {
+        let first_target = target("https://auth.reltio.com");
+        let mut second_target = first_target.clone();
+        second_target.tenant = "OtherTenant".to_owned();
+
+        let first = imported_bearer_cache_key(Path::new("config/one.toml"), &first_target)
+            .expect("first cache key");
+        let other_config = imported_bearer_cache_key(Path::new("config/two.toml"), &first_target)
+            .expect("second cache key");
+        let other_route = imported_bearer_cache_key(Path::new("config/one.toml"), &second_target)
+            .expect("routed cache key");
+
+        assert_ne!(first, other_config);
+        assert_ne!(first, other_route);
+
+        let mut first_generation = first_target.clone();
+        first_generation.auth.bearer_cache_generation = Some("a".repeat(64));
+        let mut second_generation = first_generation.clone();
+        second_generation.auth.bearer_cache_generation = Some("b".repeat(64));
+        let generated = imported_bearer_cache_key(Path::new("config/one.toml"), &first_generation)
+            .expect("generated cache key");
+        let other_generation =
+            imported_bearer_cache_key(Path::new("config/one.toml"), &second_generation)
+                .expect("other generated cache key");
+        assert_ne!(first, generated);
+        assert_ne!(generated, other_generation);
+    }
+
+    #[tokio::test]
+    async fn generated_bearer_candidate_refuses_an_existing_cache_path() {
+        let directory = tempdir().expect("temporary directory");
+        let config_file = directory.path().join("config.toml");
+        let mut bearer_target = target("https://auth.reltio.com");
+        bearer_target.auth.method = Some(AuthMethod::Bearer);
+        bearer_target.auth.bearer_cache_generation = Some("a".repeat(64));
+        TokenManager::import_bearer(
+            directory.path(),
+            &config_file,
+            &bearer_target,
+            SecretString::from("existing-generation-token".to_owned()),
+            Some(Utc::now() + TimeDelta::hours(1)),
+        )
+        .expect("seed generated cache path");
+        let cache_key =
+            imported_bearer_cache_key(&config_file, &bearer_target).expect("generated cache key");
+        let cache_path = directory
+            .path()
+            .join("tokens")
+            .join(format!("{cache_key}.json"));
+        let before = fs::read(&cache_path).expect("generated cache preimage");
+
+        let error = TokenManager::prepare_bearer_login_until(
+            directory.path(),
+            &config_file,
+            &bearer_target,
+            SecretString::from("colliding-candidate-token".to_owned()),
+            Some(Utc::now() + TimeDelta::hours(1)),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a generated candidate path must be immutable");
+
+        assert_eq!(error.code, "auth_login_cache_generation_conflict");
+        assert_eq!(error.details["local_cache_committed"], false);
+        assert_eq!(fs::read(cache_path).expect("unchanged cache"), before);
+    }
+
     #[tokio::test]
     async fn managed_login_retains_displaced_bearer_and_restores_exact_preimage() {
         let directory = tempdir().expect("temporary directory");
+        let config_file = directory.path().join("config.toml");
+        let bearer_target = target("https://auth.reltio.com");
         let manager = TokenManager::from_target(
-            &target("https://auth.reltio.com"),
+            &bearer_target,
             &Environment::default(),
             directory.path().to_path_buf(),
             TokenManagerOptions {
@@ -3308,7 +4874,8 @@ mod tests {
         .expect("token manager");
         TokenManager::import_bearer(
             directory.path(),
-            "test",
+            &config_file,
+            &bearer_target,
             "previous-bearer-token".to_owned().into(),
             Some(Utc::now() + TimeDelta::hours(1)),
         )
@@ -3334,6 +4901,7 @@ mod tests {
         let candidate = AccessToken {
             secret: "candidate-managed-token".to_owned().into(),
             output_guard: OutputGuard::from_known_secrets(&["candidate-managed-token"]),
+            disclosure_output_guard: OutputGuard::default(),
             expires_at: Some(Utc::now() + TimeDelta::hours(1)),
             provider: "client_credentials".to_owned(),
             cache_hit: false,
@@ -3343,7 +4911,9 @@ mod tests {
             .prepare_managed_login(&candidate)
             .await
             .expect("prepare cache transaction");
-        let bearer_path = manager.cache_path(&imported_bearer_key("test"));
+        let bearer_path = manager.cache_path(
+            &imported_bearer_cache_key(&config_file, &bearer_target).expect("bearer cache key"),
+        );
 
         plan.commit().expect("commit candidate cache");
 
@@ -3410,6 +4980,7 @@ mod tests {
         let candidate = AccessToken {
             secret: "candidate-managed-token".to_owned().into(),
             output_guard: OutputGuard::from_known_secrets(&["candidate-managed-token"]),
+            disclosure_output_guard: OutputGuard::default(),
             expires_at: Some(Utc::now() + TimeDelta::hours(1)),
             provider: "client_credentials".to_owned(),
             cache_hit: false,
@@ -3738,16 +5309,21 @@ mod tests {
     #[test]
     fn imported_bearer_lock_timeout_has_no_late_cache_mutation() {
         let directory = tempdir().expect("temp dir");
+        let config_file = directory.path().join("config.toml");
+        let bearer_target = target("https://auth.reltio.com");
         let token_dir = directory.path().join("tokens");
         let maintenance =
             open_private_lock(&token_dir.join("cache-maintenance.lock")).expect("maintenance lock");
         FileExt::try_lock_exclusive(&maintenance).expect("hold maintenance lock");
-        let cache_path = token_dir.join(format!("{}.json", imported_bearer_key("test")));
+        let cache_key =
+            imported_bearer_cache_key(&config_file, &bearer_target).expect("bearer cache key");
+        let cache_path = token_dir.join(format!("{cache_key}.json"));
         let started = Instant::now();
 
         let error = TokenManager::import_bearer_with_timeout(
             directory.path(),
-            "test",
+            &config_file,
+            &bearer_target,
             "candidate-bearer-token".to_owned().into(),
             Some(Utc::now() + TimeDelta::hours(1)),
             Duration::from_millis(50),
@@ -3816,7 +5392,11 @@ mod tests {
     fn profile_removal_lock_timeout_preserves_exact_cache_preimage() {
         let directory = tempdir().expect("temp dir");
         let manager = TokenManager::cache_only(directory.path().to_path_buf()).expect("manager");
-        let key = imported_bearer_key("test");
+        let key = imported_bearer_cache_key(
+            &directory.path().join("config.toml"),
+            &target("https://auth.reltio.com"),
+        )
+        .expect("bearer cache key");
         manager
             .write_cache_until(
                 &key,
@@ -3840,7 +5420,7 @@ mod tests {
 
         let error = TokenManager::prepare_imported_bearer_removal_with_timeout(
             directory.path(),
-            "test",
+            &BTreeSet::from([key.clone()]),
             Duration::from_millis(50),
         )
         .expect_err("profile-removal contention must honor the supplied timeout");
@@ -3858,7 +5438,11 @@ mod tests {
     fn profile_removal_plan_refuses_deletion_after_its_deadline() {
         let directory = tempdir().expect("temp dir");
         let manager = TokenManager::cache_only(directory.path().to_path_buf()).expect("manager");
-        let key = imported_bearer_key("test");
+        let key = imported_bearer_cache_key(
+            &directory.path().join("config.toml"),
+            &target("https://auth.reltio.com"),
+        )
+        .expect("bearer cache key");
         manager
             .write_cache_until(
                 &key,
@@ -3878,7 +5462,7 @@ mod tests {
         let before = fs::read(&cache_path).expect("cache preimage");
         let mut plan = TokenManager::prepare_imported_bearer_removal_with_timeout(
             directory.path(),
-            "test",
+            &BTreeSet::from([key.clone()]),
             Duration::from_secs(2),
         )
         .expect("prepare profile-removal cache plan");
@@ -4545,7 +6129,11 @@ mod tests {
         let directory = tempdir().expect("temp dir");
         let broker = directory
             .path()
-            .join("broker")
+            .join(if cfg!(windows) {
+                "broker.exe"
+            } else {
+                "broker"
+            })
             .to_string_lossy()
             .into_owned();
         let mut first_target = target("https://auth.reltio.com");
@@ -4574,6 +6162,7 @@ mod tests {
         .expect("second manager");
         assert_ne!(first.source.cache_key(), second.source.cache_key());
 
+        let same_target = second_target.clone();
         second_target.tenant = "OtherTenant".to_owned();
         let other_target = TokenManager::from_target(
             &second_target,
@@ -4584,6 +6173,164 @@ mod tests {
         )
         .expect("other-target manager");
         assert_ne!(second.source.cache_key(), other_target.source.cache_key());
+
+        let other_config = TokenManager::from_target_scoped(
+            &same_target,
+            &Environment::default(),
+            &directory.path().join("other-config.toml"),
+            directory.path().to_path_buf(),
+            TokenManagerOptions::default(),
+            Duration::from_secs(5),
+        )
+        .expect("other-config manager");
+        assert_ne!(second.source.cache_key(), other_config.source.cache_key());
+    }
+
+    #[test]
+    fn credential_process_environment_scope_tracks_inherited_identity_inputs() {
+        let base_variables = vec![
+            (OsString::from("AWS_PROFILE"), OsString::from("development")),
+            (OsString::from("PATH"), OsString::from("ignored-one")),
+            (
+                OsString::from("RELTIO_ACCESS_TOKEN"),
+                OsString::from("ignored-token-one"),
+            ),
+            (
+                OsString::from("RELTIO_CLIENT_SECRET"),
+                OsString::from("ignored-secret-one"),
+            ),
+            (
+                OsString::from("DYLD_FUTURE_INJECTION"),
+                OsString::from("ignored-dyld-one"),
+            ),
+            (
+                OsString::from("LD_FUTURE_INJECTION"),
+                OsString::from("ignored-ld-one"),
+            ),
+            (
+                OsString::from("CORECLR_PROFILER"),
+                OsString::from("ignored-coreclr-one"),
+            ),
+            (
+                OsString::from("COR_ENABLE_PROFILING"),
+                OsString::from("ignored-cor-one"),
+            ),
+            (
+                OsString::from("COMPlus_ReadyToRun"),
+                OsString::from("ignored-complus-one"),
+            ),
+            (
+                OsString::from("DOTNET_STARTUP_HOOKS"),
+                OsString::from("ignored-dotnet-one"),
+            ),
+        ];
+        let mut changed_identity_variables = base_variables.clone();
+        changed_identity_variables[0].1 = OsString::from("production");
+        let mut changed_removed_variables = base_variables.clone();
+        for (_, value) in &mut changed_removed_variables[1..] {
+            value.push("-changed");
+        }
+
+        let base = credential_process_environment_scope_from(base_variables.clone());
+        let changed_identity =
+            credential_process_environment_scope_from(changed_identity_variables);
+        let changed_removed_values =
+            credential_process_environment_scope_from(changed_removed_variables);
+        let filtered = credential_process_environment_from(base_variables);
+
+        assert_ne!(base, changed_identity);
+        assert_eq!(base, changed_removed_values);
+        assert_eq!(
+            filtered,
+            vec![(OsString::from("AWS_PROFILE"), OsString::from("development"))]
+        );
+
+        let first = credential_process_environment_from([
+            (OsString::from("AWS_PROFILE"), OsString::from("development")),
+            (OsString::from("AWS_PROFILE"), OsString::from("production")),
+        ]);
+        let second = credential_process_environment_from([
+            (OsString::from("AWS_PROFILE"), OsString::from("production")),
+            (OsString::from("AWS_PROFILE"), OsString::from("development")),
+        ]);
+        assert_eq!(
+            first,
+            vec![(OsString::from("AWS_PROFILE"), OsString::from("production"))]
+        );
+        assert_eq!(
+            second,
+            vec![(OsString::from("AWS_PROFILE"), OsString::from("development"))]
+        );
+        assert_ne!(
+            credential_process_environment_scope(&first),
+            credential_process_environment_scope(&second)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn credential_process_executes_with_the_cache_identity_environment_filter() {
+        let directory = tempdir().expect("temporary directory");
+        let native_shell = directory.path().join("private-sh");
+        copy_private_native_executable(Path::new("/bin/sh"), &native_shell);
+        let environment = credential_process_environment_from([
+            (OsString::from("AWS_PROFILE"), OsString::from("development")),
+            (OsString::from("PATH"), OsString::from("injected-path")),
+            (
+                OsString::from("RELTIO_ACCESS_TOKEN"),
+                OsString::from("injected-token"),
+            ),
+            (
+                OsString::from("RELTIO_CLIENT_SECRET"),
+                OsString::from("injected-secret"),
+            ),
+            (
+                OsString::from("DYLD_FUTURE_INJECTION"),
+                OsString::from("injected-dyld"),
+            ),
+            (
+                OsString::from("LD_FUTURE_INJECTION"),
+                OsString::from("injected-ld"),
+            ),
+            (
+                OsString::from("CORECLR_PROFILER"),
+                OsString::from("injected-coreclr"),
+            ),
+            (
+                OsString::from("COR_ENABLE_PROFILING"),
+                OsString::from("injected-cor"),
+            ),
+            (
+                OsString::from("COMPlus_ReadyToRun"),
+                OsString::from("injected-complus"),
+            ),
+            (
+                OsString::from("DOTNET_STARTUP_HOOKS"),
+                OsString::from("injected-dotnet"),
+            ),
+        ]);
+        let contract = r#"if [ "$AWS_PROFILE" = development ] && [ -z "${RELTIO_ACCESS_TOKEN+x}" ] && [ -z "${RELTIO_CLIENT_SECRET+x}" ] && [ -z "${DYLD_FUTURE_INJECTION+x}" ] && [ -z "${LD_FUTURE_INJECTION+x}" ] && [ -z "${CORECLR_PROFILER+x}" ] && [ -z "${COR_ENABLE_PROFILING+x}" ] && [ -z "${COMPlus_ReadyToRun+x}" ] && [ -z "${DOTNET_STARTUP_HOOKS+x}" ]; then printf '%s' '{"access_token":"filtered-environment-token","expires_in":3600}'; else printf '%s' '{"access_token":"environment-filter-failed","expires_in":3600}'; fi"#;
+        let command = vec![
+            native_shell.to_string_lossy().into_owned(),
+            "-c".to_owned(),
+            contract.to_owned(),
+        ];
+        let manager =
+            TokenManager::cache_only(directory.path().join("cache")).expect("cache-only manager");
+
+        let acquired = manager
+            .acquire_credential_process(
+                &command,
+                &environment,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .expect("credential process executes with filtered environment");
+
+        assert_eq!(
+            acquired.token.access_token.expose_secret(),
+            "filtered-environment-token"
+        );
     }
 
     #[cfg(unix)]
@@ -4593,18 +6340,21 @@ mod tests {
         let native_shell = directory.path().join("private-sh");
         copy_private_native_executable(Path::new("/bin/sh"), &native_shell);
         let expected_working_directory = fs::canonicalize(directory.path()).expect("canonical cwd");
+        let command_for = |body: &str| {
+            vec![
+                native_shell.to_string_lossy().into_owned(),
+                "-c".to_owned(),
+                body.to_owned(),
+                "private-broker".to_owned(),
+                expected_working_directory.to_string_lossy().into_owned(),
+            ]
+        };
         let manager_for = |body: &str, cache: &str, timeout: Duration| {
             let mut broker_target = target("https://auth.reltio.com");
             broker_target.profile = Some(cache.to_owned());
             broker_target.auth = AuthProfile {
                 method: Some(AuthMethod::CredentialProcess),
-                credential_process: Some(vec![
-                    native_shell.to_string_lossy().into_owned(),
-                    "-c".to_owned(),
-                    body.to_owned(),
-                    "private-broker".to_owned(),
-                    expected_working_directory.to_string_lossy().into_owned(),
-                ]),
+                credential_process: Some(command_for(body)),
                 ..AuthProfile::default()
             };
             TokenManager::from_target(
@@ -4616,23 +6366,52 @@ mod tests {
             )
             .expect("credential-process manager")
         };
+        let normal_timeout = Duration::from_secs(30);
 
         let valid = r#"if [ "$(pwd)" != "$1" ]; then printf '%s' '{"access_token":"cwd-invalid","expires_in":3600}'; else printf '%s' '{"access_token":"broker-token","expires_in":3600,"metadata":{"id_token":"broker-extension-secret"}}'; fi"#;
-        let token = manager_for(valid, "valid", Duration::from_secs(2))
+        let token = manager_for(valid, "valid", normal_timeout)
             .token(false)
             .await
             .expect("broker token");
         assert_eq!(token.expose_secret(), "broker-token");
         assert!(!token.output_guard().permits(b"broker-extension-secret"));
+        let metadata_conflict = manager_for(
+            r#"printf '%s' '{"access_token":"metadata-shared-token","expires_in":3600,"metadata":{"id_token":"metadata-shared-token"}}'"#,
+            "metadata-conflict",
+            normal_timeout,
+        )
+        .token(false)
+        .await
+        .expect_err("access-token metadata provenance must remain non-disclosable");
+        assert_eq!(metadata_conflict.code, "auth_token_provenance_conflict");
+        let successful_descendant_pid = directory.path().join("successful-descendant.pid");
+        let successful_descendant = r#"/bin/sleep 30 & printf '%s' "$!" > successful-descendant.pid; printf '%s' '{"access_token":"successful-broker-token","expires_in":3600}'"#;
+        let token = manager_for(
+            successful_descendant,
+            "successful-descendant",
+            normal_timeout,
+        )
+        .token(false)
+        .await
+        .expect("successful broker token");
+        assert_eq!(token.expose_secret(), "successful-broker-token");
+        let successful_descendant_pid = read_test_process_pid(&successful_descendant_pid).await;
+        assert_test_process_cannot_execute(successful_descendant_pid).await;
         let malformed_error = manager_for(
             r#"printf '%s' '{"access_token":"secret-parser-fragment"'"#,
             "malformed",
-            Duration::from_secs(2),
+            normal_timeout,
         )
         .token(false)
         .await
         .expect_err("malformed output");
         assert_eq!(malformed_error.code, "credential_process_output_invalid");
+        assert_eq!(malformed_error.details["credential_process_started"], true);
+        assert_eq!(
+            malformed_error.details["credential_process_side_effects"],
+            "unknown"
+        );
+        assert_eq!(malformed_error.details["safe_to_replay"], false);
         assert!(
             !serde_json::to_string(&malformed_error)
                 .expect("error JSON")
@@ -4647,7 +6426,7 @@ mod tests {
         let unknown_field_error = manager_for(
             r#"printf '%s' '{"access_token":"credential_process_output_invalid","unexpected":true}'"#,
             "unknown-field",
-            Duration::from_secs(2),
+            normal_timeout,
         )
         .token(false)
         .await
@@ -4665,7 +6444,7 @@ mod tests {
         let expiry_error = manager_for(
             r#"printf '%s' '{"access_token":"broker-token","refresh_token":"range","expires_in":9223372036854775807}'"#,
             "invalid-expiry",
-            Duration::from_secs(2),
+            normal_timeout,
         )
         .token(false)
         .await
@@ -4683,40 +6462,150 @@ mod tests {
                 .expect("credential-process response guard")
                 .permits(&rendered)
         );
-        assert_eq!(
-            manager_for("exit 23", "failed", Duration::from_secs(2))
-                .token(false)
-                .await
-                .expect_err("failed process")
-                .code,
-            "credential_process_failed"
-        );
-        let started = Instant::now();
-        let timeout_error = manager_for("exec /bin/sleep 1", "slow", Duration::from_millis(50))
+        let failed_error = manager_for("exit 23", "failed", normal_timeout)
             .token(false)
             .await
-            .expect_err("slow process");
+            .expect_err("failed process");
+        assert_eq!(failed_error.code, "credential_process_failed");
+        assert_eq!(failed_error.details["credential_process_started"], true);
+        assert_eq!(
+            failed_error.details["credential_process_side_effects"],
+            "unknown"
+        );
+        assert_eq!(failed_error.details["safe_to_replay"], false);
+        let oversized_error = manager_for("printf '%1048578s' x", "oversized", normal_timeout)
+            .token(false)
+            .await
+            .expect_err("oversized broker output");
+        if oversized_error.code == "credential_process_cleanup_failed" {
+            assert_eq!(oversized_error.category, ErrorCategory::Safety);
+            assert_eq!(
+                oversized_error.details["cause"],
+                "credential_process_group_termination_failed"
+            );
+            assert_eq!(oversized_error.details["safe_to_replay"], false);
+            assert!(
+                !oversized_error
+                    .output_guard()
+                    .expect("cleanup failure denies output")
+                    .permits(b"unrelated-output")
+            );
+        } else {
+            assert_eq!(oversized_error.code, "credential_process_output_too_large");
+        }
+        let direct_manager = TokenManager::cache_only(directory.path().join("direct"))
+            .expect("direct credential-process manager");
+        let timeout_command = command_for("exec /bin/sleep 1");
+        let Err(timeout_error) = direct_manager
+            .acquire_credential_process(
+                &timeout_command,
+                &[],
+                Instant::now() + Duration::from_millis(50),
+            )
+            .await
+        else {
+            panic!("slow process unexpectedly succeeded");
+        };
         assert_eq!(timeout_error.code, "auth_timeout");
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "timed-out credential child was not killed and reaped promptly"
-        );
+        assert_eq!(timeout_error.details["credential_process_started"], true);
+        assert_eq!(timeout_error.details["safe_to_replay"], false);
 
-        let descendant_marker = directory.path().join("descendant-survived");
-        let descendant_error = manager_for(
-            "(sleep 1; printf descendant > descendant-survived) & wait",
-            "descendant",
-            Duration::from_millis(50),
-        )
-        .token(false)
-        .await
-        .expect_err("credential-process descendants must be terminated on timeout");
-        assert_eq!(descendant_error.code, "auth_timeout");
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let canceled_descendant_pid = directory.path().join("canceled-descendant.pid");
+        let descendant_command =
+            command_for("/bin/sleep 30 & printf '%s' \"$!\" > canceled-descendant.pid; wait");
+        let pending_process = tokio::spawn(async move {
+            direct_manager
+                .acquire_credential_process(
+                    &descendant_command,
+                    &[],
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await
+        });
+        let canceled_descendant_pid = read_test_process_pid(&canceled_descendant_pid).await;
+        pending_process.abort();
+        match pending_process.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("aborted credential process unexpectedly completed"),
+        }
+        assert_test_process_cannot_execute(canceled_descendant_pid).await;
+    }
+
+    #[test]
+    fn credential_process_post_execution_cleanup_is_not_replayable() {
+        let cause = ReltioError::internal("synthetic process-group cleanup failure");
+        let error = credential_process_post_execution_cleanup_error(&cause);
+
+        assert_eq!(error.code, "credential_process_cleanup_failed");
+        assert_eq!(error.category, ErrorCategory::Safety);
+        assert_eq!(error.details["credential_process_started"], true);
+        assert_eq!(error.details["credential_process_root_exited"], true);
+        assert_eq!(error.details["network_request_sent"], Value::Null);
+        assert_eq!(error.details["local_state_committed"], false);
+        assert_eq!(error.details["safe_to_replay"], false);
         assert!(
-            !descendant_marker.exists(),
-            "a timed-out credential-process descendant remained alive"
+            !error
+                .output_guard()
+                .expect("cleanup failure denies output")
+                .permits(b"unrelated-output")
         );
+    }
+
+    #[test]
+    fn credential_process_timeout_after_spawn_is_not_replayable() {
+        let error = credential_process_timeout_error("credential_processing");
+
+        assert_eq!(error.code, "auth_timeout");
+        assert_eq!(error.category, ErrorCategory::Timeout);
+        assert_eq!(error.details["stage"], "credential_processing");
+        assert_eq!(error.details["credential_process_started"], true);
+        assert_eq!(error.details["credential_process_side_effects"], "unknown");
+        assert_eq!(error.details["network_request_sent"], Value::Null);
+        assert_eq!(error.details["local_state_committed"], false);
+        assert_eq!(error.details["safe_to_replay"], false);
+        assert!(
+            !error
+                .output_guard()
+                .expect("post-spawn timeout denies output")
+                .permits(b"unrelated-output")
+        );
+    }
+
+    #[test]
+    fn credential_process_replay_veto_preserves_known_local_commit_state() {
+        let error = ReltioError::new(
+            "local_io_error",
+            ErrorCategory::Internal,
+            "synthetic post-broker cache failure",
+        )
+        .with_details(json!({
+            "local_state_committed": true,
+            "safe_to_replay": true
+        }));
+
+        let normalized = credential_process_execution_error(error);
+
+        assert_eq!(normalized.details["credential_process_started"], true);
+        assert_eq!(
+            normalized.details["credential_process_side_effects"],
+            "unknown"
+        );
+        assert_eq!(normalized.details["local_state_committed"], true);
+        assert_eq!(normalized.details["safe_to_replay"], false);
+        assert!(!normalized.retryable);
+    }
+
+    #[test]
+    fn post_spawn_windows_containment_failure_is_not_replayable() {
+        let before_spawn = credential_process_containment_details("synthetic", false);
+        let after_spawn = credential_process_containment_details("synthetic", true);
+
+        assert_eq!(before_spawn["network_request_sent"], false);
+        assert_eq!(before_spawn["safe_to_replay"], true);
+        assert_eq!(after_spawn["credential_process_started"], true);
+        assert_eq!(after_spawn["credential_process_side_effects"], "unknown");
+        assert_eq!(after_spawn["network_request_sent"], Value::Null);
+        assert_eq!(after_spawn["safe_to_replay"], false);
     }
 
     #[cfg(unix)]
@@ -4771,6 +6660,13 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let parent = directory.path().join("broker-directory");
         let broker = parent.join("broker.exe");
+        let marker = parent.join("cwd.marker");
+        let contract = directory.path().join("contract.cmd");
+        fs::write(
+            &contract,
+            "@echo off\r\nif defined PATH exit /b 9\r\ntype nul > cwd.marker\r\necho {\"access_token\":\"broker-token\",\"expires_in\":3600}\r\n",
+        )
+        .expect("write broker contract");
         let command_interpreter = PathBuf::from(
             std::env::var_os("SystemRoot").expect("Windows SystemRoot environment variable"),
         )
@@ -4778,19 +6674,14 @@ mod tests {
         .join("cmd.exe");
         let bytes = fs::read(command_interpreter).expect("read system command interpreter");
         atomic_write_private(&broker, &bytes).expect("private broker PE");
-        let expected_directory = parent.to_string_lossy();
-        let contract = format!(
-            r#"if defined PATH (echo {{"access_token":"path-present","expires_in":3600}}) else if /I "%CD%"=="{expected_directory}" (echo {{"access_token":"broker-token","expires_in":3600}}) else (echo {{"access_token":"cwd-invalid","expires_in":3600}})"#
-        );
         let mut broker_target = target("https://auth.reltio.com");
         broker_target.auth = AuthProfile {
             method: Some(AuthMethod::CredentialProcess),
             credential_process: Some(vec![
                 broker.to_string_lossy().into_owned(),
                 "/D".to_owned(),
-                "/S".to_owned(),
                 "/C".to_owned(),
-                contract,
+                contract.to_string_lossy().into_owned(),
             ]),
             ..AuthProfile::default()
         };
@@ -4805,6 +6696,10 @@ mod tests {
 
         let token = manager.token(false).await.expect("broker token");
         assert_eq!(token.expose_secret(), "broker-token");
+        assert!(
+            marker.is_file(),
+            "broker did not run in its guarded directory"
+        );
     }
 
     #[tokio::test]

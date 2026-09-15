@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use clap::{ArgAction, CommandFactory};
 use reltio_client::config::AuthMethod;
+use reltio_client::entities::ENTITY_SCAN_OPTIONS;
 use reltio_client::error::{ReltioError, Result};
 use serde::Serialize;
 use serde_json::{Value, json, to_value};
@@ -116,6 +117,8 @@ const ENTITY_SCAN_PRACTICES: &[&str] = &[
     "HTTP-RETRY-001",
     "HTTP-POST-SIZE-001",
     "ENTITY-SCAN-CURSOR-001",
+    "ENTITY-SCAN-PAGE-LIMIT-001",
+    "ENTITY-SCAN-OPTIONS-001",
     "ENTITY-FILTER-QUERY-001",
     "ENTITY-SEARCH-CONSISTENCY-001",
     "ENTITY-LOSSLESS-001",
@@ -145,6 +148,7 @@ const ENTITY_MATCHES_PRACTICES: &[&str] = &[
     "HTTP-RETRY-001",
     "ENTITY-MATCHES-CONTRACT-001",
     "ENTITY-MATCHES-FRESHNESS-001",
+    "ENTITY-MATCHES-RELEVANCE-PRECISION-001",
     "ENTITY-LOSSLESS-001",
 ];
 const RAW_PRACTICES: &[&str] = &[
@@ -167,6 +171,8 @@ const RAW_PRACTICES: &[&str] = &[
     "ENTITY-SEARCH-BOUNDARY-001",
     "ENTITY-SEARCH-CONSISTENCY-001",
     "ENTITY-SCAN-CURSOR-001",
+    "ENTITY-SCAN-PAGE-LIMIT-001",
+    "ENTITY-SCAN-OPTIONS-001",
     "ENTITY-FILTER-QUERY-001",
     "ENTITY-HISTORY-CONTRACT-001",
     "ENTITY-HISTORY-PERFORMANCE-001",
@@ -174,6 +180,7 @@ const RAW_PRACTICES: &[&str] = &[
     "ENTITY-HISTORY-BOUNDARY-001",
     "ENTITY-MATCHES-CONTRACT-001",
     "ENTITY-MATCHES-FRESHNESS-001",
+    "ENTITY-MATCHES-RELEVANCE-PRECISION-001",
     "ENTITY-LOSSLESS-001",
 ];
 #[cfg(test)]
@@ -670,21 +677,23 @@ fn argument_metadata(
 fn command_constraints(command: &str) -> &'static [&'static str] {
     match command {
         "entity.by-crosswalk" => &[
-            "global --fields is unsupported",
             "ovOnly and nonOvOnly cannot be combined",
             "GET accepts only RFC 3986 unreserved crosswalk values; other values require the deferred POST variant",
         ],
         "entity.history" => &[
-            "global --fields is unsupported",
             "max_items must be greater than zero",
             "offset + max_items must not exceed 1000",
             "filter conflicts with show_all",
         ],
         "entity.matches" => &[
-            "global --fields is unsupported",
             "max_items must be greater than zero",
             "forceMatch=true is unavailable in typed and raw commands",
             "grouped continuation cardinality is unknown; next_offset is not synthesized",
+            "server relevance, response order, and matchActionLabel are preserved without local score or action derivation",
+        ],
+        "entity.scan" => &[
+            "ovOnly and nonOvOnly cannot be combined",
+            "scan options require --allow-unverified-scan-options because applicability to /entities/_scan is not live-tenant verified",
         ],
         "api.practices.check" => &["--expected-release requires --release-ready"],
         _ => &[],
@@ -693,6 +702,10 @@ fn command_constraints(command: &str) -> &'static [&'static str] {
 
 fn argument_constraints(command: &str, argument: &str) -> Vec<&'static str> {
     match (command, argument) {
+        (_, "fields") if !matches!(command, "entity.get" | "entity.search" | "entity.scan") => {
+            vec!["unsupported; use only with entity get, entity search, or entity scan"]
+        }
+        (_, "max_response_bytes") => vec!["must be greater than zero"],
         ("entity.by-crosswalk", "value") => vec!["RFC 3986 unreserved characters only"],
         ("entity.by-crosswalk", "options") => {
             vec!["ovOnly and nonOvOnly cannot be combined"]
@@ -700,6 +713,19 @@ fn argument_constraints(command: &str, argument: &str) -> Vec<&'static str> {
         ("entity.history", "max_items" | "offset") => {
             vec!["max_items > 0", "offset + max_items <= 1000"]
         }
+        ("entity.scan", "page_size") => vec!["page_size must be between 1 and 200"],
+        ("entity.scan", "options") => vec![
+            "ovOnly and nonOvOnly cannot be combined",
+            "requires --allow-unverified-scan-options",
+            "allowed values come from the conflicting /entities/v2/_scan OpenAPI schema; applicability to /entities/_scan is not live-tenant verified",
+        ],
+        ("entity.scan", "allow_unverified_scan_options") => {
+            vec!["requires at least one --option"]
+        }
+        ("api.request", "allow_unverified_scan_options") => vec![
+            "valid only for POST /entities/_scan with a nonempty options query parameter",
+            "option-bearing raw scan requests remain partial coverage",
+        ],
         ("entity.matches", "max_items") => {
             vec!["max_items > 0; 200 is an API default, not a maximum"]
         }
@@ -766,6 +792,11 @@ fn argument_possible_values(
             .collect(),
             ("entity.by-crosswalk", "options") => ["sendHidden", "ovOnly", "nonOvOnly"]
                 .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            ("entity.scan", "options") => ENTITY_SCAN_OPTIONS
+                .iter()
+                .copied()
                 .map(ToOwned::to_owned)
                 .collect(),
             _ => Vec::new(),
@@ -1000,6 +1031,38 @@ mod tests {
             assert_eq!(
                 schema_argument(&value, "output")["environment"],
                 "RELTIO_OUTPUT",
+                "{}",
+                metadata.name
+            );
+        }
+    }
+
+    #[test]
+    fn schemas_report_global_field_applicability_and_response_bounds() {
+        const FIELDS_CONSTRAINT: &str =
+            "unsupported; use only with entity get, entity search, or entity scan";
+        for metadata in all() {
+            let value = schema(Some(metadata.name)).expect("schema");
+            let fields = schema_argument(&value, "fields")["constraints"]
+                .as_array()
+                .expect("field constraints");
+            let fields_supported = matches!(
+                metadata.name,
+                "entity.get" | "entity.search" | "entity.scan"
+            );
+            assert_eq!(
+                fields
+                    .iter()
+                    .any(|constraint| constraint == FIELDS_CONSTRAINT),
+                !fields_supported,
+                "{}",
+                metadata.name
+            );
+            assert!(
+                schema_argument(&value, "max_response_bytes")["constraints"]
+                    .as_array()
+                    .expect("response constraints")
+                    .contains(&Value::String("must be greater than zero".to_owned())),
                 "{}",
                 metadata.name
             );

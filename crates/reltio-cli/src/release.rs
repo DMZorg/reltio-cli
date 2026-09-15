@@ -49,8 +49,11 @@ pub fn readiness(registry: &Registry) -> Result<Value> {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let complete =
-                command_present && endpoint_role_satisfied && incomplete_contracts.is_empty();
+            let implementation_evidence_complete = !operation.implementation_test_ids.is_empty();
+            let complete = command_present
+                && endpoint_role_satisfied
+                && implementation_evidence_complete
+                && incomplete_contracts.is_empty();
             operation_complete_count += usize::from(complete);
 
             let mut reasons = Vec::new();
@@ -72,6 +75,9 @@ pub fn readiness(registry: &Registry) -> Result<Value> {
                     "code": "acceptance_contract_unimplemented",
                     "contract_id": contract_id
                 }));
+            }
+            if !implementation_evidence_complete {
+                reasons.push(json!({"code": "missing_implementation_evidence"}));
             }
             if !complete {
                 blockers.push(json!({
@@ -95,6 +101,8 @@ pub fn readiness(registry: &Registry) -> Result<Value> {
                 "endpoint_role_satisfied": endpoint_role_satisfied,
                 "contract_ids": operation.contract_ids,
                 "incomplete_contracts": incomplete_contracts,
+                "implementation_test_ids": operation.implementation_test_ids,
+                "implementation_evidence_complete": implementation_evidence_complete,
                 "complete": complete
             })
         })
@@ -268,23 +276,67 @@ fn capability_supported(command: &str, argument: &str, required_value: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+
     use reltio_client::registry::EndpointCommandRole;
 
     use super::*;
 
-    #[test]
+    #[::std::prelude::v1::test]
+    fn release_evidence_functions_are_discoverable_in_cli_unit_harness() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let output = Command::new(&executable)
+            .args(["--list", "--format", "terse"])
+            .output()
+            .expect("list CLI unit tests");
+        assert!(output.status.success(), "test listing failed: {output:?}");
+        let listed = String::from_utf8(output.stdout).expect("UTF-8 test listing");
+        let dep_info = fs::read_to_string(executable.with_extension("d"))
+            .expect("CLI unit-test dep-info is readable")
+            .replace('\\', "/");
+        for (_, path, _, expected) in reltio_client::release_evidence_bindings_for_validation()
+            .iter()
+            .filter(|(_, path, _, _)| path.starts_with("crates/reltio-cli/src/"))
+        {
+            assert!(
+                listed
+                    .lines()
+                    .any(|line| line == format!("{expected}: test")),
+                "release evidence test {expected} is absent from the CLI unit harness"
+            );
+            assert!(
+                dep_info
+                    .split_ascii_whitespace()
+                    .map(|entry| entry.trim_end_matches(':'))
+                    .any(|entry| entry == *path),
+                "release evidence source {path} is absent from CLI unit-test dep-info"
+            );
+        }
+    }
+
+    #[::std::prelude::v1::test]
     fn release_readiness_reports_the_independent_prd_inventory() {
         let report = readiness(Registry::embedded().expect("registry parses")).expect("report");
         assert_eq!(report["required_operation_count"], 50);
         assert_eq!(report["command_present_count"], 28);
         assert_eq!(report["missing_command_count"], 22);
+        assert_eq!(report["operation_complete_count"], 0);
         assert_eq!(
             report["acceptance_scenarios"].as_array().map(Vec::len),
             Some(19)
         );
         assert_eq!(report["release_ready"], false);
         assert!(report["blockers"].as_array().is_some_and(|blockers| {
-            blockers
+            blockers.iter().any(|blocker| {
+                blocker["type"] == "operation"
+                    && blocker["id"] == "profile.list"
+                    && blocker["reasons"].as_array().is_some_and(|reasons| {
+                        reasons
+                            .iter()
+                            .any(|reason| reason["code"] == "missing_implementation_evidence")
+                    })
+            }) && blockers
                 .iter()
                 .any(|blocker| blocker["type"] == "operation" && blocker["id"] == "entity.get-many")
                 && blockers.iter().any(|blocker| {
@@ -300,7 +352,7 @@ mod tests {
         }));
     }
 
-    #[test]
+    #[::std::prelude::v1::test]
     fn endpoint_roles_do_not_count_dependencies_as_typed_ownership() {
         let registry = Registry::embedded().expect("registry parses");
         let auth = registry

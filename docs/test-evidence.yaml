@@ -1,5 +1,14 @@
 schema_version: 1
 tests:
+  - id: release_client_harness_discovery
+    path: crates/reltio-client/src/registry.rs
+    function: release_evidence_functions_are_discoverable_in_client_unit_harness
+  - id: release_cli_unit_harness_discovery
+    path: crates/reltio-cli/src/release.rs
+    function: release_evidence_functions_are_discoverable_in_cli_unit_harness
+  - id: release_cli_integration_harness_discovery
+    path: crates/reltio-cli/tests/cli.rs
+    function: release_evidence_functions_are_discoverable_in_cli_integration_harness
   - id: auth_url_is_centralized
     path: crates/reltio-client/src/service.rs
     function: auth_url_is_centralized_and_deprecated_path_is_absent
@@ -18,9 +27,25 @@ tests:
   - id: auth_login_secret_read_order
     path: crates/reltio-cli/tests/cli.rs
     function: login_resolves_the_selected_profile_before_reading_secret_stdin
+  # Parser-only Windows key-record evidence; this does not execute native console I/O.
+  - id: auth_windows_hidden_input_parser_unicode_editing_limit
+    path: crates/reltio-windows-security/src/lib.rs
+    function: hidden_input_parser_preserves_unicode_editing_and_utf8_limit
+  - id: auth_windows_hidden_input_parser_surrogate_validation
+    path: crates/reltio-windows-security/src/lib.rs
+    function: hidden_input_parser_rejects_malformed_surrogates_and_completes_on_enter
+  - id: auth_unix_hidden_input_cleanup
+    path: crates/reltio-cli/src/commands/auth.rs
+    function: hidden_input_timeout_flushes_pending_input_and_restores_terminal_settings
   - id: auth_login_prior_credential_guard
     path: crates/reltio-cli/tests/cli.rs
-    function: login_guards_displaced_secret_file_and_basic_credentials
+    function: login_guards_displaced_secret_file_material
+  - id: auth_environment_basic_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: environment_basic_credentials_guard_local_profile_output
+  - id: auth_mixed_source_basic_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: mixed_source_basic_credentials_guard_local_profile_output
   - id: auth_malformed_cache_guard
     path: crates/reltio-client/src/auth.rs
     function: output_guard_errors_retain_discovered_secret_and_malformed_cache_values
@@ -36,6 +61,91 @@ tests:
   - id: auth_orphan_cache_output_guard
     path: crates/reltio-client/src/auth.rs
     function: cache_output_guard_covers_orphaned_atomic_token_images
+  - id: auth_cache_output_guard_lease
+    path: crates/reltio-client/src/auth.rs
+    function: cache_output_guard_lease_blocks_writers_until_emission_finishes
+  - id: auth_cache_output_guard_control
+    path: crates/reltio-client/src/auth.rs
+    function: cache_output_guard_wait_observes_deadline_and_cancellation
+  - id: auth_cli_final_output_lease
+    path: crates/reltio-cli/tests/cli.rs
+    function: finite_output_holds_the_cache_lease_through_physical_flush
+  - id: auth_preparse_output_lease
+    path: crates/reltio-cli/tests/cli.rs
+    function: preparse_help_fails_closed_when_the_cache_lease_is_contended
+  - id: auth_output_timeout_control
+    path: crates/reltio-cli/tests/cli.rs
+    function: blocked_stdout_obeys_the_overall_timeout
+  - id: auth_output_sigint_control
+    path: crates/reltio-cli/tests/cli.rs
+    function: sigint_interrupts_blocked_stdout_without_a_success_record
+  - id: auth_output_event_order
+    path: crates/reltio-cli/src/output.rs
+    function: output_control_uses_chronological_event_order
+  - id: auth_control_source_order
+    path: crates/reltio-cli/src/main.rs
+    function: signal_exit_status_uses_the_first_control_event
+  - id: auth_credential_process_timeout_arg_boundary
+    path: crates/reltio-cli/src/main.rs
+    function: credential_process_arguments_do_not_become_the_preparse_timeout
+  - id: auth_profile_candidate_credential_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: profile_mutations_guard_candidate_secret_file_material_before_commit
+  - id: auth_profile_candidate_locked_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: profile_update_guards_the_exact_config_loaded_under_the_commit_lock
+  - id: auth_profile_removal_recovery
+    path: crates/reltio-cli/tests/cli.rs
+    function: interrupted_profile_removal_recovers_from_the_durable_cleanup_marker
+  - id: auth_profile_removal_compensation
+    path: crates/reltio-cli/src/commands/profile.rs
+    function: profile_removal_compensation_uses_a_fresh_uncancelled_budget
+  - id: auth_profile_removal_pending_union
+    path: crates/reltio-cli/src/commands/profile.rs
+    function: profile_removal_includes_already_pending_retired_bearers
+  - id: auth_bearer_transition_cleanup
+    path: crates/reltio-cli/tests/cli.rs
+    function: successful_provider_transition_removes_the_retired_bearer_generation
+  - id: auth_bearer_cache_migration
+    path: crates/reltio-cli/tests/cli.rs
+    function: legacy_bearer_profiles_require_global_cleanup_before_target_scoped_login
+  - id: auth_bearer_generation_switch
+    path: crates/reltio-cli/tests/cli.rs
+    function: bearer_relogin_switches_generation_and_removes_retired_cache
+  - id: auth_bearer_generation_crash_isolation
+    path: crates/reltio-cli/tests/cli.rs
+    function: killed_bearer_relogin_preserves_the_active_generation
+  - id: auth_bearer_generation_collision
+    path: crates/reltio-client/src/auth.rs
+    function: generated_bearer_candidate_refuses_an_existing_cache_path
+  - id: auth_logout_cache_linearization
+    path: crates/reltio-cli/tests/cli.rs
+    function: auth_logout_holds_the_cache_lease_through_bearer_deconfiguration
+  - id: auth_profile_remove_without_bearer
+    path: crates/reltio-cli/tests/cli.rs
+    function: profile_lifecycle_and_private_permissions
+  - id: auth_storage_path_isolation
+    path: crates/reltio-client/src/config.rs
+    function: storage_paths_reject_config_cache_and_state_aliases
+  - id: auth_macos_storage_case_isolation
+    path: crates/reltio-client/src/config.rs
+    function: storage_paths_reject_case_aliased_cache_names_on_macos
+  - id: auth_unix_storage_physical_alias
+    path: crates/reltio-client/src/unix_fs.rs
+    function: storage_comparison_aligns_physical_alias_ancestors
+  - id: auth_unix_storage_casefold_isolation
+    path: crates/reltio-client/src/unix_fs.rs
+    function: storage_comparison_treats_missing_ascii_case_aliases_conservatively
+  - id: auth_macos_storage_firmlink_isolation
+    path: crates/reltio-client/src/config.rs
+    function: storage_paths_reject_users_firmlink_alias_when_available
+  # Case-folding and literal-tilde refusal; this does not create or resolve a DOS 8.3 alias.
+  - id: auth_windows_storage_casefold_and_tilde_rejection
+    path: crates/reltio-windows-security/src/lib.rs
+    function: local_path_normalization_rejects_remote_namespaces_and_compares_case_aliases
+  - id: auth_cancellation_outcome
+    path: crates/reltio-cli/src/commands/auth.rs
+    function: cancellation_metadata_preserves_known_authentication_completion
   - id: auth_singleflight_cache
     path: crates/reltio-client/src/auth.rs
     function: concurrent_managers_singleflight_token_acquisition
@@ -54,13 +164,38 @@ tests:
   - id: auth_provider_preparse_guard
     path: crates/reltio-client/src/auth.rs
     function: malformed_token_response_guards_duplicate_candidate_values
-  - id: auth_credential_process_preparse_guard
+  - id: auth_unix_credential_process_preparse_guard
     path: crates/reltio-client/src/auth.rs
     function: credential_process_executes_a_private_absolute_file_and_bounds_failures
-  - id: auth_credential_process_descendant_cleanup
+  # Unix-only process-group lifecycle coverage.
+  - id: auth_unix_credential_process_descendant_cleanup
     path: crates/reltio-client/src/auth.rs
     function: credential_process_executes_a_private_absolute_file_and_bounds_failures
-  - id: auth_windows_credential_process_job_cleanup
+  - id: auth_unix_credential_process_output_bound
+    path: crates/reltio-client/src/auth.rs
+    function: credential_process_executes_a_private_absolute_file_and_bounds_failures
+  # Platform-neutral metadata unit coverage, not a native cleanup-failure run.
+  - id: auth_credential_process_cleanup_error_metadata_unit
+    path: crates/reltio-client/src/auth.rs
+    function: credential_process_post_execution_cleanup_is_not_replayable
+  # Platform-neutral metadata unit coverage, not a native timeout lifecycle run.
+  - id: auth_credential_process_timeout_metadata_unit
+    path: crates/reltio-client/src/auth.rs
+    function: credential_process_timeout_after_spawn_is_not_replayable
+  - id: auth_credential_process_request_timeout_replay
+    path: crates/reltio-client/src/http.rs
+    function: credential_process_auth_timeout_remains_replay_unsafe_at_request_boundary
+  - id: auth_credential_process_request_cancellation_replay
+    path: crates/reltio-client/src/http.rs
+    function: credential_process_cancellation_before_tenant_request_is_not_replayable
+  - id: auth_credential_process_cache_identity
+    path: crates/reltio-client/src/auth.rs
+    function: credential_process_environment_scope_tracks_inherited_identity_inputs
+  - id: auth_unix_credential_process_environment_filter
+    path: crates/reltio-client/src/auth.rs
+    function: credential_process_executes_with_the_cache_identity_environment_filter
+  # Native Windows test source for successful Job assignment and kill-on-close only.
+  - id: auth_windows_job_close_kills_descendants
     path: crates/reltio-windows-security/src/lib.rs
     function: credential_process_job_starts_suspended_and_terminates_descendants
   - id: auth_config_lock_cancellation
@@ -135,6 +270,9 @@ tests:
   - id: auth_token_raw_cumulative_guard
     path: crates/reltio-cli/tests/cli.rs
     function: raw_auth_token_retains_transient_refresh_guard
+  - id: auth_token_disclosure_provenance
+    path: crates/reltio-cli/tests/cli.rs
+    function: auth_token_refuses_access_token_bytes_that_are_also_a_client_secret
   - id: auth_prior_cache_disclosure_guard
     path: crates/reltio-cli/tests/cli.rs
     function: raw_auth_token_retains_prior_cache_generation_guard
@@ -171,6 +309,9 @@ tests:
   - id: release_audit_evidence_separation
     path: crates/reltio-client/src/registry.rs
     function: mutation_audit_guard_evidence_cannot_claim_implementation
+  - id: release_evidence_substitution_guard
+    path: crates/reltio-client/src/registry.rs
+    function: release_requirements_reject_unapproved_evidence_substitution
   - id: release_version_binding
     path: crates/reltio-cli/src/commands/api.rs
     function: release_version_binding_requires_one_stable_exact_version
@@ -252,6 +393,72 @@ tests:
   - id: entity_scan_pages
     path: crates/reltio-cli/tests/cli.rs
     function: entity_scan_streams_pages_and_writes_resume_checkpoint
+  - id: entity_scan_page_limit
+    path: crates/reltio-client/src/entities.rs
+    function: entity_scan_page_limit_is_enforced
+  - id: raw_entity_scan_prebody_page_limit
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_scan_page_limit_is_rejected_before_body_input
+  - id: entity_scan_options_contract
+    path: crates/reltio-client/src/entities.rs
+    function: entity_scan_options_match_the_reviewed_openapi_intersection
+  - id: raw_entity_scan_options_prebody
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_scan_options_are_validated_before_body_input
+  - id: entity_scan_option_acknowledgement
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_options_require_explicit_unverified_acknowledgement
+  - id: entity_scan_continuation_replay
+    path: crates/reltio-client/src/entities.rs
+    function: entity_scan_continuations_are_never_replayed_automatically
+  - id: raw_entity_scan_continuation_replay
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_scan_continuation_response_failures_remain_non_replayable
+  - id: entity_scan_response_route_guard
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_refuses_the_conflicting_v2_response_collection
+  - id: entity_scan_progress_error
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_custom_errors_keep_the_cumulative_output_guard
+  - id: entity_scan_output_context
+    path: crates/reltio-cli/src/output.rs
+    function: stream_context_catches_credentials_split_across_successful_emissions
+  - id: entity_scan_final_guard_context
+    path: crates/reltio-cli/src/output.rs
+    function: stream_context_catches_two_layer_credentials_from_a_later_final_guard
+  - id: entity_scan_flush_progress
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_does_not_advance_progress_before_page_flush
+  - id: entity_scan_artifact_reconciliation
+    path: crates/reltio-cli/src/commands/entity.rs
+    function: a_resumed_scan_without_new_output_is_not_safe_to_replay
+  - id: entity_scan_guard_refusal_replay
+    path: crates/reltio-cli/src/commands/entity.rs
+    function: fresh_scan_guard_refusal_before_output_remains_safe_to_replay
+  - id: entity_scan_response_outcome
+    path: crates/reltio-cli/tests/cli.rs
+    function: invalid_scan_shape_does_not_echo_protected_cursor_values
+  - id: entity_scan_cursor_request_start
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_cursor_expiry_is_anchored_to_request_start
+  - id: entity_scan_resume_work_bound
+    path: crates/reltio-cli/tests/cli.rs
+    function: resumed_scan_max_items_bounds_only_the_current_invocation
+  - id: entity_scan_checkpoint_commit_metadata
+    path: crates/reltio-cli/src/commands/entity.rs
+    function: committed_checkpoint_errors_preserve_durability_metadata
+  - id: entity_scan_resume_io_control
+    path: crates/reltio-cli/src/commands/entity.rs
+    function: launched_resume_write_reports_unknown_commit_when_control_wins
+  - id: raw_entity_scan_v2_route_refused
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_scan_refuses_the_unverified_v2_route_without_network
+  - id: raw_entity_scan_v2_alias_refused
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_scan_refuses_v2_trailing_slash_before_stdin_or_file_input
+  - id: entity_scan_sigint_no_summary
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_scan_sigint_preserves_checkpoint_without_a_false_summary
   - id: entity_scan_filter_guard
     path: crates/reltio-client/src/entities.rs
     function: refuses_silently_truncated_scan_filter
@@ -306,9 +513,15 @@ tests:
   - id: entity_crosswalk_id_fallback
     path: crates/reltio-cli/tests/cli.rs
     function: entity_by_crosswalk_warns_when_documented_id_fallback_is_detected
+  - id: entity_crosswalk_source_normalization
+    path: crates/reltio-client/src/entities.rs
+    function: crosswalk_fallback_detection_normalizes_source_type_shorthand
   - id: raw_entity_crosswalk_preflight
     path: crates/reltio-cli/tests/cli.rs
     function: raw_entity_crosswalk_enforces_the_narrowed_contract
+  - id: raw_entity_crosswalk_fallback_warning
+    path: crates/reltio-cli/tests/cli.rs
+    function: raw_entity_crosswalk_warns_when_documented_id_fallback_is_detected
   - id: entity_history_contract
     path: crates/reltio-cli/tests/cli.rs
     function: entity_history_preserves_changes_and_explicit_order
@@ -330,6 +543,9 @@ tests:
   - id: entity_matches_validation
     path: crates/reltio-client/src/entities.rs
     function: matches_enforce_the_positive_direct_contract
+  - id: entity_matches_relevance_precision
+    path: crates/reltio-cli/tests/cli.rs
+    function: entity_matches_preserves_server_relevance_and_action_labels
   - id: raw_entity_matches_preflight
     path: crates/reltio-cli/tests/cli.rs
     function: raw_entity_matches_refuses_force_match_and_reviews_only_stored_direct_reads

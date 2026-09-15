@@ -1,5 +1,7 @@
 # Reltio CLI Entity Data
 
+`--fields` is implemented only by `entity get`, `entity search`, and `entity scan`. Other commands fail with `fields_unsupported` instead of silently returning an unnarrowed response.
+
 ## Direct Read
 
 `entity get` accepts an ID or `entities/<id>` URI and reports `consistency: consistent`. `--fields` accepts documented lowercase top-level fields or nonempty `attributes.<path>` values. Repeated `--option` accepts `sendHidden`, `ovOnly`, `nonOvOnly`, `serializeInitialSourcesInCrosswalks`, `cleanEntity`, `showAppliedSurvivorshipRules`, `showEndDatedReferenceAttributes`, or `explainOv`. It also exposes Reltio's documented historical `--time`, duplicate-crosswalk, value-limit, explicit-survivorship-group, reverse-transcoding, and masking controls. `--reverse-transcode-lookups` carries a Preview availability warning in structured metadata and on stderr for raw/table output; verify the tenant capability and destination mapping before depending on the result.
@@ -40,7 +42,7 @@ reltio --profile dev entity scan \
   > organizations.jsonl
 ```
 
-The first request requires a filter. Resume identity includes the state schema, endpoint, profile, environment, tenant, normalized filter and query hashes, page size, resolved data-service route, and exact CLI version. Resume paths must be valid UTF-8. A mismatch or incoherent cursor, sequence, or timestamp fails before network I/O. Checkpoint events keep `data` null and expose the complete resumable state under `meta.resume`. The CLI derives expiry from the last-read time and reviewed one-hour registry limit, then bounds each continuation's authentication and complete retry chain by that expiry because tenant `preserveCursor` capability is not always discoverable.
+The first request requires a filter. Repeated `--option` accepts only the conservative locked-OpenAPI allowlist `sendHidden`, `searchByOv`, `ovOnly`, and `nonOvOnly`; `ovOnly` and `nonOvOnly` conflict. Current English cursor documentation omits options, while the OpenAPI and connector material use incompatible route and cursor contracts. The CLI refuses option transmission unless `--allow-unverified-scan-options` explicitly acknowledges that conflict, and option-bearing raw requests remain partial coverage. Pilot behavior in a non-production tenant before using the acknowledgement. A response containing the conflicting `entities` collection without canonical `objects` is refused rather than interpreted as exhaustion. Resume identity includes the state schema, endpoint, profile, environment, tenant, normalized filter and query hashes, page size, resolved data-service route, and exact CLI version. Resume paths must be valid UTF-8. A mismatch or incoherent cursor, sequence, or timestamp fails before network I/O. Checkpoint events keep `data` null and expose the complete resumable state under `meta.resume`. The CLI derives expiry from the last-read time and reviewed one-hour registry limit, then bounds each continuation's authentication and complete retry chain by that expiry because tenant `preserveCursor` capability is not always discoverable.
 
 ## History
 
@@ -52,7 +54,7 @@ reltio --profile dev entity history entities/00009qz --max-items 50
 
 ## Potential Matches
 
-`entity matches` retrieves stored direct potential matches and preserves the dynamic match-group object. It explicitly disables forced recalculation and transitive traversal, so it remains a replay-safe read. Reltio documents 200 as the API default, not a maximum, and does not document grouped continuation cardinality, so the CLI does not invent `next_offset`. Results may be absent or out of date with `ON_REQUEST`, strategy `NONE`, or custom handlers that do not persist suspect links. Raw `forceMatch=true` is refused until its cost, state-change, and replay contract is reviewed. Use `--match-type automatic`, `relevance_based`, or `suspect` to select a reviewed built-in group type.
+`entity matches` retrieves stored direct potential matches and preserves the dynamic match-group object. It explicitly disables forced recalculation and transitive traversal, so it remains a replay-safe read. Reltio documents 200 as the API default, not a maximum, and does not document grouped continuation cardinality, so the CLI does not invent `next_offset`. Results may be absent or out of date with `ON_REQUEST`, strategy `NONE`, or custom handlers that do not persist suspect links. After release `2026.1.9.0` reaches a tenant, selected returned relevance values change from rounding to two-decimal truncation; DEV/TEST rollout is scheduled for August 21, 2026 and PRD for August 28, 2026. Preserve the server score, order, and `matchActionLabel`; do not derive an action or sort from the displayed score. Raw `forceMatch=true` is refused until its cost, state-change, and replay contract is reviewed. Use `--match-type automatic`, `relevance_based`, or `suspect` to select a reviewed built-in group type.
 
 ```bash
 reltio --profile dev entity matches entities/00009qz \
