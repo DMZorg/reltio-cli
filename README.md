@@ -1,117 +1,108 @@
 # reltio-cli
 
-`reltio` is an independent, agent-native Rust CLI for Reltio public APIs. It gives humans, shell scripts, CI jobs, and AI agents one production-oriented layer for profiles, multi-service routing, OAuth credentials, stable JSON, retries, endpoint guidance, and tenant safety.
+Read and search Reltio data from your terminal. `reltio` manages tenant profiles, authentication, and structured output for people, scripts, and AI agents.
+
+**Start here:** [Quickstart](docs/quickstart.md) · [Authentication options](docs/authentication.md) · [Troubleshooting](docs/quickstart.md#troubleshooting)
 
 > [!IMPORTANT]
-> This project is unofficial and is not affiliated with or endorsed by Reltio. The current version is an `0.1.0-alpha.1` foundation release. Its typed network surface is intentionally read-only while mutation-specific safeguards are completed and reviewed.
+> This is an unofficial project, not affiliated with or endorsed by Reltio. The current version is `0.1.0-alpha.1`, built from source. Typed network commands are read-only; actual raw mutations are blocked while their safeguards are completed. Published packages and signed release downloads are not yet available as approved distribution channels.
 
-## What Works
+## Quickstart
 
-- Deterministic profile, environment, tenant, and service URL resolution.
-- Supplied bearer, client-credentials, and strict credential-process authentication; complete Windows broker lifecycle validation remains pilot-gated.
-- Owner-only token cache with cross-process locking and single-flight acquisition; Windows DACL/owner enforcement remains native-runtime and pilot-gated.
-- Opaque multi-kilobyte token support and unconditional secret redaction.
-- Typed consistent entity get and crosswalk lookup, bounded history and stored potential matches, POST-body entity search, and resumable cursor scan.
-- Controlled raw reads with protected headers, no credential-forwarding redirects, mutation dry runs, and a fail-closed audit-contract gate.
-- Stable JSON success/error envelopes, JSONL scan events, YAML, table, and raw output.
-- Source-linked API-practice and endpoint registries validated against statically attributed test functions at build time; CI execution is a separate gate.
-- Embedded agent skills, command schemas, shell completions, and offline/online diagnostics.
+These examples use Bash or Zsh. You need Git, [Rust installed with rustup](https://rust-lang.org/tools/install/), and a Reltio client ID and secret with read access to your tenant. Ask your Reltio administrator for your environment, tenant ID, and credentials. Browser SSO login is not implemented in this alpha.
 
-## Build
+### 1. Install
 
-The repository pins Rust `1.85.0` and uses rustls, so no system OpenSSL installation is required. Linux builds use the native ACL library to verify owner-only files; install its development package first (`libacl1-dev` on Debian/Ubuntu or `libacl-devel` on Fedora/RHEL).
-
-This alpha is currently a source-built development snapshot. Signed release archives, checksums, provenance, crates.io publication, Homebrew, and Scoop are not yet approved distribution channels; do not treat a local build as a published production release.
+On Ubuntu/Debian, install the build prerequisites first:
 
 ```bash
-cargo build --release --locked
-./target/release/reltio --version
+sudo apt-get update
+sudo apt-get install --yes git build-essential libacl1-dev
 ```
 
-## Five-Minute Start
+Then clone and install the CLI:
 
 ```bash
-# Profiles never contain a raw secret by default.
-reltio profile add dev --environment dev --tenant ExampleTenant
+git clone https://github.com/aiadjacent/reltio-cli.git
+cd reltio-cli
+cargo install --path crates/reltio-cli --locked
+export PATH="$HOME/.cargo/bin:$PATH"
+reltio --version
+```
 
-# The Unix hidden prompt has a pseudo-terminal runtime test source. The Windows native-console path remains pilot-gated.
+The first build may take several minutes. The repository pins Rust `1.85.0`; rustup selects it when you work inside the repository. The PATH line applies to this terminal; see the [installation notes](docs/quickstart.md#1-install-the-cli) for persistent setup and other platforms. CI currently validates Ubuntu only.
+
+### 2. Save your tenant details
+
+Replace the `YOUR_…` values before running these commands. `dev` is just a local profile name; it does not select a Reltio environment by itself.
+
+```bash
+reltio profile add dev \
+  --environment 'YOUR_ENVIRONMENT' \
+  --tenant 'YOUR_TENANT_ID'
+
+reltio profile show dev
+```
+
+For a Data API URL of `https://YOUR_ENVIRONMENT.reltio.com/reltio/api/YOUR_TENANT_ID`, use the host prefix as the environment and the value after `/api/` as the tenant ID. Confirm these with your administrator. [Custom host?](docs/quickstart.md#2-save-your-tenant-details)
+
+### 3. Log in and check access
+
+```bash
 reltio --profile dev auth login \
   --method client-credentials \
-  --client-id "$RELTIO_CLIENT_ID"
+  --client-id 'YOUR_CLIENT_ID'
 
 reltio --profile dev auth check
-reltio --profile dev entity get entities/00009qz
 ```
 
-Headless authentication uses environment injection without putting a secret in an argument:
+Enter your client secret at the hidden prompt. The CLI caches the access token, not the prompted secret. When that token expires, log in again or configure a [reusable secret source](docs/authentication.md#client-credentials). For automated runs, use [secret-manager injection](docs/quickstart.md#use-in-ci-or-an-agent).
+
+### 4. Read your first entities
 
 ```bash
-export RELTIO_CLIENT_ID='example-client'
-export RELTIO_CLIENT_SECRET='injected-by-ci'
-reltio --profile dev entity search \
-  --filter "equals(type,'configuration/entityTypes/Organization')" \
-  --max-items 25
+reltio --profile dev entity search --max-items 5
 ```
 
-For exhaustive retrieval, stream checkpointed JSONL:
+A successful command returns JSON with `"ok": true`, the result in `data`, and request context in `meta`. An empty result can be valid. No entity ID or entity-type name is needed for this first search.
 
-```bash
-reltio --profile dev entity scan \
-  --filter "equals(type,'configuration/entityTypes/Organization')" \
-  --page-size 100 \
-  --resume-file organizations.resume.json \
-  > organizations.part-0001.jsonl
-```
+**You're ready.** Continue with the [quickstart examples](docs/quickstart.md#4-read-and-save-data) to fetch a known entity, filter results, save JSON, or stream a larger scan.
 
-Resume state is accepted only by the exact CLI version, target, route, query, and page size that created it. After a failed scan, resume into a new part file. Do not redirect a resumed command over an earlier part or blindly append: reconcile complete `meta.sequence` values with the resume-file sequence first because a crash between output flush and checkpoint commit can duplicate a page.
+## Common commands
 
-## Agent Discovery
+| I want to… | Command |
+| --- | --- |
+| See saved profiles | `reltio profile list` |
+| Choose a default profile | `reltio profile use dev` |
+| Inspect cached authentication | `reltio --profile dev auth status` |
+| Check tenant access | `reltio --profile dev auth check` |
+| Read an entity by ID | `reltio --profile dev entity get YOUR_ENTITY_ID` |
+| Check local setup | `reltio --profile dev doctor` |
+| Include an online access check | `reltio --profile dev doctor --online` |
+| Find command options | `reltio entity search --help` |
+| Get agent instructions | `reltio agent guide` |
+| Inspect a command schema | `reltio command schema entity.get` |
 
-```bash
-reltio agent guide
-reltio skills list
-reltio skills get reltio-data
-reltio command schema entity.get
-reltio api practices list
-reltio --profile dev doctor
-```
+JSON is the default output, including in an interactive terminal. Errors go to stderr and return a nonzero exit code. `doctor` also returns nonzero for warnings; read its check details before treating that as a connection failure. See the [output contract](docs/output-contract.md) and [error reference](docs/errors.md).
 
-Finite stdout is JSON by default, even on a TTY. Diagnostics go to stderr. See [the output contract](docs/output-contract.md) and [error reference](docs/errors.md).
+## What you can do today
 
-`doctor` exits `0` only when every check passes. Warnings and failures return a guarded `doctor_unhealthy` error on stderr, with check details whenever they are safely representable.
+- Keep separate profiles for different environments and tenants.
+- Authenticate with client credentials, supplied bearer tokens, or a credential process.
+- Retrieve entities by ID or crosswalk, search, scan, and inspect history or stored potential matches.
+- Use JSON, JSONL, YAML, table, or guarded raw output where supported.
+- Discover command schemas, embedded skills, shell completions, and source-linked API guidance.
 
-## Safety
-
-- A token never selects or proves the intended tenant.
-- HTTP redirects are not followed with authorization.
-- Unknown raw reads are labeled `practice_coverage: unknown` and receive no automatic retries.
-- Mutation dry runs require the normal endpoint and target acknowledgements. Actual raw mutations are refused with `mutation_audit_unavailable` until the versioned audit-result contract has implementation evidence.
-- `--dry-run` resolves and validates an API request without sending it; mutation planning remains its primary use.
-- Raw API bodies are refused on terminal stdout; redirect them deliberately. Active credentials and credential-shaped JSON fields remain redacted without applying diagnostic heuristics to ordinary entity values.
-- No general option disables TLS verification, redaction, target validation, or protected-header policy.
-
-Review [the threat model](docs/threat-model.md) and [security policy](SECURITY.md) before production pilot use.
-
-## Development
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo run -p reltio-cli -- api practices check --strict
-cargo run -p reltio-cli -- api practices check --release-ready
-```
-
-CI and release-readiness tests run only on GitHub-hosted `ubuntu-latest`. CI runs the debug workspace suite with all features and the complete release workspace suite with default shipped features. Windows-native tests, macOS execution, and ARM execution require separate validation before claiming support on those platforms.
-
-The second check is expected to fail during this incomplete alpha and is one mandatory product-MVP gate before a stable `v0.1.0` release. It does not replace platform tests, signing, provenance, packaging, or pilot approval. Stable readiness accepts only an exact `vMAJOR.MINOR.PATCH` tag, runs the default shipped feature set on Ubuntu, requires current upstream and dependency-policy evidence, and binds the tag, manifest target, and package version through `--expected-release`. Every required operation also needs independently approved, Cargo-discoverable implementation evidence; a command leaf or endpoint binding alone is insufficient. Every Reltio API operation must update `docs/endpoints.yaml`, `docs/reltio-api-practices.yaml`, `docs/test-evidence.yaml`, `docs/release-requirements.yaml`, command metadata, tests, and user/agent guidance together. Read the [product contract](docs/PRD.md) and [repository agent instructions](AGENTS.md) before implementation work.
+See [API coverage](docs/api-coverage.md) for exact limits and deferred features. A token does not choose your tenant. Unknown raw reads are marked as unreviewed, authenticated redirects are not followed, and there is no general switch to disable TLS verification or secret redaction. Review the [security policy](SECURITY.md) and [threat model](docs/threat-model.md) before pilot use.
 
 ## Documentation
 
-- [Quickstart](docs/quickstart.md)
-- [Authentication](docs/authentication.md)
-- [Output contract](docs/output-contract.md)
-- [Errors](docs/errors.md)
-- [API coverage](docs/api-coverage.md)
-- [Threat model](docs/threat-model.md)
-- [Product requirements](docs/PRD.md)
+| Guide | Use it for |
+| --- | --- |
+| [Quickstart](docs/quickstart.md) | Installation, first read, examples, and common setup problems |
+| [Authentication](docs/authentication.md) | Bearer tokens, secret files, CI, and credential brokers |
+| [Output contract](docs/output-contract.md) | Parsing results and handling streams |
+| [Errors](docs/errors.md) | Error codes, exit codes, and recovery |
+| [API coverage](docs/api-coverage.md) | Supported operations, safeguards, and release readiness |
+| [Development](docs/development.md) | Building, testing, and contributing |
+| [Product requirements](docs/PRD.md) | Project direction and planned capabilities |
